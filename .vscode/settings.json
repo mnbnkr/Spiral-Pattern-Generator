@@ -1,0 +1,6 @@
+{
+  "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
+  "chat.tools.terminal.autoApprove": {
+    "trunk": true
+  }
+}

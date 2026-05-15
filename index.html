@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <base data-trunk-public-url />
+    <title>Spiral Pattern Generator</title>
+    <link data-trunk rel="css" href="styles.css" />
+    <link data-trunk rel="rust" data-bin="spg_app" />
+    <link
+      data-trunk
+      rel="rust"
+      data-bin="spg_worker"
+      data-type="worker"
+      data-loader-shim
+    />
+  </head>
+  <body>
+    <canvas id="sim-canvas" aria-label="Spiral pattern canvas"></canvas>
+    <aside id="control-panel" class="panel">
+      <header class="panel-header">
+        <h1>Spiral Pattern Generator</h1>
+        <div id="status-line">Idle</div>
+      </header>
+
+      <section class="control-section">
+        <div class="two-column-row">
+          <label for="board-select">Board
+            <select id="board-select">
+              <option value="LatticeSquare">LatticeSquare</option>
+              <option value="LatticeHex">LatticeHex</option>
+              <option value="ContinuousArchimedean">ContinuousArchimedean</option>
+            </select>
+          </label>
+
+          <label for="shape-select">Shape
+            <select id="shape-select">
+              <option value="Square">Square</option>
+              <option value="Circle">Circle</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <section class="control-section">
+        <label for="radius-input">Radius</label>
+        <input id="radius-input" type="text" value="100" inputmode="decimal" autocomplete="off" />
+
+        <label for="piece-radius-slider">Piece Radius <output id="piece-radius-output">0.50</output></label>
+        <input id="piece-radius-slider" type="range" min="0.05" max="0.50" step="0.01" value="0.50" />
+
+        <label for="speed-slider">Speed <output id="speed-output">250/s</output></label>
+        <input id="speed-slider" type="range" min="1" max="1000" step="1" value="250" />
+        <label class="inline-control" for="fastest-toggle">
+          <input id="fastest-toggle" type="checkbox" checked />
+          Fastest
+        </label>
+
+        <label for="continuous-offset-input">Offset</label>
+        <input id="continuous-offset-input" type="number" min="0" max="1" step="0.001" value="0" />
+      </section>
+
+      <section class="control-section">
+        <label for="display-mode-select">Display Mode</label>
+        <select id="display-mode-select">
+          <option value="FitScreen">Fit Screen</option>
+          <option value="PixelOneToOne">1:1 Pixel</option>
+        </select>
+
+        <div id="zoom-row">
+          <label for="zoom-slider">Zoom <output id="zoom-output">x4</output></label>
+          <input id="zoom-slider" type="range" min="1" max="16" step="1" value="4" />
+        </div>
+      </section>
+
+      <section class="control-section">
+        <label class="inline-control" for="attacking-toggle">
+          <input id="attacking-toggle" type="checkbox" />
+          Attacking
+        </label>
+
+        <label for="enemy-mode-select">Ally / Enemy</label>
+        <select id="enemy-mode-select">
+          <option value="MoveSet" selected>Move-set</option>
+          <option value="Color">Color</option>
+        </select>
+      </section>
+
+      <section class="control-section">
+        <label for="army-preset-select">Army Setup</label>
+        <select id="army-preset-select">
+          <option value="CustomFinite">Custom Finite</option>
+          <option value="PrimeKnight">Prime Knight</option>
+          <option value="PrimeGap">Prime Gap</option>
+        </select>
+
+        <div id="custom-army-editor">
+          <div class="piece-add-row">
+            <label for="piece-a-input">A
+              <input id="piece-a-input" type="number" step="1" value="2" />
+            </label>
+            <label for="piece-b-input">B
+              <input id="piece-b-input" type="number" step="1" value="1" />
+            </label>
+            <button id="add-piece-button" type="button">Add</button>
+          </div>
+          <div id="army-list" class="army-list"></div>
+        </div>
+
+        <div id="prime-color-controls">
+          <label for="prime-divisor-input">Modulo Divisor</label>
+          <input id="prime-divisor-input" type="number" min="2" step="1" value="12" />
+          <div class="anchor-row">
+            <label for="anchor-a-input">Anchor A
+              <input id="anchor-a-input" type="color" value="#ff7800" />
+            </label>
+            <label for="anchor-b-input">Anchor B
+              <input id="anchor-b-input" type="color" value="#ff0006" />
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section class="button-row">
+        <button id="start-button" type="button">Start</button>
+        <button id="pause-button" type="button">Pause</button>
+        <button id="step-button" type="button">Step</button>
+      </section>
+
+      <section class="button-row">
+        <button id="download-png-button" type="button">PNG</button>
+        <button id="download-webp-button" type="button">WebP</button>
+        <button id="download-log-button" type="button">Log</button>
+      </section>
+
+      <section class="control-section log-section">
+        <label for="placement-log">Placement Log</label>
+        <pre id="placement-log">No placements yet.</pre>
+      </section>
+    </aside>
+  </body>
+</html>
