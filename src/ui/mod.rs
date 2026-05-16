@@ -11,7 +11,7 @@ use web_sys::{
 use crate::protocol::{
     AppToWorker, ArmyPreset, BoardKind, CustomPiece, DisplayMode, EnemyMode, EngineSettings,
     EngineStats, Placement, ShapeKind, SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp,
-    piece_gap, rainbow_color,
+    rainbow_color,
 };
 use crate::render::CanvasRenderer;
 
@@ -295,13 +295,15 @@ fn placement_log_text(state: &AppState) -> String {
     }
 
     let mut out = format!(
-        "settings: board={:?} army={:?} enemy={:?} attacking={} radius={:.2} piece_radius={:.2} offset={:.3} anchors={}..{}\nplacements logged: {}\n\nfirst placements:\n",
+        "settings: board={:?} shape={:?} army={:?} enemy={:?} attacking={} radius={:.2} piece_radius={:.2} track={:.2} offset={:.3} anchors={}..{}\nplacements logged: {}\n\nfirst placements:\n",
         state.settings.board,
+        state.settings.shape,
         state.settings.army_preset,
         state.settings.enemy_mode,
         state.settings.proactive_attacking,
         state.settings.radius,
         state.settings.piece_radius,
+        state.settings.track_opacity,
         state.settings.continuous_offset,
         state.settings.anchor_color_a,
         state.settings.anchor_color_b,
@@ -439,6 +441,23 @@ fn schedule_next_run_tick(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
     Ok(())
 }
 
+fn schedule_step_batch(worker: Worker) -> Result<(), JsValue> {
+    let closure = Closure::<dyn FnMut()>::new(move || {
+        if let Err(error) = send_to_worker(&worker, &AppToWorker::StepBatch { max_steps: 1 }) {
+            log_error(&error);
+        }
+    });
+
+    web_sys::window()
+        .ok_or_else(|| JsValue::from_str("window unavailable"))?
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            500,
+        )?;
+    closure.forget();
+    Ok(())
+}
+
 fn run_delay_ms(speed: &SpeedMode) -> i32 {
     match speed {
         SpeedMode::Fastest => 0,
@@ -512,7 +531,7 @@ fn install_control_handlers(
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::UpdateWorker)?;
     }
 
-    for id in ["display-mode-select", "zoom-slider"] {
+    for id in ["display-mode-select", "zoom-slider", "track-opacity-slider"] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::RenderOnly)?;
     }
 
@@ -552,6 +571,12 @@ fn install_control_handlers(
         if state.running {
             return Ok(());
         }
+        if !state.has_run && state.last_stats.placements == 0 {
+            let settings = state.settings.clone();
+            reset_worker_with_settings(state, &document, settings, false)?;
+            set_status("Stepping")?;
+            return schedule_step_batch(state.worker.clone());
+        }
         set_status("Stepping")?;
         send_to_worker(&state.worker, &AppToWorker::StepBatch { max_steps: 1 })
     })?;
@@ -561,16 +586,21 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let filename = download_filename(&state.settings, state.last_stats, "image", "png");
-            state.renderer.download_image("image/png", &filename)
+            state
+                .renderer
+                .download_image("image/png", &filename, 1.0, None)
         },
     )?;
     install_button(
         document,
-        "download-webp-button",
+        "download-jpeg-button",
         Rc::clone(&state),
         |state| {
-            let filename = download_filename(&state.settings, state.last_stats, "image", "webp");
-            state.renderer.download_image("image/webp", &filename)
+            let filename =
+                download_filename(&state.settings, state.last_stats, "image-half", "jpg");
+            state
+                .renderer
+                .download_image("image/jpeg", &filename, 0.5, Some(0.82))
         },
     )?;
     install_button(document, "download-log-button", state, |state| {
@@ -684,13 +714,7 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         install_piece_drag_handlers(&row, document.clone(), Rc::clone(&state), index)?;
 
         let label = document.create_element("span")?;
-        label.set_text_content(Some(&format!(
-            "{}. ({}, {}) gap {}",
-            index + 1,
-            piece.a,
-            piece.b,
-            piece_gap(piece.a, piece.b)
-        )));
+        label.set_text_content(Some(&format!("{}. ({}, {})", index + 1, piece.a, piece.b)));
         row.append_child(&label)?;
 
         let swatch = document.create_element("span")?.dyn_into::<HtmlElement>()?;
@@ -983,7 +1007,7 @@ fn apply_board_defaults(document: &Document, previous: &EngineSettings) -> Resul
 
     if previous.board != next_board {
         let piece_radius = if next_board == BoardKind::ContinuousArchimedean {
-            "0.25"
+            "0.50"
         } else {
             "0.50"
         };
@@ -1030,6 +1054,7 @@ fn read_settings(
     } else {
         match select_value(document, "shape-select")?.as_str() {
             "Circle" => ShapeKind::Circle,
+            "Hex" => ShapeKind::Hex,
             _ => ShapeKind::Square,
         }
     };
@@ -1069,15 +1094,16 @@ fn read_settings(
             .max(1.0),
         piece_radius: input_value(document, "piece-radius-slider")?
             .parse::<f64>()
-            .unwrap_or(if board == BoardKind::ContinuousArchimedean {
-                0.25
-            } else {
-                0.5
-            })
+            .unwrap_or(0.5)
             .clamp(0.05, 0.5),
         speed,
         display_mode,
         zoom: input_value(document, "zoom-slider")?.parse().unwrap_or(4),
+        track_opacity: input_value(document, "track-opacity-slider")?
+            .parse::<f32>()
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0)
+            / 100.0,
         proactive_attacking: input_checked(document, "attacking-toggle")?,
         enemy_mode,
         army_preset,
@@ -1109,6 +1135,12 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
         "piece-radius-output",
         &format!("{:.2}", settings.piece_radius),
     )?;
+    let track_text = if settings.track_opacity <= f32::EPSILON {
+        "Off".to_string()
+    } else {
+        format!("{}%", (settings.track_opacity * 100.0).round() as u32)
+    };
+    set_text(document, "track-opacity-output", &track_text)?;
 
     input(document, "speed-slider")?.set_disabled(matches!(settings.speed, SpeedMode::Fastest));
     let continuous = settings.board == BoardKind::ContinuousArchimedean;

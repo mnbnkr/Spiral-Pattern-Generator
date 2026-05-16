@@ -7,7 +7,8 @@ use std::rc::Rc;
 use spiral_pattern_generator::engine::SimulationEngine;
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::protocol::{
-    AppToWorker, EngineSettings, Placement, SpeedMode, VertexBufferUpdate, WorkerToApp,
+    AppToWorker, ArmyPreset, BoardKind, EngineSettings, Placement, SpeedMode, VertexBufferUpdate,
+    WorkerToApp,
 };
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::render_data::pack_vertices;
@@ -103,7 +104,7 @@ fn handle_message(
         AppToWorker::RunTick => {
             let mut runtime = runtime.borrow_mut();
             if runtime.running {
-                let (batch_size, work_budget) = batch_parameters(&runtime.engine.settings().speed);
+                let (batch_size, work_budget) = batch_parameters(runtime.engine.settings());
                 post_step_result(&mut runtime, batch_size, work_budget);
             } else {
                 post_stats(&runtime);
@@ -181,12 +182,18 @@ fn post_stats_with_vertex_update(runtime: &WorkerRuntime, vertex_update: VertexB
 }
 
 #[cfg(target_arch = "wasm32")]
-fn batch_parameters(speed: &SpeedMode) -> (u32, u64) {
-    match speed {
-        SpeedMode::Fastest => (4_096, 1_000_000),
+fn batch_parameters(settings: &EngineSettings) -> (u32, u64) {
+    match settings.speed {
+        SpeedMode::Fastest => match (settings.board, settings.army_preset) {
+            (BoardKind::ContinuousArchimedean, ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap) => {
+                (64, 200_000)
+            }
+            (_, ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap) => (512, 500_000),
+            _ => (4_096, 1_000_000),
+        },
         SpeedMode::PerSecond(rate) => {
             let frames_per_second = 20;
-            let batch = ((*rate as u32).max(1) / frames_per_second).max(1);
+            let batch = ((rate as u32).max(1) / frames_per_second).max(1);
             (batch, 20_000)
         }
     }

@@ -17,6 +17,7 @@ cargo test
 cargo build --target wasm32-unknown-unknown
 trunk build --release
 trunk serve --port 8080
+pnpm exec playwright test --project=chromium
 ```
 
 ## Architecture
@@ -31,6 +32,8 @@ trunk serve --port 8080
 - `src/protocol.rs`: typed `serde` contracts for app/worker messages and placement data.
 
 Trunk builds two Rust assets from `index.html`: `spg_app` as the main WASM binary and `spg_worker` as a worker binary with a loader shim. The main thread starts `spg_worker_loader.js`, which imports the generated worker glue and initializes the worker WASM.
+
+`Trunk.toml` uses a relative default `public_url` so local static builds are path-portable. GitHub Pages deployment is handled by `.github/workflows/pages.yml`, which builds with a repository subpath public URL and uploads the generated `dist` assets through the Pages artifact flow.
 
 The run loop is a main-thread pull loop with at most one worker calculation batch in flight. After a batch arrives, the main thread appends the packed vertices and requests the next worker batch, while canvas drawing is coalesced onto `requestAnimationFrame`. This keeps the worker from pushing an unbounded queue while preventing WebGL redraws from throttling calculation throughput.
 
@@ -104,7 +107,7 @@ The chord solver uses Newton-Raphson with a bracketed bisection fallback. At lar
 
 ## Piece Radius, Collision, And Attacks
 
-The UI has a Piece Radius slider. Lattice boards default to `0.50`; switching to `ContinuousArchimedean` sets the default to `0.25` so unit-spaced centers leave visible space between bodies.
+The UI has a Piece Radius slider. Lattice boards and `ContinuousArchimedean` default to `0.50`, so unit-spaced continuous centers touch at tangency without body overlap.
 
 Continuous body overlap is rejected when:
 
@@ -128,14 +131,18 @@ abs(center_distance - attack_radius) <= piece_radius + EPS
 
 ## Rendering
 
-The renderer uses WebGL point sprites on the same canvas. Each placement contributes one packed vertex of world position and RGB color. The shader handles square versus circle shape, including circular discard via `gl_PointCoord`.
+The renderer uses WebGL point sprites on the same canvas. Each placement contributes one packed vertex of world position and RGB color. The shader handles Square, Circle, and Hex piece shapes through `gl_PointCoord`; Continuous Archimedean still forces Circle because its simulation bodies are circular. On LatticeHex, Hex shape uses a full regular hex cell scale so Piece Radius `0.50` fills adjacent hex cells without overlap.
 
-The worker computes vertex positions and RGB colors once per emitted batch. The main thread appends or replaces the already-packed vertex buffer and uploads it to WebGL incrementally. Appended batches use `bufferSubData`; every visible `requestAnimationFrame` redraws the full uploaded point buffer in one `drawArrays(POINTS)` call. The full redraw is required because a normal WebGL canvas is not a persistent retained framebuffer: relying on previous frames to keep old point sprites can make older pieces disappear after browser compositing or GPU buffer growth. Shape, zoom, display-mode, and lattice Piece Radius changes reuse the existing vertex data. This avoids the slow path of issuing one Canvas 2D call per piece from WASM, avoids repeatedly parsing color strings or rebuilding all vertices on every animation tick, and avoids re-uploading the whole simulation for every batch.
+The worker computes vertex positions and RGB colors once per emitted batch. The main thread appends or replaces the already-packed vertex buffer and uploads it to WebGL incrementally. Appended batches use `bufferSubData`; every visible `requestAnimationFrame` redraws the full uploaded point buffer in one `drawArrays(POINTS)` call. The full redraw is required because a normal WebGL canvas is not a persistent retained framebuffer: relying on previous frames to keep old point sprites can make older pieces disappear after browser compositing or GPU buffer growth. Shape, zoom, display-mode, spiral-track opacity, and lattice Piece Radius changes reuse the existing vertex data. This avoids the slow path of issuing one Canvas 2D call per piece from WASM, avoids repeatedly parsing color strings or rebuilding all vertices on every animation tick, and avoids re-uploading the whole simulation for every batch.
 
-Image export intentionally does not download the displayed viewport canvas. The PNG/WebP buttons render a deterministic offscreen pixel canvas from the current vertex buffer:
+The optional Spiral Track slider is render-only. It draws the board's underlying square, hex, or continuous spiral path as WebGL line geometry behind the point sprites and defaults to Off.
+
+Image export intentionally does not download the displayed viewport canvas. The PNG and JPEG 1/2 buttons render a deterministic offscreen pixel canvas from the current vertex buffer and download via `toBlob` object URLs rather than synchronous base64 data URLs:
 
 - LatticeSquare with Square shape exports one board cell per image pixel across the requested Radius bound.
-- LatticeHex, ContinuousArchimedean, and Circle shape exports use four pixels per world unit so non-orthogonal centers and circular bodies can be rasterized without viewport compression.
+- Full PNG exports preserve the original deterministic export scale.
+- JPEG 1/2 exports use half the export resolution and lossy JPEG compression for smaller, faster downloads.
+- LatticeHex, ContinuousArchimedean, Circle shape, and Hex shape exports use a fixed world-unit scale so non-orthogonal centers and non-square bodies can be rasterized without viewport compression.
 - Export bounds are based on the requested Radius, not the current browser viewport or Fit Screen scale.
 - File names include artifact type, board, army preset, enemy mode, shape, radius, piece radius, attacking state, completion state, and placement count.
 
@@ -144,8 +151,8 @@ Image export intentionally does not download the displayed viewport canvas. The 
 - Radius is a typed generation and view-bounding input; Piece Radius is a separate slider.
 - Fastest is the default speed mode.
 - Step advances one placement for precise inspection.
-- Start runs large pulled worker batches; Fastest uses 4096 placements or 1,000,000 candidate-work units per batch and yields between batches. Pause stops future batch requests after the current worker batch returns.
-- Shape is forced to Circle for `ContinuousArchimedean`.
+- Start runs pulled worker batches and yields between batches. Fastest uses smaller settings-aware batches for prime modes, especially ContinuousArchimedean prime presets, so the first visible placements arrive quickly and controls remain responsive. Pause stops future batch requests after the current worker batch returns.
+- Shape is forced to Circle for `ContinuousArchimedean`; Square, Circle, and Hex are available on lattice boards.
 - On lattice boards, changing Shape or Piece Radius redraws current pieces without resetting the worker simulation. In ContinuousArchimedean, changing Piece Radius resets because it changes collision and attack validity.
 - The `Attacking` toggle resets the simulation because it changes Rule B. When enabled, status text includes active rejection counts so the UI shows when proactive attacking is affecting candidates.
 - The placement log records settings, Radius, Piece Radius, anchor colors, first placements, latest placements, exact coordinates, pieces, color groups, and color rules. The worker sends only first/latest log samples, and the DOM text refresh is throttled to keep Fastest mode responsive. The Log export downloads the same inspection data with a settings-rich filename.
@@ -169,6 +176,7 @@ cargo fmt --check
 cargo test
 cargo build --target wasm32-unknown-unknown
 trunk build --release
+pnpm exec playwright test --project=chromium
 ```
 
-Browser smoke checks cover Radius-bounded completion, Shape and lattice Piece Radius redraws without reset, ContinuousArchimedean and LatticeHex custom runs with visible active rejection counts, ContinuousArchimedean Prime Knight and Prime Gap with `Color`, LatticeHex Prime Knight and Prime Gap with `Color`, Piece Radius defaulting to `0.25` on continuous boards, candidate-independent skipped spots in prime modes, deleting all custom pieces, placement logs with exact coordinates, custom order color rows, draggable row attributes, WebGL rendering, Start/Pause responsiveness, and absence of console errors.
+Browser smoke checks cover WebGL rendering, early progress for ContinuousArchimedean Prime Knight and Prime Gap in Fastest mode, Shape and lattice Piece Radius redraws without reset, Hex shape and spiral-track wiring, compressed image export, deleting all custom pieces, order-based custom row labels, placement logs, and absence of console errors. Manual browser checks should also cover Radius-bounded completion, active rejection counts with `Attacking` enabled, candidate-independent skipped spots in prime modes, draggable custom rows, Start/Pause responsiveness, and GitHub Pages-style subpath assets.

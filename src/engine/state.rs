@@ -1016,7 +1016,7 @@ mod tests {
         let settings = EngineSettings {
             board: BoardKind::ContinuousArchimedean,
             radius: 1.0,
-            piece_radius: 0.25,
+            piece_radius: 0.50,
             custom_army: vec![CustomPiece::with_auto_color(100, 0)],
             ..EngineSettings::default()
         };
@@ -1105,7 +1105,7 @@ mod tests {
         let mut passive = EngineSettings {
             board: BoardKind::ContinuousArchimedean,
             shape: ShapeKind::Circle,
-            piece_radius: 0.25,
+            piece_radius: 0.50,
             enemy_mode: EnemyMode::MoveSet,
             custom_army: vec![
                 CustomPiece::with_auto_color(3, 0),
@@ -1169,11 +1169,49 @@ mod tests {
     }
 
     #[test]
+    fn hex_attack_offsets_match_straight_then_sixty_degree_turn_rule() {
+        assert_eq!(
+            hex_attack_offsets(PieceSignature::new(1, 2))
+                .into_iter()
+                .collect::<FxHashSet<_>>(),
+            straight_then_turn_hex_offsets(2, 1)
+        );
+        assert_eq!(
+            hex_attack_offsets(PieceSignature::new(7, 11))
+                .into_iter()
+                .collect::<FxHashSet<_>>(),
+            straight_then_turn_hex_offsets(11, 7)
+        );
+    }
+
+    fn straight_then_turn_hex_offsets(long: i64, short: i64) -> FxHashSet<AxialCoord> {
+        const DIRECTIONS: [AxialCoord; 6] = [
+            AxialCoord { q: 1, r: 0 },
+            AxialCoord { q: 1, r: -1 },
+            AxialCoord { q: 0, r: -1 },
+            AxialCoord { q: -1, r: 0 },
+            AxialCoord { q: -1, r: 1 },
+            AxialCoord { q: 0, r: 1 },
+        ];
+
+        let mut offsets = FxHashSet::default();
+        for index in 0..DIRECTIONS.len() {
+            let straight = DIRECTIONS[index].scale(long);
+            let left = DIRECTIONS[(index + DIRECTIONS.len() - 1) % DIRECTIONS.len()].scale(short);
+            let right = DIRECTIONS[(index + 1) % DIRECTIONS.len()].scale(short);
+            offsets.insert(straight.add(left));
+            offsets.insert(straight.add(right));
+        }
+        offsets.remove(&AxialCoord::new(0, 0));
+        offsets
+    }
+
+    #[test]
     fn continuous_prime_knight_uses_piece_radius_and_keeps_progressing() {
         let settings = EngineSettings {
             board: BoardKind::ContinuousArchimedean,
             shape: ShapeKind::Circle,
-            piece_radius: 0.25,
+            piece_radius: 0.50,
             army_preset: ArmyPreset::PrimeKnight,
             enemy_mode: EnemyMode::MoveSet,
             ..EngineSettings::default()
@@ -1191,7 +1229,7 @@ mod tests {
             let settings = EngineSettings {
                 board: BoardKind::ContinuousArchimedean,
                 shape: ShapeKind::Circle,
-                piece_radius: 0.25,
+                piece_radius: 0.50,
                 army_preset,
                 enemy_mode: EnemyMode::Color,
                 ..EngineSettings::default()

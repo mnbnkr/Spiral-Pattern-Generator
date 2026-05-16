@@ -14,6 +14,7 @@ pub enum BoardKind {
 pub enum ShapeKind {
     Square,
     Circle,
+    Hex,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,8 +129,8 @@ pub fn auto_gap_color(gap: u32) -> String {
 
 #[must_use]
 pub fn rainbow_color(anchor_a: &str, anchor_b: &str, t: f64) -> String {
-    let left = parse_hex_rgb(anchor_a).unwrap_or_else(|| default_anchor_a_rgb());
-    let right = parse_hex_rgb(anchor_b).unwrap_or_else(|| default_anchor_b_rgb());
+    let left = parse_hex_rgb(anchor_a).unwrap_or_else(default_anchor_a_rgb);
+    let right = parse_hex_rgb(anchor_b).unwrap_or_else(default_anchor_b_rgb);
     rainbow_rgb(left, right, t).to_css_hex()
 }
 
@@ -285,6 +286,7 @@ pub struct EngineSettings {
     pub speed: SpeedMode,
     pub display_mode: DisplayMode,
     pub zoom: u8,
+    pub track_opacity: f32,
     pub proactive_attacking: bool,
     pub enemy_mode: EnemyMode,
     pub army_preset: ArmyPreset,
@@ -305,12 +307,13 @@ impl Default for EngineSettings {
             speed: SpeedMode::Fastest,
             display_mode: DisplayMode::FitScreen,
             zoom: 4,
+            track_opacity: 0.0,
             proactive_attacking: false,
-            enemy_mode: EnemyMode::MoveSet,
+            enemy_mode: EnemyMode::Color,
             army_preset: ArmyPreset::CustomFinite,
             custom_army: vec![
                 CustomPiece::with_auto_color(2, 1),
-                CustomPiece::with_auto_color(3, 0),
+                CustomPiece::with_auto_color(2, 1),
             ],
             continuous_offset: 0.0,
             prime_modulo_divisor: 12,

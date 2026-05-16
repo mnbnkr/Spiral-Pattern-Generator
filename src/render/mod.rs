@@ -1,10 +1,11 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
-    CanvasRenderingContext2d, HtmlAnchorElement, HtmlCanvasElement, ImageData, WebGlBuffer,
-    WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlUniformLocation,
+    Blob, CanvasRenderingContext2d, HtmlAnchorElement, HtmlCanvasElement, ImageData, Url,
+    WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlUniformLocation,
 };
 
+use crate::math::{ArchimedeanSpiral, HexSpiral, SquareSpiral};
 use crate::protocol::{
     BoardKind, ColorState, DisplayMode, EngineSettings, ShapeKind, VertexBufferUpdate,
 };
@@ -43,6 +44,7 @@ const FRAGMENT_SHADER: &str = r#"
 precision mediump float;
 
 uniform int u_shape;
+uniform float u_alpha;
 
 varying vec3 v_color;
 
@@ -52,9 +54,14 @@ void main() {
         if (dot(p, p) > 1.0) {
             discard;
         }
+    } else if (u_shape == 2) {
+        vec2 p = abs(gl_PointCoord * 2.0 - 1.0);
+        if (p.x > 0.8660254 || p.y > 1.0 || p.x * 0.5773503 + p.y > 1.0) {
+            discard;
+        }
     }
 
-    gl_FragColor = vec4(v_color, 1.0);
+    gl_FragColor = vec4(v_color, u_alpha);
 }
 "#;
 
@@ -69,9 +76,13 @@ pub struct CanvasRenderer {
     scale_uniform: WebGlUniformLocation,
     point_size_uniform: WebGlUniformLocation,
     shape_uniform: WebGlUniformLocation,
+    alpha_uniform: WebGlUniformLocation,
     vertices: Vec<f32>,
+    track_vertices: Vec<f32>,
     pending_upload: PendingUpload,
+    track_upload_pending: bool,
     gpu_capacity_floats: usize,
+    track_buffer: WebGlBuffer,
     settings: EngineSettings,
     color_state: ColorState,
 }
@@ -107,9 +118,15 @@ impl CanvasRenderer {
         let scale_uniform = uniform_location(&gl, &program, "u_scale")?;
         let point_size_uniform = uniform_location(&gl, &program, "u_point_size")?;
         let shape_uniform = uniform_location(&gl, &program, "u_shape")?;
+        let alpha_uniform = uniform_location(&gl, &program, "u_alpha")?;
+        let track_buffer = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("failed to create WebGL track buffer"))?;
 
         gl.clear_color(0.031, 0.035, 0.039, 1.0);
         gl.disable(Gl::DEPTH_TEST);
+        gl.enable(Gl::BLEND);
+        gl.blend_func(Gl::SRC_ALPHA, Gl::ONE_MINUS_SRC_ALPHA);
 
         let mut renderer = Self {
             canvas,
@@ -122,9 +139,13 @@ impl CanvasRenderer {
             scale_uniform,
             point_size_uniform,
             shape_uniform,
+            alpha_uniform,
             vertices: Vec::new(),
+            track_vertices: Vec::new(),
             pending_upload: PendingUpload::Full,
+            track_upload_pending: true,
             gpu_capacity_floats: 0,
+            track_buffer,
             settings: EngineSettings::default(),
             color_state: ColorState::default(),
         };
@@ -134,6 +155,8 @@ impl CanvasRenderer {
 
     pub fn set_settings(&mut self, settings: EngineSettings) -> Result<(), JsValue> {
         self.settings = settings;
+        self.track_vertices = build_track_vertices(&self.settings);
+        self.track_upload_pending = true;
         self.redraw()
     }
 
@@ -219,17 +242,70 @@ impl CanvasRenderer {
         let render_state = self.render_state(width, height);
 
         self.gl.viewport(0, 0, width as i32, height as i32);
+        self.gl.use_program(Some(&self.program));
+        self.gl
+            .uniform2f(Some(&self.resolution_uniform), width as f32, height as f32);
+        self.gl
+            .uniform1f(Some(&self.scale_uniform), render_state.scale);
+        self.gl.clear(Gl::COLOR_BUFFER_BIT);
+
+        if self.settings.track_opacity > f32::EPSILON && !self.track_vertices.is_empty() {
+            self.draw_track()?;
+        }
 
         if self.vertices.is_empty() {
-            self.gl.clear(Gl::COLOR_BUFFER_BIT);
             self.pending_upload = PendingUpload::None;
             return Ok(());
         }
 
-        self.gl.use_program(Some(&self.program));
         self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.buffer));
         self.sync_gpu_buffer()?;
+        self.configure_vertex_attribs();
+        self.gl
+            .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
+        self.gl
+            .uniform1i(Some(&self.shape_uniform), render_state.shape);
+        self.gl.uniform1f(Some(&self.alpha_uniform), 1.0);
+        self.gl.draw_arrays(
+            Gl::POINTS,
+            0,
+            (self.vertices.len() / FLOATS_PER_VERTEX) as i32,
+        );
 
+        Ok(())
+    }
+
+    fn draw_track(&mut self) -> Result<(), JsValue> {
+        self.gl
+            .bind_buffer(Gl::ARRAY_BUFFER, Some(&self.track_buffer));
+        if self.track_upload_pending {
+            unsafe {
+                let view = js_sys::Float32Array::view(&self.track_vertices);
+                self.gl.buffer_data_with_array_buffer_view(
+                    Gl::ARRAY_BUFFER,
+                    &view,
+                    Gl::STATIC_DRAW,
+                );
+            }
+            self.track_upload_pending = false;
+        }
+
+        self.configure_vertex_attribs();
+        self.gl.uniform1f(Some(&self.point_size_uniform), 1.0);
+        self.gl.uniform1i(Some(&self.shape_uniform), 0);
+        self.gl.uniform1f(
+            Some(&self.alpha_uniform),
+            self.settings.track_opacity.clamp(0.0, 1.0),
+        );
+        self.gl.draw_arrays(
+            Gl::LINE_STRIP,
+            0,
+            (self.track_vertices.len() / FLOATS_PER_VERTEX) as i32,
+        );
+        Ok(())
+    }
+
+    fn configure_vertex_attribs(&self) {
         let stride = 5 * std::mem::size_of::<f32>() as i32;
         self.gl.enable_vertex_attrib_array(self.position_attrib);
         self.gl.vertex_attrib_pointer_with_i32(
@@ -249,29 +325,16 @@ impl CanvasRenderer {
             stride,
             2 * std::mem::size_of::<f32>() as i32,
         );
-
-        self.gl
-            .uniform2f(Some(&self.resolution_uniform), width as f32, height as f32);
-        self.gl
-            .uniform1f(Some(&self.scale_uniform), render_state.scale);
-        self.gl
-            .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
-        self.gl
-            .uniform1i(Some(&self.shape_uniform), render_state.shape);
-
-        self.gl.clear(Gl::COLOR_BUFFER_BIT);
-        self.gl.draw_arrays(
-            Gl::POINTS,
-            0,
-            (self.vertices.len() / FLOATS_PER_VERTEX) as i32,
-        );
-
-        Ok(())
     }
 
-    pub fn download_image(&self, mime_type: &str, filename: &str) -> Result<(), JsValue> {
-        let export_canvas = self.pixel_export_canvas()?;
-        let data_url = export_canvas.to_data_url_with_type(mime_type)?;
+    pub fn download_image(
+        &self,
+        mime_type: &str,
+        filename: &str,
+        resolution_scale: f64,
+        encoder_quality: Option<f64>,
+    ) -> Result<(), JsValue> {
+        let export_canvas = self.pixel_export_canvas(resolution_scale)?;
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
         let document = window
             .document()
@@ -279,10 +342,33 @@ impl CanvasRenderer {
         let anchor = document
             .create_element("a")?
             .dyn_into::<HtmlAnchorElement>()?;
-
-        anchor.set_href(&data_url);
         anchor.set_download(filename);
-        anchor.click();
+
+        let callback = Closure::<dyn FnMut(JsValue)>::new(move |blob_value: JsValue| {
+            if blob_value.is_null() || blob_value.is_undefined() {
+                web_sys::console::error_1(&JsValue::from_str("image encoder returned no blob"));
+                return;
+            }
+
+            let blob = blob_value.unchecked_into::<Blob>();
+            match Url::create_object_url_with_blob(&blob) {
+                Ok(url) => {
+                    anchor.set_href(&url);
+                    anchor.click();
+                    if let Err(error) = Url::revoke_object_url(&url) {
+                        web_sys::console::error_1(&error);
+                    }
+                }
+                Err(error) => web_sys::console::error_1(&error),
+            }
+        });
+        let quality = encoder_quality.unwrap_or(0.92);
+        export_canvas.to_blob_with_type_and_encoder_options(
+            callback.as_ref().unchecked_ref(),
+            mime_type,
+            &JsValue::from_f64(quality),
+        )?;
+        callback.forget();
         Ok(())
     }
 
@@ -352,8 +438,8 @@ impl CanvasRenderer {
         Ok(())
     }
 
-    fn pixel_export_canvas(&self) -> Result<HtmlCanvasElement, JsValue> {
-        let spec = self.export_spec();
+    fn pixel_export_canvas(&self, resolution_scale: f64) -> Result<HtmlCanvasElement, JsValue> {
+        let spec = self.export_spec(resolution_scale);
         let pixel_count = spec.width as usize * spec.height as usize;
         if pixel_count > 64_000_000 {
             return Err(JsValue::from_str(
@@ -415,14 +501,8 @@ impl CanvasRenderer {
 
     fn render_state(&self, width: u32, height: u32) -> RenderState {
         let scale = self.world_scale(width as f64, height as f64);
-        let radius_px = (scale * self.settings.piece_radius).max(1.0);
-        let shape = if self.settings.shape == ShapeKind::Circle
-            || self.settings.board == BoardKind::ContinuousArchimedean
-        {
-            1
-        } else {
-            0
-        };
+        let radius_px = (scale * rendered_piece_radius(&self.settings)).max(1.0);
+        let shape = shader_shape(&self.settings);
 
         RenderState {
             width,
@@ -433,13 +513,14 @@ impl CanvasRenderer {
         }
     }
 
-    fn export_spec(&self) -> ExportSpec {
+    fn export_spec(&self, resolution_scale: f64) -> ExportSpec {
         let radius = self.settings.radius.max(1.0);
         let board = self.settings.board;
         let square_pixel_cells =
             board == BoardKind::LatticeSquare && self.settings.shape == ShapeKind::Square;
-        let scale = if square_pixel_cells { 1.0 } else { 4.0 };
-        let piece_radius = self.settings.piece_radius.max(0.0);
+        let base_scale = if square_pixel_cells { 1.0 } else { 4.0 };
+        let scale = (base_scale * resolution_scale.clamp(0.25, 1.0)).max(0.25);
+        let piece_radius = rendered_piece_radius(&self.settings).max(0.0);
         let margin = if square_pixel_cells {
             0.0
         } else {
@@ -467,13 +548,7 @@ impl CanvasRenderer {
 
         let width = ((max_x - min_x) * scale).round() as u32 + 1;
         let height = ((max_y - min_y) * scale).round() as u32 + 1;
-        let shape = if self.settings.shape == ShapeKind::Circle
-            || board == BoardKind::ContinuousArchimedean
-        {
-            ExportShape::Circle
-        } else {
-            ExportShape::Square
-        };
+        let shape = export_shape(&self.settings);
 
         ExportSpec {
             min_x,
@@ -518,6 +593,86 @@ struct ExportSpec {
 enum ExportShape {
     Square,
     Circle,
+    Hex,
+}
+
+fn rendered_piece_radius(settings: &EngineSettings) -> f64 {
+    if settings.shape == ShapeKind::Hex && settings.board == BoardKind::LatticeHex {
+        settings.piece_radius * 2.0
+    } else {
+        settings.piece_radius
+    }
+}
+
+fn shader_shape(settings: &EngineSettings) -> i32 {
+    if settings.board == BoardKind::ContinuousArchimedean || settings.shape == ShapeKind::Circle {
+        1
+    } else if settings.shape == ShapeKind::Hex {
+        2
+    } else {
+        0
+    }
+}
+
+fn export_shape(settings: &EngineSettings) -> ExportShape {
+    if settings.board == BoardKind::ContinuousArchimedean || settings.shape == ShapeKind::Circle {
+        ExportShape::Circle
+    } else if settings.shape == ShapeKind::Hex {
+        ExportShape::Hex
+    } else {
+        ExportShape::Square
+    }
+}
+
+fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
+    if settings.track_opacity <= f32::EPSILON {
+        return Vec::new();
+    }
+
+    let mut vertices = Vec::new();
+    match settings.board {
+        BoardKind::LatticeSquare => {
+            let bound = settings.radius.max(0.0).floor() as i64;
+            for coord in SquareSpiral::new() {
+                if coord.x.abs().max(coord.y.abs()) > bound {
+                    break;
+                }
+                let point = coord.to_point();
+                push_track_vertex(&mut vertices, point.x, point.y);
+            }
+        }
+        BoardKind::LatticeHex => {
+            let bound = settings.radius.max(0.0).floor() as i64;
+            for coord in HexSpiral::new() {
+                let (x, y, z) = coord.cube();
+                if x.abs().max(y.abs()).max(z.abs()) > bound {
+                    break;
+                }
+                let point = coord.to_point();
+                push_track_vertex(&mut vertices, point.x, point.y);
+            }
+        }
+        BoardKind::ContinuousArchimedean => {
+            let radius = settings.radius.max(0.0);
+            let start_theta =
+                ArchimedeanSpiral::theta_for_arc_length_from_origin(settings.continuous_offset)
+                    .unwrap_or(0.0);
+            let end_theta = radius * std::f64::consts::TAU;
+            let step = 0.05_f64;
+            let mut theta = start_theta.min(end_theta);
+            while theta <= end_theta {
+                let point = ArchimedeanSpiral::position(theta);
+                push_track_vertex(&mut vertices, point.x, point.y);
+                theta += step;
+            }
+        }
+    }
+
+    vertices
+}
+
+fn push_track_vertex(vertices: &mut Vec<f32>, x: f64, y: f64) {
+    vertices.extend_from_slice(&[x as f32, y as f32, 0.70, 0.78, 0.86]);
 }
 
 fn fill_background(pixels: &mut [u8]) {
@@ -576,6 +731,13 @@ fn export_shape_contains(
         }
         ExportShape::Circle => {
             (world_x - center_x).hypot(world_y - center_y) <= piece_radius + epsilon
+        }
+        ExportShape::Hex => {
+            let dx = ((world_x - center_x) / piece_radius.max(epsilon)).abs();
+            let dy = ((world_y - center_y) / piece_radius.max(epsilon)).abs();
+            dx <= 0.866_025_403_784 + epsilon
+                && dy <= 1.0 + epsilon
+                && dx / 3.0_f64.sqrt() + dy <= 1.0 + epsilon
         }
     }
 }

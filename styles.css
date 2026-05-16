@@ -1,7 +1,12 @@
 :root {
   color-scheme: dark;
   font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
     sans-serif;
   background: #111315;
   color: #eef1f4;
@@ -79,6 +84,57 @@ label {
   color: #d9dee5;
   font-size: 13px;
   font-weight: 650;
+}
+
+.label-row {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.info-icon {
+  position: relative;
+  display: inline-grid;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgb(255 255 255 / 22%);
+  border-radius: 999px;
+  color: #9fc9ff;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  cursor: help;
+}
+
+.global-tooltip {
+  position: fixed;
+  z-index: 9999;
+  width: min(270px, calc(100vw - 64px));
+  padding: 8px 10px;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 999px;
+  background: #edf6ff;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 34%);
+  color: #16202a;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.3;
+  opacity: 0;
+  pointer-events: none;
+  text-align: center;
+  transform: translate(-50%, calc(-100% + 4px));
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+
+.global-tooltip.visible {
+  opacity: 1;
+  transform: translate(-50%, -100%);
 }
 
 output {
@@ -173,6 +229,10 @@ input[type="color"] {
 
 .piece-add-row button {
   grid-column: 1 / -1;
+}
+
+.piece-add-row {
+  margin-bottom: 8px;
 }
 
 .army-list {
