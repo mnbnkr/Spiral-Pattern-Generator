@@ -13,5 +13,4 @@ ignore = [
     "dist",
     "node_modules",
     "target",
-    "test-results",
 ]
