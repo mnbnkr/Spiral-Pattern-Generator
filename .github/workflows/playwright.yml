@@ -31,6 +31,8 @@ jobs:
         run: pnpm exec playwright install --with-deps
       - name: Build Web App
         run: trunk build
+      - name: Create Test Directories
+        run: mkdir -p test-results playwright-report
       - name: Run Playwright tests
         run: pnpm exec playwright test
       - uses: actions/upload-artifact@v7
