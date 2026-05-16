@@ -28,7 +28,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Trunk
-        run: cargo install trunk --version 0.21.14 --locked
+        uses: jetli/trunk-action@v0.5.1
+        with:
+          version: "latest"
 
       - name: Build static assets
         run: |
