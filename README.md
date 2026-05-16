@@ -1,4 +1,8 @@
-# Spiral Pattern Generator
+# Spiral Pattern Generator (in alpha)
+<br>
+Inspired by <i>- Numberphile's 'Red & Black Knights' <a href="https://youtu.be/UiX4CFIiegM">video</a>, - Jonas Karlsson's <a href="https://jonka364.github.io/stendhal/stendhal.html">work</a>, - and Pitouli's 'Knights' <a href="https://github.com/Pitouli/knights">web application</a>.</i>
+
+<br><br>
 
 Rust/WASM application for deterministic spiral pattern simulations. The app uses Trunk, `wasm-bindgen`, `web-sys`, a dedicated Web Worker for simulation, and a WebGL renderer on one HTML5 `<canvas>`.
 
