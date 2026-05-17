@@ -32,14 +32,14 @@ pnpm exec playwright test --project=chromium
 - `src/render`: WebGL point-sprite canvas renderer and image export.
 - `src/render_data.rs`: shared render-data packing for worker-side WebGL vertices.
 - `src/engine`: deterministic worker-owned simulation engine and spatial indexes.
-- `src/math`: square, hex, continuous spiral geometry, root solving, and collision predicates.
+- `src/math`: square, hex, triangle, continuous spiral geometry, root solving, and collision predicates.
 - `src/protocol.rs`: typed `serde` contracts for app/worker messages and placement data.
 
 Trunk builds two Rust assets from `index.html`: `spg_app` as the main WASM binary and `spg_worker` as a worker binary with a loader shim. The main thread starts `spg_worker_loader.js`, which imports the generated worker glue and initializes the worker WASM.
 
 `Trunk.toml` uses a relative default `public_url` so local static builds are path-portable. GitHub Pages deployment is handled by `.github/workflows/pages.yml`, which builds with a repository subpath public URL and uploads the generated `dist` assets through the Pages artifact flow.
 
-The run loop is a main-thread pull loop with at most one worker calculation batch in flight. After a batch arrives, the main thread appends the packed vertices and requests the next worker batch, while canvas drawing is coalesced onto `requestAnimationFrame`. This keeps the worker from pushing an unbounded queue while preventing WebGL redraws from throttling calculation throughput.
+The default visual run loop is a main-thread pull loop with at most one worker calculation batch in flight. After a batch arrives, the main thread appends the packed vertices and requests the next worker batch, while canvas drawing is coalesced onto `requestAnimationFrame`. This keeps the worker from pushing an unbounded queue while preventing WebGL redraws from throttling calculation throughput. When `Visual Progress` is disabled, the worker runs silently and sends final vertices/log samples only when the radius-bounded run completes or a long silent work slice yields.
 
 Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Each worker batch includes only the placement samples needed for the first/latest log display, plus a packed `[x, y, r, g, b]` `Vec<f32>` for direct WebGL upload. Most batches append vertices. Prime Gap recoloring and anchor-color changes send a full replacement vertex buffer so existing pieces stay visually consistent without making the main thread recompute all colors every frame.
 
@@ -83,7 +83,13 @@ The square spiral iterator matches the supplied Python generator:
 
 ### Hex Lattice
 
-The hex spiral uses axial coordinates with cube-consistent directions. It emits the origin first and then complete rings with counts `6r`, giving cumulative ring sizes of `1, 7, 19, 37, ...`.
+The hex spiral uses axial coordinates with cube-consistent directions. It emits the origin first, then starts immediately to the visual right and walks counterclockwise through adjacent cells. Ring transitions remain adjacent, complete rings have counts `6r`, and cumulative ring sizes are `1, 7, 19, 37, ...`.
+
+### Triangle Lattice
+
+The triangle board uses one fixed orientation of equilateral triangle cells as visible placement spots. The visible spot centers form a triangular axial lattice, and the spiral starts at the origin, moves immediately to the visual right, then turns 120 degrees left at triangular-number corners. Segment lengths are `1, 2, 3, 4, ...`, so the first spots are `0`, then `1` to the right, then two steps on the next vector, three on the next, and so on. The opposite-orientation triangles in the tiling are hidden from placement but are counted by triangle attack stepping.
+
+Triangle attacks use three primary corner-aligned `A` rays. After walking through the alternating triangle tiling, the `B` leg resolves to the two nearest visible same-orientation cells perpendicular to that ray. `(1,1)`, `(2,1)`, and `(3,1)` each produce six visible attack targets after deduplication.
 
 ### Continuous Archimedean Spiral
 
@@ -107,6 +113,7 @@ The chord solver uses Newton-Raphson with a bracketed bisection fallback. At lar
 
 - LatticeSquare uses Chebyshev spiral ring radius: `max(abs(x), abs(y)) <= floor(radius)`.
 - LatticeHex uses cube/hex ring radius: `max(abs(x), abs(y), abs(z)) <= floor(radius)`.
+- LatticeTriangle uses the triangular spiral shell index: shell `0` is spot `0`, shell `1` is segments `1..=3` and spots `1..=6`, shell `2` is segments `4..=6`, and so on. The worker stops when the next spot's shell first exceeds `floor(radius)`.
 - ContinuousArchimedean uses center radius: `sqrt(x*x + y*y) <= radius`.
 
 ## Piece Radius, Collision, And Attacks
@@ -135,28 +142,33 @@ abs(center_distance - attack_radius) <= piece_radius + EPS
 
 ## Rendering
 
-The renderer uses WebGL point sprites on the same canvas. Each placement contributes one packed vertex of world position and RGB color. The shader handles Square, Circle, and Hex piece shapes through `gl_PointCoord`; Continuous Archimedean still forces Circle because its simulation bodies are circular. On LatticeHex, Hex shape uses a full regular hex cell scale so Piece Radius `0.50` fills adjacent hex cells without overlap.
+The renderer uses WebGL point sprites on the same canvas. Each placement contributes one packed vertex of world position and RGB color. The shader handles Square, Circle, Hex, and Triangle piece shapes through `gl_PointCoord`; Continuous Archimedean still forces Circle because its simulation bodies are circular. Triangle Lattice offers Triangle and Circle rendering. On LatticeHex, Hex shape uses a full regular hex cell scale so Piece Radius `0.50` fills adjacent hex cells without overlap. On LatticeTriangle, Triangle shape scales the default `0.50` Piece Radius to the exact same-orientation triangle size for non-overlapping contact on the triangular center lattice.
 
 The worker computes vertex positions and RGB colors once per emitted batch. The main thread appends or replaces the already-packed vertex buffer and uploads it to WebGL incrementally. Appended batches use `bufferSubData`; every visible `requestAnimationFrame` redraws the full uploaded point buffer in one `drawArrays(POINTS)` call. The full redraw is required because a normal WebGL canvas is not a persistent retained framebuffer: relying on previous frames to keep old point sprites can make older pieces disappear after browser compositing or GPU buffer growth. Shape, zoom, display-mode, spiral-track opacity, and lattice Piece Radius changes reuse the existing vertex data. This avoids the slow path of issuing one Canvas 2D call per piece from WASM, avoids repeatedly parsing color strings or rebuilding all vertices on every animation tick, and avoids re-uploading the whole simulation for every batch.
 
-The optional Spiral Track slider is render-only. It draws the board's underlying square, hex, or continuous spiral path as WebGL line geometry behind the point sprites and defaults to Off.
+The optional Spiral Track slider is render-only. It draws the board's underlying square, hex, triangle, or continuous spiral path as WebGL line geometry behind the point sprites and defaults to Off. Track geometry is cached and capped for high radii so toggling visibility stays responsive.
 
 Image export intentionally does not download the displayed viewport canvas. The PNG and JPEG 1/2 buttons render a deterministic offscreen pixel canvas from the current vertex buffer and download via `toBlob` object URLs rather than synchronous base64 data URLs:
 
 - LatticeSquare with Square shape exports one board cell per image pixel across the requested Radius bound.
 - Full PNG exports preserve the original deterministic export scale.
 - JPEG 1/2 exports use half the export resolution and lossy JPEG compression for smaller, faster downloads.
-- LatticeHex, ContinuousArchimedean, Circle shape, and Hex shape exports use a fixed world-unit scale so non-orthogonal centers and non-square bodies can be rasterized without viewport compression.
+- LatticeHex, LatticeTriangle, ContinuousArchimedean, Circle shape, Hex shape, and Triangle shape exports use a fixed world-unit scale so non-orthogonal centers and non-square bodies can be rasterized without viewport compression.
 - Export bounds are based on the requested Radius, not the current browser viewport or Fit Screen scale.
 - File names include artifact type, board, army preset, enemy mode, shape, radius, piece radius, attacking state, completion state, and placement count.
+- Export remains strict full-scale: if the requested deterministic export exceeds browser canvas or memory limits, the status line shows an export error instead of silently doing nothing or downscaling.
 
 ## UI Notes
 
 - Radius is a typed generation and view-bounding input; Piece Radius is a separate slider.
 - Fastest is the default speed mode.
 - Step advances one placement for precise inspection.
-- Start runs pulled worker batches and yields between batches. Fastest uses smaller settings-aware batches for prime modes, especially ContinuousArchimedean prime presets, so the first visible placements arrive quickly and controls remain responsive. Pause stops future batch requests after the current worker batch returns.
-- Shape is forced to Circle for `ContinuousArchimedean`; Square, Circle, and Hex are available on lattice boards.
+- The untouched default simulation auto-starts so the initial canvas is nonblank.
+- Start runs pulled worker batches and yields between batches when `Visual Progress` is enabled. Fastest uses smaller settings-aware batches for prime modes, especially ContinuousArchimedean prime presets, so the first visible placements arrive quickly and controls remain responsive. Pause stops future batch requests after the current worker batch returns.
+- Disabling `Visual Progress` makes the worker suppress live vertices and log updates until completion or a long silent work slice. Start shows an explicit silent-run status. Re-enabling Visual Progress while a silent run is active cancels that silent worker run, pauses, and lets the next Start run visually again.
+- Refresh terminates any active worker run, recreates worker/render state, clears stale in-flight messages, pauses, and preserves the current settings and custom army.
+- The canvas can be panned with left mouse drag when zoomed in. In `1:1 Pixel` mode, the mouse wheel changes Zoom around the cursor.
+- Shape is forced to Circle for `ContinuousArchimedean`; Triangle Lattice offers Triangle and Circle; Square, Circle, and Hex are available on square/hex lattice boards. The first switch to Hex Lattice defaults to Hex shape, and later board switches remember the user's per-session shape choice for each lattice board.
 - On lattice boards, changing Shape or Piece Radius redraws current pieces without resetting the worker simulation. In ContinuousArchimedean, changing Piece Radius resets because it changes collision and attack validity.
 - The `Attacking` toggle resets the simulation because it changes Rule B. When enabled, status text includes active rejection counts so the UI shows when proactive attacking is affecting candidates.
 - The placement log records settings, Radius, Piece Radius, anchor colors, first placements, latest placements, exact coordinates, pieces, color groups, and color rules. The worker sends only first/latest log samples, and the DOM text refresh is throttled to keep Fastest mode responsive. The Log export downloads the same inspection data with a settings-rich filename.
@@ -165,7 +177,7 @@ Image export intentionally does not download the displayed viewport canvas. The 
 - Changing board, continuous piece radius, rules, offset, army preset, custom army, or prime divisor resets the simulation because those inputs alter placement validity or generation bounds.
 - Fit Screen maps the requested Radius to the viewport. It does not auto-expand to include every placement.
 
-Continuous passive and proactive attack checks use the continuous spatial hash to probe only centers that can fall inside the relevant body or attack-ring radius, then apply the exact thin-ring predicate. This avoids scanning every previously placed continuous piece for every candidate while preserving the mathematical rule.
+Continuous passive and proactive attack checks use the continuous spatial hash to probe only centers that can fall inside the relevant body or attack-ring radius, then apply the exact thin-ring predicate. Prime moves whose attack radius is larger than any possible distance inside the requested generation bound are skipped from broad spatial probes, which avoids the old Continuous Prime Knight/Gap slowdown without changing the attack semantics.
 
 ## Editor Notes
 
@@ -183,4 +195,4 @@ trunk build --release
 pnpm exec playwright test --project=chromium
 ```
 
-Browser smoke checks cover WebGL rendering, early progress for ContinuousArchimedean Prime Knight and Prime Gap in Fastest mode, Shape and lattice Piece Radius redraws without reset, Hex shape and spiral-track wiring, compressed image export, deleting all custom pieces, order-based custom row labels, placement logs, and absence of console errors. Manual browser checks should also cover Radius-bounded completion, active rejection counts with `Attacking` enabled, candidate-independent skipped spots in prime modes, draggable custom rows, Start/Pause responsiveness, and GitHub Pages-style subpath assets.
+Browser smoke checks cover WebGL rendering, default auto-run, early progress for ContinuousArchimedean Prime Knight and Prime Gap in Fastest mode, Shape and lattice Piece Radius redraws without reset, Hex and Triangle shape wiring, spiral-track responsiveness, compressed image export, strict export errors, panning and wheel zoom, deleting all custom pieces, order-based custom row labels, placement logs, and absence of console errors. Manual browser checks should also cover Radius-bounded completion, active rejection counts with `Attacking` enabled, candidate-independent skipped spots in prime modes, draggable custom rows, Start/Pause responsiveness, and GitHub Pages-style subpath assets.

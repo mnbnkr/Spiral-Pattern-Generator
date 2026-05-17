@@ -19,9 +19,21 @@
     <canvas id="sim-canvas" aria-label="Spiral pattern canvas"></canvas>
     <aside id="control-panel" class="panel">
       <header class="panel-header">
-        <h1>Spiral Pattern Generator</h1>
+        <div class="title-row">
+          <h1>Spiral Pattern Generator</h1>
+          <button
+            id="panel-toggle-button"
+            class="small-header-button"
+            type="button"
+            title="Collapse controls"
+          >
+            Hide
+          </button>
+        </div>
         <div id="status-line">Idle</div>
       </header>
+
+      <div class="panel-body">
 
       <section class="control-section">
         <div class="two-column-row">
@@ -31,12 +43,13 @@
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Choose the coordinate system used by the worker: square spiral cells, axial hex spiral cells, or exact continuous Archimedean spots."
+                data-tip="Choose the coordinate system used by the worker: triangle, square, axial hex, or exact continuous Archimedean spots."
                 >i</span
               ></span
             >
             <select id="board-select">
-              <option value="LatticeSquare">Square Lattice</option>
+              <option value="LatticeTriangle">Triangle Lattice</option>
+              <option value="LatticeSquare" selected>Square Lattice</option>
               <option value="LatticeHex">Hex Lattice</option>
               <option value="ContinuousArchimedean">Continuous Spiral</option>
             </select>
@@ -53,33 +66,42 @@
               ></span
             >
             <select id="shape-select">
-              <option value="Square">Square</option>
+              <option id="shape-option-square" value="Square">Square</option>
               <option value="Circle">Circle</option>
-              <option value="Hex">Hex</option>
+              <option id="shape-option-hex" value="Hex">Hex</option>
+              <option id="shape-option-triangle" value="Triangle" disabled>
+                Triangle
+              </option>
             </select>
           </label>
         </div>
       </section>
 
       <section class="control-section">
-        <label for="radius-input"
-          ><span class="label-row"
-            >View / Generation Radius
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="Radius controls both Fit Screen bounds and where the worker stops generating. Edits preview immediately and commit after a short delay."
-              >i</span
-            ></span
-          ></label
-        >
-        <input
-          id="radius-input"
-          type="text"
-          value="100"
-          inputmode="decimal"
-          autocomplete="off"
-        />
+        <div class="radius-row">
+          <label for="radius-input"
+            ><span class="label-row"
+              >View / Generation Radius
+              <span
+                class="info-icon"
+                tabindex="0"
+                data-tip="Radius controls both Fit Screen bounds and where the worker stops generating. Edits preview immediately and commit after a short delay."
+                >i</span
+              ></span
+            >
+            <input
+              id="radius-input"
+              type="text"
+              value="100"
+              inputmode="decimal"
+              autocomplete="off"
+            />
+          </label>
+          <label class="inline-control visual-progress" for="visual-progress-toggle">
+            <input id="visual-progress-toggle" type="checkbox" checked />
+            Visual Progress
+          </label>
+        </div>
 
         <label for="piece-radius-slider"
           ><span class="label-row"
@@ -101,29 +123,31 @@
           value="0.50"
         />
 
-        <label for="speed-slider"
-          ><span class="label-row"
-            >Speed <output id="speed-output">250/s</output>
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="Fastest uses bounded worker batches. Slower rates are useful when inspecting exact placement order."
-              >i</span
-            ></span
-          ></label
-        >
-        <input
-          id="speed-slider"
-          type="range"
-          min="1"
-          max="1000"
-          step="1"
-          value="250"
-        />
-        <label class="inline-control" for="fastest-toggle">
-          <input id="fastest-toggle" type="checkbox" checked />
-          Fastest
-        </label>
+        <div class="inline-setting-row">
+          <label for="speed-slider"
+            ><span class="label-row"
+              >Speed <output id="speed-output">250/s</output>
+              <span
+                class="info-icon"
+                tabindex="0"
+                data-tip="Fastest uses bounded worker batches. Slower rates are useful when inspecting exact placement order."
+                >i</span
+              ></span
+            >
+            <input
+              id="speed-slider"
+              type="range"
+              min="1"
+              max="1000"
+              step="1"
+              value="250"
+            />
+          </label>
+          <label class="inline-control" for="fastest-toggle">
+            <input id="fastest-toggle" type="checkbox" checked />
+            Fastest
+          </label>
+        </div>
 
         <label for="continuous-offset-input"
           ><span class="label-row"
@@ -203,38 +227,45 @@
       </section>
 
       <section class="control-section">
-        <label class="inline-control" for="attacking-toggle">
-          <input id="attacking-toggle" type="checkbox" />
-          <span class="label-row"
-            >Proactive Attack Rule
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="When enabled, a candidate is rejected if it would attack an existing enemy piece. Status shows active rejection counts."
-              >i</span
-            ></span
-          >
-        </label>
+        <div class="split-setting-row">
+          <label class="setting-pair" for="enemy-mode-select"
+            ><span class="label-row"
+              >Ally / Enemy Condition
+              <span
+                class="info-icon"
+                tabindex="0"
+                data-tip="Move-set treats different normalized piece jumps as enemies. Color treats different color groups as enemies."
+                >i</span
+              ></span
+            >
+            <select id="enemy-mode-select">
+              <option value="MoveSet">Move-set</option>
+              <option value="Color" selected>Color</option>
+            </select>
+          </label>
 
-        <label for="enemy-mode-select"
-          ><span class="label-row"
-            >Ally / Enemy Condition
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="Move-set treats different normalized piece jumps as enemies. Color treats different color groups as enemies."
-              >i</span
-            ></span
-          ></label
-        >
-        <select id="enemy-mode-select">
-          <option value="MoveSet">Move-set</option>
-          <option value="Color" selected>Color</option>
-        </select>
+          <span class="row-divider" aria-hidden="true"></span>
+
+          <label class="setting-pair checkbox-pair" for="attacking-toggle">
+            <span class="label-row"
+              >Proactive Attack Rule
+              <span
+                class="info-icon"
+                tabindex="0"
+                data-tip="When enabled, a candidate is rejected if it would attack an existing enemy piece. Status shows active rejection counts."
+                >i</span
+              ></span
+            >
+            <span class="inline-control">
+              <input id="attacking-toggle" type="checkbox" />
+              Enabled
+            </span>
+          </label>
+        </div>
       </section>
 
       <section class="control-section">
-        <label for="army-preset-select"
+        <label class="inline-setting-row" for="army-preset-select"
           ><span class="label-row"
             >Army Preset
             <span
@@ -243,22 +274,22 @@
               data-tip="Custom Finite cycles through your ordered rows. Prime presets consume each generated prime piece at most once."
               >i</span
             ></span
-          ></label
-        >
-        <select id="army-preset-select">
-          <option value="CustomFinite">Custom Finite</option>
-          <option value="PrimeKnight">Prime Knight</option>
-          <option value="PrimeGap">Prime Gap</option>
-        </select>
+          >
+          <select id="army-preset-select">
+            <option value="CustomFinite">Custom Finite</option>
+            <option value="PrimeKnight">Prime Knight</option>
+            <option value="PrimeGap">Prime Gap</option>
+          </select>
+        </label>
 
         <div id="custom-army-editor">
           <div class="piece-add-row">
             <label for="piece-a-input"
-              >A
+              >Primary Move
               <input id="piece-a-input" type="number" step="1" value="2" />
             </label>
             <label for="piece-b-input"
-              >B
+              >Turn Move
               <input id="piece-b-input" type="number" step="1" value="1" />
             </label>
             <button id="add-piece-button" type="button">Add</button>
@@ -267,7 +298,10 @@
         </div>
 
         <div id="prime-color-controls">
-          <label for="prime-divisor-input"
+          <label
+            id="prime-divisor-label"
+            class="inline-setting-row"
+            for="prime-divisor-input"
             ><span class="label-row"
               >Modulo Divisor (colors)
               <span
@@ -276,19 +310,19 @@
                 data-tip="Prime Knight colors bounce through modulo buckets between Anchor A and Anchor B."
                 >i</span
               ></span
-            ></label
-          >
-          <input
-            id="prime-divisor-input"
-            type="number"
-            min="2"
-            step="1"
-            value="12"
-          />
+            >
+            <input
+              id="prime-divisor-input"
+              type="number"
+              min="2"
+              step="1"
+              value="12"
+            />
+          </label>
           <div class="anchor-row">
             <label for="anchor-a-input"
               ><span class="label-row"
-                >Color Anchor A
+                >Start Color
                 <span
                   class="info-icon"
                   tabindex="0"
@@ -300,7 +334,7 @@
             </label>
             <label for="anchor-b-input"
               ><span class="label-row"
-                >Color Anchor B
+                >End Color
                 <span
                   class="info-icon"
                   tabindex="0"
@@ -318,6 +352,7 @@
         <button id="start-button" type="button">Start</button>
         <button id="pause-button" type="button">Pause</button>
         <button id="step-button" type="button">Step</button>
+        <button id="refresh-button" type="button">Refresh</button>
       </section>
 
       <section class="button-row">
@@ -330,6 +365,7 @@
         <label for="placement-log">Placement Log</label>
         <pre id="placement-log">No placements yet.</pre>
       </section>
+      </div>
     </aside>
 
     <script>

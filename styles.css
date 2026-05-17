@@ -57,6 +57,33 @@ body {
   margin-bottom: 14px;
 }
 
+.title-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.small-header-button {
+  width: auto;
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.panel.collapsed {
+  width: min(430px, calc(100vw - 32px));
+  overflow: hidden;
+}
+
+.panel.collapsed .panel-header {
+  margin-bottom: 0;
+}
+
+.panel.collapsed .panel-body {
+  display: none;
+}
+
 h1 {
   margin: 0;
   font-size: 18px;
@@ -212,7 +239,7 @@ input[type="color"] {
 
 .button-row {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 8px;
   padding-top: 12px;
   border-top: 1px solid rgb(255 255 255 / 10%);
@@ -220,11 +247,77 @@ input[type="color"] {
 
 .two-column-row,
 .piece-add-row,
-.anchor-row {
+.anchor-row,
+.radius-row,
+.inline-setting-row,
+.split-setting-row {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   align-items: end;
+}
+
+.inline-setting-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.inline-setting-row > select,
+.inline-setting-row > input {
+  width: min(190px, 42vw);
+}
+
+.inline-setting-row > .inline-control {
+  padding-left: 10px;
+  border-left: 1px solid rgb(255 255 255 / 12%);
+}
+
+.split-setting-row {
+  grid-template-columns: minmax(0, 1fr) 1px minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.setting-pair {
+  align-content: end;
+}
+
+.row-divider {
+  width: 1px;
+  min-height: 52px;
+  background: rgb(255 255 255 / 12%);
+}
+
+.checkbox-pair .inline-control {
+  min-height: 36px;
+}
+
+.radius-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.visual-progress {
+  align-self: end;
+  min-height: 36px;
+  white-space: nowrap;
+}
+
+.is-disabled {
+  opacity: 0.45;
+}
+
+.piece-add-row label,
+.anchor-row label {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+}
+
+.piece-add-row label {
+  min-width: 0;
+}
+
+.anchor-row input[type="color"] {
+  justify-self: end;
+  width: 56px;
 }
 
 .piece-add-row button {
@@ -309,5 +402,15 @@ input[type="color"] {
     left: 8px;
     width: calc(100vw - 16px);
     max-height: min(58vh, calc(100vh - 16px));
+  }
+
+  .split-setting-row {
+    grid-template-columns: 1fr;
+  }
+
+  .row-divider {
+    width: 100%;
+    min-height: 1px;
+    height: 1px;
   }
 }

@@ -49,15 +49,24 @@ impl ArchimedeanSpiral {
 
     #[must_use]
     pub fn squared_distance(theta0: f64, theta1: f64) -> f64 {
-        Self::position(theta0).squared_distance(Self::position(theta1))
+        let r0 = Self::radius(theta0);
+        let r1 = Self::radius(theta1);
+        let dr = r1 - r0;
+        let half_delta = 0.5 * (theta1 - theta0);
+        dr.mul_add(dr, 4.0 * r0 * r1 * half_delta.sin().powi(2))
     }
 
     #[must_use]
     pub fn squared_distance_derivative(theta0: f64, theta1: f64) -> f64 {
-        let p0 = Self::position(theta0);
-        let p1 = Self::position(theta1);
-        let d1 = Self::derivative(theta1);
-        2.0 * ((p1.x - p0.x) * d1.x + (p1.y - p0.y) * d1.y)
+        let inv_tau = 1.0 / TAU;
+        let r0 = Self::radius(theta0);
+        let r1 = Self::radius(theta1);
+        let delta = theta1 - theta0;
+        let sin_half = (0.5 * delta).sin();
+        let sin_half_squared = sin_half * sin_half;
+        2.0 * (r1 - r0) * inv_tau
+            + 4.0 * r0 * inv_tau * sin_half_squared
+            + 2.0 * r0 * r1 * delta.sin()
     }
 
     #[must_use]
@@ -187,10 +196,11 @@ impl ArchimedeanSpiral {
                 best_theta = theta;
             }
 
-            if error <= SOLVER_EPS * target.max(1.0)
-                || (high - low).abs() <= SOLVER_EPS * high.abs().max(1.0)
-            {
+            if error <= SOLVER_EPS * target.max(1.0) {
                 return Ok(theta);
+            }
+            if (high - low).abs() <= f64::EPSILON * high.abs().max(1.0) {
+                return Ok(best_theta);
             }
 
             if value > 0.0 {
@@ -303,6 +313,20 @@ mod tests {
         let distance =
             ArchimedeanSpiral::position(theta0).distance(ArchimedeanSpiral::position(theta1));
         assert!((distance - UNIT_TOUCH_DISTANCE).abs() <= 1.0e-10);
+    }
+
+    #[test]
+    fn chord_solver_handles_very_high_radius_spots() {
+        for radius in [1_500.0, 3_000.0, 5_000.0] {
+            let theta0 = radius * TAU;
+            let theta1 =
+                ArchimedeanSpiral::theta_for_chord_from(theta0, UNIT_TOUCH_DISTANCE).unwrap();
+            let distance = ArchimedeanSpiral::squared_distance(theta0, theta1).sqrt();
+            assert!(
+                (distance - UNIT_TOUCH_DISTANCE).abs() <= 2.0e-8,
+                "radius={radius}, theta0={theta0}, theta1={theta1}, distance={distance}"
+            );
+        }
     }
 
     #[test]

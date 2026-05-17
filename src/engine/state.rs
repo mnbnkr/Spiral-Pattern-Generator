@@ -3,8 +3,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::engine::spatial::{ContinuousSpatialHash, LatticeSpatialIndex};
 use crate::math::{
     ArchimedeanSpiral, ArchimedeanSpots, AxialCoord, HexSpiral, Point2, SquareCoord, SquareSpiral,
-    attack_circle_hits_body, attack_circle_hits_body_distance_squared, attack_radius_from_move,
-    bodies_overlap,
+    TriangleCoord, TriangleSpiral, attack_circle_hits_body,
+    attack_circle_hits_body_distance_squared, attack_radius_from_move, bodies_overlap,
 };
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
@@ -61,6 +61,11 @@ enum BoardSpot {
         index: u64,
         coord: AxialCoord,
     },
+    Triangle {
+        index: u64,
+        coord: TriangleCoord,
+        spiral_radius: u64,
+    },
     Continuous {
         index: u64,
         theta: f64,
@@ -74,6 +79,7 @@ impl BoardSpot {
         match self {
             Self::Square { index, .. }
             | Self::Hex { index, .. }
+            | Self::Triangle { index, .. }
             | Self::Continuous { index, .. } => *index,
         }
     }
@@ -83,6 +89,7 @@ impl BoardSpot {
         match self {
             Self::Square { coord, .. } => Some((coord.x, coord.y)),
             Self::Hex { coord, .. } => Some((coord.q, coord.r)),
+            Self::Triangle { coord, .. } => Some((coord.u, coord.v)),
             Self::Continuous { .. } => None,
         }
     }
@@ -92,6 +99,7 @@ impl BoardSpot {
         match self {
             Self::Square { coord, .. } => coord.to_point(),
             Self::Hex { coord, .. } => coord.to_point(),
+            Self::Triangle { coord, .. } => coord.to_point(),
             Self::Continuous { center, .. } => *center,
         }
     }
@@ -107,11 +115,28 @@ impl BoardSpot {
                 q: coord.q,
                 r: coord.r,
             },
+            Self::Triangle { coord, .. } => SpotCoord::Triangle {
+                u: coord.u,
+                v: coord.v,
+            },
             Self::Continuous { theta, center, .. } => SpotCoord::Continuous {
                 x: center.x,
                 y: center.y,
                 theta: *theta,
             },
+        }
+    }
+
+    #[must_use]
+    fn generation_radius(&self) -> f64 {
+        match self {
+            Self::Square { coord, .. } => coord.x.abs().max(coord.y.abs()) as f64,
+            Self::Hex { coord, .. } => {
+                let (x, y, z) = coord.cube();
+                x.abs().max(y.abs()).max(z.abs()) as f64
+            }
+            Self::Triangle { spiral_radius, .. } => *spiral_radius as f64,
+            Self::Continuous { center, .. } => center.radius(),
         }
     }
 }
@@ -129,6 +154,7 @@ pub struct SimulationEngine {
     spots: Vec<BoardSpot>,
     square_spiral: SquareSpiral,
     hex_spiral: HexSpiral,
+    triangle_spiral: TriangleSpiral,
     continuous_spiral: ArchimedeanSpots,
     occupied_spots: FxHashMap<u64, u64>,
     lattice_index: LatticeSpatialIndex,
@@ -160,6 +186,7 @@ impl SimulationEngine {
             spots: Vec::new(),
             square_spiral: SquareSpiral::new(),
             hex_spiral: HexSpiral::new(),
+            triangle_spiral: TriangleSpiral::new(),
             continuous_spiral,
             occupied_spots: FxHashMap::default(),
             lattice_index: LatticeSpatialIndex::new(),
@@ -330,7 +357,7 @@ impl SimulationEngine {
 
     fn should_skip_piece_seeking_spot(&self, spot: &BoardSpot) -> bool {
         match self.settings.board {
-            BoardKind::LatticeSquare | BoardKind::LatticeHex => {
+            BoardKind::LatticeSquare | BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
                 let Some(coord) = spot.lattice_coord() else {
                     return false;
                 };
@@ -416,11 +443,7 @@ impl SimulationEngine {
     }
 
     fn place_piece(&mut self, spot: BoardSpot, piece: CandidatePiece) -> Placement {
-        let shape = if self.settings.board == BoardKind::ContinuousArchimedean {
-            ShapeKind::Circle
-        } else {
-            self.settings.shape
-        };
+        let shape = forced_shape_for_board(self.settings.board, self.settings.shape);
 
         let center = spot.center();
         let lattice_coord = spot.lattice_coord();
@@ -480,7 +503,7 @@ impl SimulationEngine {
         }
 
         match self.settings.board {
-            BoardKind::LatticeSquare | BoardKind::LatticeHex => {
+            BoardKind::LatticeSquare | BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
                 self.is_valid_lattice_candidate(spot, candidate)
             }
             BoardKind::ContinuousArchimedean => self.is_valid_continuous_candidate(spot, candidate),
@@ -594,10 +617,15 @@ impl SimulationEngine {
             return Vec::new();
         }
 
-        self.continuous_index.nearby_ids(
-            center,
-            self.max_continuous_attack_radius + body_radius.max(0.0),
-        )
+        let bounded_attack_radius = self
+            .max_continuous_attack_radius
+            .min(2.0 * self.settings.radius.max(0.0) + body_radius.max(0.0));
+        if bounded_attack_radius <= 0.0 {
+            return Vec::new();
+        }
+
+        self.continuous_index
+            .nearby_ids(center, bounded_attack_radius + body_radius.max(0.0))
     }
 
     fn continuous_proactive_probe_ids(
@@ -606,6 +634,12 @@ impl SimulationEngine {
         candidate: &CandidatePiece,
         body_radius: f64,
     ) -> Vec<u64> {
+        let max_possible_distance =
+            center.radius() + self.settings.radius.max(0.0) + body_radius.max(0.0);
+        if candidate.attack_radius > max_possible_distance {
+            return Vec::new();
+        }
+
         self.continuous_index.nearby_ids(
             center,
             candidate.attack_radius.max(0.0) + body_radius.max(0.0),
@@ -737,6 +771,14 @@ impl SimulationEngine {
                         coord,
                     }
                 }
+                BoardKind::LatticeTriangle => {
+                    let coord = self.triangle_spiral.next()?;
+                    BoardSpot::Triangle {
+                        index: next_index,
+                        coord,
+                        spiral_radius: TriangleSpiral::radius_for_index(next_index),
+                    }
+                }
                 BoardKind::ContinuousArchimedean => {
                     let spot = self.continuous_spiral.next()?;
                     BoardSpot::Continuous {
@@ -748,10 +790,12 @@ impl SimulationEngine {
             };
 
             if !self.spot_within_generation_radius(&spot) {
+                self.stats.current_radius = self.stats.current_radius.max(spot.generation_radius());
                 self.stats.exhausted = true;
                 return None;
             }
 
+            self.stats.current_radius = self.stats.current_radius.max(spot.generation_radius());
             self.spots.push(spot);
         }
 
@@ -770,6 +814,7 @@ impl SimulationEngine {
                 let (x, y, z) = coord.cube();
                 x.abs().max(y.abs()).max(z.abs()) <= bound
             }
+            BoardSpot::Triangle { spiral_radius, .. } => *spiral_radius <= radius.floor() as u64,
             BoardSpot::Continuous { center, .. } => center.radius() <= radius + 1.0e-9,
         }
     }
@@ -823,6 +868,10 @@ fn lattice_attack_targets(
             .into_iter()
             .map(|offset| (origin.0 + offset.q, origin.1 + offset.r))
             .collect(),
+        BoardKind::LatticeTriangle => triangle_attack_offsets(piece)
+            .into_iter()
+            .map(|offset| (origin.0 + offset.u, origin.1 + offset.v))
+            .collect(),
         BoardKind::ContinuousArchimedean => Vec::new(),
     }
 }
@@ -866,6 +915,49 @@ fn hex_attack_offsets(piece: PieceSignature) -> Vec<AxialCoord> {
     out.into_iter().collect()
 }
 
+fn triangle_attack_offsets(piece: PieceSignature) -> Vec<TriangleCoord> {
+    const DIRECTIONS: [TriangleCoord; 6] = [
+        TriangleCoord { u: 1, v: 0 },
+        TriangleCoord { u: 0, v: 1 },
+        TriangleCoord { u: -1, v: 1 },
+        TriangleCoord { u: -1, v: 0 },
+        TriangleCoord { u: 0, v: -1 },
+        TriangleCoord { u: 1, v: -1 },
+    ];
+    const PRIMARY_AXES: [usize; 3] = [0, 2, 4];
+
+    let a = piece.a.unsigned_abs() as i64;
+    let b = piece.b.unsigned_abs() as i64;
+    let mut out = FxHashSet::default();
+
+    for axis in PRIMARY_AXES {
+        let primary = DIRECTIONS[axis];
+        if b == 0 {
+            out.insert(primary.scale(a));
+            continue;
+        }
+
+        let (base, left, right) = if a % 2 == 0 {
+            (
+                primary.scale(a),
+                DIRECTIONS[(axis + 1) % DIRECTIONS.len()].scale(b),
+                DIRECTIONS[(axis + DIRECTIONS.len() - 1) % DIRECTIONS.len()].scale(b),
+            )
+        } else {
+            (
+                primary.scale(a.saturating_sub(1)),
+                primary.scale(b),
+                DIRECTIONS[(axis + 1) % DIRECTIONS.len()].scale(b),
+            )
+        };
+        out.insert(base.add(left));
+        out.insert(base.add(right));
+    }
+
+    out.remove(&TriangleCoord::new(0, 0));
+    out.into_iter().collect()
+}
+
 fn rotate_cube_right((x, y, z): (i64, i64, i64)) -> (i64, i64, i64) {
     (-z, -x, -y)
 }
@@ -874,6 +966,17 @@ fn move_group(piece: PieceSignature) -> (i32, i32) {
     let a = piece.a.unsigned_abs() as i32;
     let b = piece.b.unsigned_abs() as i32;
     (a.min(b), a.max(b))
+}
+
+fn forced_shape_for_board(board: BoardKind, requested: ShapeKind) -> ShapeKind {
+    match board {
+        BoardKind::ContinuousArchimedean => ShapeKind::Circle,
+        BoardKind::LatticeTriangle => match requested {
+            ShapeKind::Circle => ShapeKind::Circle,
+            _ => ShapeKind::Triangle,
+        },
+        BoardKind::LatticeSquare | BoardKind::LatticeHex => requested,
+    }
 }
 
 fn signature_gap(piece: PieceSignature) -> u32 {
@@ -1009,6 +1112,24 @@ mod tests {
             }
             _ => false,
         }));
+    }
+
+    #[test]
+    fn radius_limits_triangle_generation() {
+        let settings = EngineSettings {
+            board: BoardKind::LatticeTriangle,
+            shape: ShapeKind::Triangle,
+            radius: 1.0,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        };
+        let mut engine = SimulationEngine::new(settings);
+        let batch = engine.step_budget(20, 10_000);
+
+        assert_eq!(batch.len(), 7);
+        assert!(engine.stats().exhausted);
+        assert!(batch.iter().all(|placement| placement.spot_index <= 6
+            && matches!(placement.coord, SpotCoord::Triangle { .. })));
     }
 
     #[test]
@@ -1184,6 +1305,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn triangle_attack_offsets_have_three_primary_rays_and_two_side_choices() {
+        for piece in [
+            PieceSignature::new(1, 1),
+            PieceSignature::new(2, 1),
+            PieceSignature::new(3, 1),
+        ] {
+            let offsets = triangle_attack_offsets(piece)
+                .into_iter()
+                .collect::<FxHashSet<_>>();
+            assert_eq!(offsets.len(), 6, "piece={piece:?}");
+            assert!(!offsets.contains(&TriangleCoord::new(0, 0)));
+        }
+
+        let one_one = triangle_attack_offsets(PieceSignature::new(1, 1))
+            .into_iter()
+            .collect::<FxHashSet<_>>();
+        assert_eq!(
+            one_one,
+            [
+                TriangleCoord::new(1, 0),
+                TriangleCoord::new(0, 1),
+                TriangleCoord::new(-1, 1),
+                TriangleCoord::new(-1, 0),
+                TriangleCoord::new(0, -1),
+                TriangleCoord::new(1, -1),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn triangle_board_forces_triangle_or_circle_shape() {
+        let mut square_request = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeTriangle,
+            shape: ShapeKind::Square,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = square_request.step_batch(1);
+        assert_eq!(batch[0].shape, ShapeKind::Triangle);
+
+        let mut circle_request = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeTriangle,
+            shape: ShapeKind::Circle,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = circle_request.step_batch(1);
+        assert_eq!(batch[0].shape, ShapeKind::Circle);
+    }
+
     fn straight_then_turn_hex_offsets(long: i64, short: i64) -> FxHashSet<AxialCoord> {
         const DIRECTIONS: [AxialCoord; 6] = [
             AxialCoord { q: 1, r: 0 },
@@ -1240,6 +1414,28 @@ mod tests {
                 batch.len(),
                 64,
                 "continuous {army_preset:?} with color mode stalled at {} placements after testing {} candidates",
+                batch.len(),
+                engine.stats().piece_candidates_tested
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_prime_modes_make_progress_on_interactive_work_budget() {
+        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGap] {
+            let settings = EngineSettings {
+                board: BoardKind::ContinuousArchimedean,
+                shape: ShapeKind::Circle,
+                piece_radius: 0.50,
+                army_preset,
+                enemy_mode: EnemyMode::Color,
+                ..EngineSettings::default()
+            };
+            let mut engine = SimulationEngine::new(settings);
+            let batch = engine.step_budget(16, 200_000);
+            assert!(
+                batch.len() >= 8,
+                "continuous {army_preset:?} only placed {} pieces after testing {} candidates",
                 batch.len(),
                 engine.stats().piece_candidates_tested
             );

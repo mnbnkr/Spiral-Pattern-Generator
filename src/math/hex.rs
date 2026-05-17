@@ -4,11 +4,11 @@ use super::Point2;
 
 const AXIAL_DIRECTIONS: [AxialCoord; 6] = [
     AxialCoord { q: 1, r: 0 },
-    AxialCoord { q: 1, r: -1 },
-    AxialCoord { q: 0, r: -1 },
-    AxialCoord { q: -1, r: 0 },
-    AxialCoord { q: -1, r: 1 },
     AxialCoord { q: 0, r: 1 },
+    AxialCoord { q: -1, r: 1 },
+    AxialCoord { q: -1, r: 0 },
+    AxialCoord { q: 0, r: -1 },
+    AxialCoord { q: 1, r: -1 },
 ];
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -66,17 +66,28 @@ impl HexSpiral {
             return vec![AxialCoord::new(0, 0)];
         }
 
-        let radius_i64 = radius as i64;
-        let mut coord = AXIAL_DIRECTIONS[4].scale(radius_i64);
+        let r = radius as i64;
+        let mut coord = AxialCoord::new(r, 1 - r);
         let mut out = Vec::with_capacity((radius * 6) as usize);
+        out.push(coord);
 
-        for direction in AXIAL_DIRECTIONS {
+        for _ in 0..radius.saturating_sub(1) {
+            coord = coord.add(AXIAL_DIRECTIONS[1]);
+            out.push(coord);
+        }
+
+        for direction in AXIAL_DIRECTIONS
+            .iter()
+            .skip(2)
+            .chain(AXIAL_DIRECTIONS.iter().take(1))
+        {
             for _ in 0..radius {
+                coord = coord.add(*direction);
                 out.push(coord);
-                coord = coord.add(direction);
             }
         }
 
+        out.truncate((radius * 6) as usize);
         out
     }
 
@@ -129,19 +140,37 @@ mod tests {
     }
 
     #[test]
-    fn first_hex_spiral_coordinates_are_deterministic() {
-        let got: Vec<_> = HexSpiral::new().take(8).collect();
+    fn first_hex_spiral_coordinates_start_right_and_turn_counterclockwise() {
+        let got: Vec<_> = HexSpiral::new().take(12).collect();
         let expected = vec![
             AxialCoord::new(0, 0),
-            AxialCoord::new(-1, 1),
-            AxialCoord::new(0, 1),
             AxialCoord::new(1, 0),
-            AxialCoord::new(1, -1),
-            AxialCoord::new(0, -1),
+            AxialCoord::new(0, 1),
+            AxialCoord::new(-1, 1),
             AxialCoord::new(-1, 0),
-            AxialCoord::new(-2, 2),
+            AxialCoord::new(0, -1),
+            AxialCoord::new(1, -1),
+            AxialCoord::new(2, -1),
+            AxialCoord::new(2, 0),
+            AxialCoord::new(1, 1),
+            AxialCoord::new(0, 2),
+            AxialCoord::new(-1, 2),
         ];
 
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn hex_spiral_ring_transitions_are_adjacent() {
+        let got: Vec<_> = HexSpiral::new().take(128).collect();
+        for pair in got.windows(2) {
+            let delta = AxialCoord::new(pair[1].q - pair[0].q, pair[1].r - pair[0].r);
+            assert!(
+                AXIAL_DIRECTIONS.contains(&delta),
+                "non-adjacent transition from {:?} to {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

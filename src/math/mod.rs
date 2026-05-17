@@ -4,6 +4,7 @@ pub mod constants;
 pub mod hex;
 pub mod point;
 pub mod square;
+pub mod triangle;
 
 pub use archimedean::{ArchimedeanSpiral, ArchimedeanSpots, ContinuousSpot, SolverError};
 pub use circles::{
@@ -14,3 +15,4 @@ pub use constants::{BODY_RADIUS, GEOM_EPS, PI, SOLVER_EPS, TAU, UNIT_TOUCH_DISTA
 pub use hex::{AxialCoord, HexSpiral};
 pub use point::Point2;
 pub use square::{SquareCoord, SquareSpiral};
+pub use triangle::{TriangleCoord, TriangleSpiral};

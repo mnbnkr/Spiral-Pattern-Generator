@@ -71,7 +71,7 @@ fn handle_message(
             runtime.running = false;
             runtime.engine.reset(settings);
             runtime.placements.clear();
-            post_stats(&runtime);
+            post_stats_with_vertex_update(&runtime, VertexBufferUpdate::Replace(Vec::new()));
         }
         AppToWorker::UpdateSettings { settings } => {
             let mut runtime = runtime.borrow_mut();
@@ -104,8 +104,12 @@ fn handle_message(
         AppToWorker::RunTick => {
             let mut runtime = runtime.borrow_mut();
             if runtime.running {
-                let (batch_size, work_budget) = batch_parameters(runtime.engine.settings());
-                post_step_result(&mut runtime, batch_size, work_budget);
+                if runtime.engine.settings().visual_progress {
+                    let (batch_size, work_budget) = batch_parameters(runtime.engine.settings());
+                    post_step_result(&mut runtime, batch_size, work_budget);
+                } else {
+                    post_finish_only_result(&mut runtime);
+                }
             } else {
                 post_stats(&runtime);
             }
@@ -117,6 +121,71 @@ fn handle_message(
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn post_finish_only_result(runtime: &mut WorkerRuntime) {
+    const MAX_SILENT_WORK: u64 = 20_000_000;
+    const MAX_EMPTY_LOOPS: u32 = 64;
+
+    let mut silent_work = 0_u64;
+    let mut empty_loops = 0_u32;
+
+    while runtime.running
+        && !runtime.engine.stats().exhausted
+        && silent_work < MAX_SILENT_WORK
+        && empty_loops < MAX_EMPTY_LOOPS
+    {
+        let previous = runtime.engine.stats();
+        let (_, work_budget) = batch_parameters(runtime.engine.settings());
+        let placements = runtime
+            .engine
+            .step_budget(16_384, work_budget.saturating_mul(8).max(1_000_000));
+        let stats = runtime.engine.stats();
+        let work_delta = stats
+            .spots_tested
+            .saturating_sub(previous.spots_tested)
+            .saturating_add(
+                stats
+                    .piece_candidates_tested
+                    .saturating_sub(previous.piece_candidates_tested),
+            )
+            .max(1);
+        silent_work = silent_work.saturating_add(work_delta);
+
+        if placements.is_empty() {
+            empty_loops += 1;
+        } else {
+            empty_loops = 0;
+            runtime.placements.extend_from_slice(&placements);
+        }
+    }
+
+    let stats = runtime.engine.stats();
+    let color_state = runtime.engine.color_state();
+    if stats.exhausted {
+        runtime.running = false;
+        let vertices = pack_vertices(&runtime.placements, runtime.engine.settings(), color_state);
+        let log_placements = log_sample_for_full_run(&runtime.placements);
+        post_worker_message(
+            &runtime.scope,
+            &WorkerToApp::Batch {
+                log_placements,
+                vertex_update: VertexBufferUpdate::Replace(vertices),
+                stats,
+                color_state,
+            },
+        );
+    } else {
+        post_worker_message(
+            &runtime.scope,
+            &WorkerToApp::Stats {
+                stats,
+                color_state,
+                vertex_update: VertexBufferUpdate::None,
+            },
+        );
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -226,6 +295,20 @@ fn log_sample_for_batch(previous_placement_count: u64, placements: &[Placement])
         .into_iter()
         .map(|index| placements[index].clone())
         .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn log_sample_for_full_run(placements: &[Placement]) -> Vec<Placement> {
+    const LOG_EDGE_COUNT: usize = 32;
+
+    if placements.len() <= LOG_EDGE_COUNT * 2 {
+        return placements.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(LOG_EDGE_COUNT * 2);
+    out.extend_from_slice(&placements[..LOG_EDGE_COUNT]);
+    out.extend_from_slice(&placements[placements.len() - LOG_EDGE_COUNT..]);
+    out
 }
 
 #[cfg(target_arch = "wasm32")]

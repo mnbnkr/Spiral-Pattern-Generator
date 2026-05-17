@@ -7,6 +7,7 @@ pub const DEFAULT_ANCHOR_B: &str = "#ff0006";
 pub enum BoardKind {
     LatticeSquare,
     LatticeHex,
+    LatticeTriangle,
     ContinuousArchimedean,
 }
 
@@ -15,6 +16,7 @@ pub enum ShapeKind {
     Square,
     Circle,
     Hex,
+    Triangle,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -283,6 +285,7 @@ pub struct EngineSettings {
     pub shape: ShapeKind,
     pub radius: f64,
     pub piece_radius: f64,
+    pub visual_progress: bool,
     pub speed: SpeedMode,
     pub display_mode: DisplayMode,
     pub zoom: u8,
@@ -304,6 +307,7 @@ impl Default for EngineSettings {
             shape: ShapeKind::Square,
             radius: 100.0,
             piece_radius: 0.5,
+            visual_progress: true,
             speed: SpeedMode::Fastest,
             display_mode: DisplayMode::FitScreen,
             zoom: 4,
@@ -340,6 +344,7 @@ impl PieceSignature {
 pub enum SpotCoord {
     Square { x: i64, y: i64 },
     Hex { q: i64, r: i64 },
+    Triangle { u: i64, v: i64 },
     Continuous { x: f64, y: f64, theta: f64 },
 }
 
@@ -383,6 +388,7 @@ pub struct EngineStats {
     pub piece_candidates_tested: u64,
     pub passive_rejections: u64,
     pub proactive_rejections: u64,
+    pub current_radius: f64,
     pub exhausted: bool,
 }
 
@@ -472,5 +478,10 @@ mod tests {
     fn default_anchor_colors_match_requested_rgb_values() {
         assert_eq!(EngineSettings::default().anchor_color_a, "#ff7800");
         assert_eq!(EngineSettings::default().anchor_color_b, "#ff0006");
+    }
+
+    #[test]
+    fn visual_progress_defaults_to_enabled() {
+        assert!(EngineSettings::default().visual_progress);
     }
 }

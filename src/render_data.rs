@@ -1,4 +1,4 @@
-use crate::math::{AxialCoord, Point2, SquareCoord};
+use crate::math::{AxialCoord, Point2, SquareCoord, TriangleCoord};
 use crate::protocol::{
     ColorRule, ColorState, EngineSettings, Placement, RgbColor, SpotCoord, parse_hex_rgb,
     rainbow_rgb,
@@ -27,6 +27,7 @@ pub fn placement_center(placement: &Placement) -> Point2 {
     match placement.coord {
         SpotCoord::Square { x, y } => SquareCoord::new(x, y).to_point(),
         SpotCoord::Hex { q, r } => AxialCoord::new(q, r).to_point(),
+        SpotCoord::Triangle { u, v } => TriangleCoord::new(u, v).to_point(),
         SpotCoord::Continuous { x, y, .. } => Point2::new(x, y),
     }
 }
