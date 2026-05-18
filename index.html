@@ -36,7 +36,7 @@
       <div class="panel-body">
 
       <section class="control-section">
-        <div class="two-column-row">
+        <div class="two-column-row separated-row">
           <label for="board-select"
             ><span class="label-row"
               >Board Type
@@ -103,25 +103,53 @@
           </label>
         </div>
 
-        <label for="piece-radius-slider"
-          ><span class="label-row"
-            >Piece Radius <output id="piece-radius-output">0.50</output>
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="On lattice boards this only changes rendering. On the continuous board it changes physical body overlap and attack hits, so generation resets."
-              >i</span
-            ></span
-          ></label
-        >
-        <input
-          id="piece-radius-slider"
-          type="range"
-          min="0.05"
-          max="0.50"
-          step="0.01"
-          value="0.50"
-        />
+        <div class="two-column-row separated-row">
+          <label for="piece-radius-slider"
+            ><span class="label-row"
+              >Piece Radius <output id="piece-radius-output">0.50</output>
+              <span
+                class="info-icon"
+                tabindex="0"
+                data-tip="On lattice boards this only changes rendering. On the continuous board it changes physical body overlap and attack hits, so generation resets."
+                >i</span
+              ></span
+            >
+            <input
+              id="piece-radius-slider"
+              type="range"
+              min="0.05"
+              max="0.50"
+              step="0.01"
+              value="0.50"
+            />
+          </label>
+
+          <label id="continuous-offset-group" for="continuous-offset-input"
+            ><span class="label-row"
+              >Continuous Offset
+              <span
+                class="info-icon"
+                tabindex="0"
+                data-tip="Initial arc-length offset from the origin. Valid values are 0..1 with up to 12 decimal places; more precision is below the solver tolerance."
+                >i</span
+              ></span
+            >
+            <span id="continuous-offset-input-wrap" class="offset-input-wrap">
+              <input
+                id="continuous-offset-input"
+                type="text"
+                inputmode="decimal"
+                autocomplete="off"
+                value="0"
+              />
+              <span
+                id="continuous-offset-highlight"
+                class="offset-input-highlight"
+                aria-hidden="true"
+              ></span>
+            </span>
+          </label>
+        </div>
 
         <div class="inline-setting-row">
           <label for="speed-slider"
@@ -149,36 +177,17 @@
           </label>
         </div>
 
-        <label for="continuous-offset-input"
-          ><span class="label-row"
-            >Continuous Offset
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="Initial arc-length offset from the origin, clamped to 0..1. Only applies to the continuous spiral."
-              >i</span
-            ></span
-          ></label
-        >
-        <input
-          id="continuous-offset-input"
-          type="number"
-          min="0"
-          max="1"
-          step="0.001"
-          value="0"
-        />
       </section>
 
       <section class="control-section">
-        <div class="two-column-row">
+        <div class="two-column-row separated-row">
           <label for="display-mode-select"
             ><span class="label-row"
               >Display Mode
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Fit Screen uses the requested Radius. 1:1 Pixel uses the Zoom slider and does not auto-expand to placements."
+                data-tip="Fit Screen uses the requested Radius. 1:1 Pixel uses direct board panning plus mouse-wheel zoom around the cursor."
                 >i</span
               ></span
             >
@@ -219,7 +228,7 @@
             id="zoom-slider"
             type="range"
             min="1"
-            max="16"
+            max="32"
             step="1"
             value="4"
           />
@@ -227,6 +236,22 @@
       </section>
 
       <section class="control-section">
+        <label class="inline-setting-row compact-setting-row" for="placement-search-select"
+          ><span class="label-row"
+            >Placement Search
+            <span
+              class="info-icon"
+              tabindex="0"
+              data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
+              >i</span
+            ></span
+          >
+          <select id="placement-search-select">
+            <option value="SpiralPath" selected>Spiral Path</option>
+            <option value="CenterDistance">Center Distance</option>
+          </select>
+        </label>
+
         <div class="split-setting-row">
           <label class="setting-pair" for="enemy-mode-select"
             ><span class="label-row"
@@ -234,13 +259,14 @@
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Move-set treats different normalized piece jumps as enemies. Color treats different color groups as enemies."
+                data-tip="Attack-set treats different normalized attack jumps as enemies. Color treats different color groups as enemies. Color-Attack-set applies both."
                 >i</span
               ></span
             >
             <select id="enemy-mode-select">
-              <option value="MoveSet">Move-set</option>
+              <option value="AttackSet">Attack-set</option>
               <option value="Color" selected>Color</option>
+              <option value="ColorAttackSet">Color-Attack-set</option>
             </select>
           </label>
 
@@ -265,7 +291,7 @@
       </section>
 
       <section class="control-section">
-        <label class="inline-setting-row" for="army-preset-select"
+        <label class="inline-setting-row compact-setting-row" for="army-preset-select"
           ><span class="label-row"
             >Army Preset
             <span
@@ -278,7 +304,7 @@
           <select id="army-preset-select">
             <option value="CustomFinite">Custom Finite</option>
             <option value="PrimeKnight">Prime Knight</option>
-            <option value="PrimeGap">Prime Gap</option>
+            <option value="PrimeGap">Prime Gap Knight</option>
           </select>
         </label>
 
@@ -356,6 +382,7 @@
       </section>
 
       <section class="button-row">
+        <button id="download-full-png-button" type="button">Full PNG</button>
         <button id="download-png-button" type="button">PNG</button>
         <button id="download-jpeg-button" type="button">JPEG 1/2</button>
         <button id="download-log-button" type="button">Log</button>

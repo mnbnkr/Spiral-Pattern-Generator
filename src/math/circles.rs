@@ -118,4 +118,19 @@ mod tests {
     fn attack_radius_comes_from_euclidean_move_vector() {
         assert_eq!(attack_radius_from_move(3, 4), 5.0);
     }
+
+    #[test]
+    fn prime_knight_examples_use_piece_centered_euclidean_attack_radii() {
+        assert!((attack_radius_from_move(1, 23) - 530.0_f64.sqrt()).abs() <= 1.0e-12);
+        assert!((attack_radius_from_move(3, 5) - 34.0_f64.sqrt()).abs() <= 1.0e-12);
+
+        let attacker = Point2::new(10.0, -4.0);
+        let target = Point2::new(11.0, 19.0);
+        assert!(attack_circle_hits_body(
+            attacker,
+            target,
+            attack_radius_from_move(1, 23),
+            BODY_RADIUS
+        ));
+    }
 }

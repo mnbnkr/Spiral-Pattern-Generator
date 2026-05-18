@@ -82,9 +82,26 @@ impl TriangleSpiral {
 
     #[must_use]
     pub fn coord_at_index(index: u64) -> TriangleCoord {
-        Self::new()
-            .nth(index as usize)
-            .expect("triangle spiral is infinite")
+        if index == 0 {
+            return TriangleCoord::new(0, 0);
+        }
+
+        let segment = segment_for_index(index);
+        let previous_segments = segment - 1;
+        let completed_cycles = previous_segments / 3;
+        let remainder = previous_segments % 3;
+        let mut coord = TriangleCoord::new(-(completed_cycles as i64), -(completed_cycles as i64));
+
+        let first_length = 3 * completed_cycles + 1;
+        if remainder >= 1 {
+            coord = coord.add(TRIANGLE_SPIRAL_DIRECTIONS[0].scale(first_length as i64));
+        }
+        if remainder >= 2 {
+            coord = coord.add(TRIANGLE_SPIRAL_DIRECTIONS[1].scale((first_length + 1) as i64));
+        }
+
+        let offset = index - triangular_number(segment - 1);
+        coord.add(TRIANGLE_SPIRAL_DIRECTIONS[remainder as usize].scale(offset as i64))
     }
 
     #[must_use]
@@ -124,7 +141,7 @@ impl Iterator for TriangleSpiral {
 
 #[must_use]
 fn triangular_number(n: u64) -> u64 {
-    n.saturating_mul(n + 1) / 2
+    n.saturating_mul(n.saturating_add(1)) / 2
 }
 
 #[must_use]
@@ -218,5 +235,15 @@ mod tests {
         assert_eq!(&radii[0..=6], &[0, 1, 1, 1, 1, 1, 1]);
         assert!(radii[7..=21].iter().all(|radius| *radius == 2));
         assert_eq!(radii[22], 3);
+    }
+
+    #[test]
+    fn coord_at_index_matches_iterator() {
+        for i in 0..256 {
+            assert_eq!(
+                TriangleSpiral::coord_at_index(i),
+                TriangleSpiral::new().nth(i as usize).unwrap()
+            );
+        }
     }
 }

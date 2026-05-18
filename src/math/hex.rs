@@ -93,10 +93,59 @@ impl HexSpiral {
 
     #[must_use]
     pub fn coord_at_index(index: u64) -> AxialCoord {
-        Self::new()
-            .nth(index as usize)
-            .expect("hex spiral is infinite")
+        if index == 0 {
+            return AxialCoord::new(0, 0);
+        }
+
+        let mut radius = (((index as f64) / 3.0).sqrt().ceil() as u64).max(1);
+        while hex_ring_max_index(radius) < index {
+            radius += 1;
+        }
+        while radius > 0 && hex_ring_max_index(radius - 1) >= index {
+            radius -= 1;
+        }
+
+        let ring_start = hex_ring_max_index(radius - 1) + 1;
+        Self::coord_at_ring_offset(radius, index - ring_start)
     }
+
+    #[must_use]
+    fn coord_at_ring_offset(radius: u64, offset: u64) -> AxialCoord {
+        let r = radius as i64;
+        let mut coord = AxialCoord::new(r, 1 - r);
+        if offset == 0 {
+            return coord;
+        }
+
+        let first_side_remaining = radius - 1;
+        if offset <= first_side_remaining {
+            return coord.add(AXIAL_DIRECTIONS[1].scale(offset as i64));
+        }
+        coord = coord.add(AXIAL_DIRECTIONS[1].scale(first_side_remaining as i64));
+        let mut remaining = offset - first_side_remaining;
+
+        for direction in AXIAL_DIRECTIONS
+            .iter()
+            .skip(2)
+            .chain(AXIAL_DIRECTIONS.iter().take(1))
+        {
+            let step = remaining.min(radius);
+            coord = coord.add(direction.scale(step as i64));
+            if remaining <= radius {
+                return coord;
+            }
+            remaining -= radius;
+        }
+
+        coord
+    }
+}
+
+#[must_use]
+fn hex_ring_max_index(radius: u64) -> u64 {
+    3_u64
+        .saturating_mul(radius)
+        .saturating_mul(radius.saturating_add(1))
 }
 
 impl Iterator for HexSpiral {
@@ -170,6 +219,16 @@ mod tests {
                 "non-adjacent transition from {:?} to {:?}",
                 pair[0],
                 pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn coord_at_index_matches_iterator() {
+        for i in 0..256 {
+            assert_eq!(
+                HexSpiral::coord_at_index(i),
+                HexSpiral::new().nth(i as usize).unwrap()
             );
         }
     }

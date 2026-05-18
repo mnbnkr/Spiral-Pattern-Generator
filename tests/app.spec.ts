@@ -28,6 +28,12 @@ test("default simulation auto-runs", async ({ page }) => {
     "Triangle Lattice",
   );
   await expect(page.locator("#board-select")).toHaveValue("LatticeSquare");
+  await expect(page.locator("#enemy-mode-select option").nth(0)).toHaveText(
+    "Attack-set",
+  );
+  await expect(page.locator("#enemy-mode-select option").nth(2)).toHaveText(
+    "Color-Attack-set",
+  );
   await page.waitForFunction(
     () => {
       const text = document.querySelector("#status-line")?.textContent ?? "";
@@ -108,6 +114,8 @@ test("custom rows use order labels and can be deleted to an empty placeholder", 
   await expect(rows.nth(0)).toContainText("1. (2, 1)");
   await expect(rows.nth(1)).toContainText("2. (2, 1)");
   await expect(rows.nth(0)).toHaveAttribute("draggable", "true");
+  await expect(page.locator('.army-row button[title="Move up"]').nth(0)).toHaveText("▲");
+  await expect(page.locator('.army-row button[title="Move down"]').nth(0)).toHaveText("▼");
   await expect(page.locator("#army-list")).not.toContainText("gap");
 
   await page.locator('.army-row button[title="Delete"]').nth(1).click();
@@ -150,8 +158,17 @@ test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async 
   page,
 }) => {
   await pauseIfRunning(page);
+  if (!((await page.locator("#placement-log").textContent()) ?? "").includes("coord=square(")) {
+    await page.click("#step-button");
+    await expect(page.locator("#placement-log")).toContainText("coord=square(", {
+      timeout: 15_000,
+    });
+  }
+
   await page.selectOption("#board-select", "LatticeTriangle");
   await expect(page.locator("#shape-select")).toHaveValue("Triangle");
+  await expect(page.locator("#placement-search-select")).toHaveValue("SpiralPath");
+  await expect(page.locator("#placement-log")).toContainText("No placements yet.");
   await expect(page.locator("#shape-option-square")).toHaveAttribute(
     "disabled",
     "disabled",
@@ -233,6 +250,128 @@ test("refresh terminates a silent continuous run and keeps controls usable", asy
   });
 });
 
+test("refresh then immediate start uses the selected board worker", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.selectOption("#board-select", "LatticeTriangle");
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+
+  await expect(page.locator("#placement-log")).toContainText(
+    "board=LatticeTriangle",
+    { timeout: 15_000 },
+  );
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(");
+  await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
+});
+
+test("starting a staged board switch clears stale square data", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  if (!((await page.locator("#placement-log").textContent()) ?? "").includes("coord=square(")) {
+    await page.click("#step-button");
+    await expect(page.locator("#placement-log")).toContainText("coord=square(", {
+      timeout: 15_000,
+    });
+  }
+
+  await page.selectOption("#board-select", "LatticeTriangle");
+  await page.click("#start-button");
+
+  await expect(page.locator("#placement-log")).toContainText(
+    "board=LatticeTriangle",
+    { timeout: 15_000 },
+  );
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(");
+  await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
+});
+
+test("reselecting the current board refreshes without changing board", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expect(page.locator("#board-select")).toHaveValue("LatticeSquare");
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+
+  await page.locator("#board-select").evaluate((element) => {
+    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    element.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+  });
+
+  await expect(page.locator("#board-select")).toHaveValue("LatticeSquare");
+  await expect(page.locator("#status-line")).toContainText("Paused");
+  await expect(page.locator("#placement-log")).toContainText("No placements yet.");
+});
+
+test("placement search and continuous offset validation stay wired", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.selectOption("#placement-search-select", "CenterDistance");
+  await page.click("#step-button");
+  await expect(page.locator("#placement-log")).toContainText(
+    "search=CenterDistance",
+  );
+
+  await page.selectOption("#board-select", "ContinuousArchimedean");
+  await page.fill("#continuous-offset-input", "1.0000000000001");
+  await expect(page.locator("#continuous-offset-input")).toHaveClass(
+    /invalid-input/,
+  );
+  await expect(
+    page.locator("#continuous-offset-highlight .invalid-char"),
+  ).not.toHaveCount(0);
+  await page.fill("#continuous-offset-input", "0.1234567890123");
+  await expect(page.locator("#continuous-offset-input")).toHaveClass(
+    /invalid-input/,
+  );
+  await expect(
+    page.locator("#continuous-offset-highlight .invalid-char"),
+  ).toHaveCount(1);
+  await expect(page.locator("#continuous-offset-highlight .valid-char")).not.toHaveCount(
+    0,
+  );
+  await page.fill("#continuous-offset-input", "0.123456789012");
+  await expect(page.locator("#continuous-offset-input")).not.toHaveClass(
+    /invalid-input/,
+  );
+
+  await page.fill("#continuous-offset-input", "");
+  await expect(page.locator("#continuous-offset-input")).toHaveClass(
+    /invalid-input/,
+  );
+  await page.locator("#status-line").click();
+  await expect(page.locator("#continuous-offset-input")).toHaveValue("0");
+  await expect(page.locator("#continuous-offset-input")).not.toHaveClass(
+    /invalid-input/,
+  );
+});
+
+test("higher radius commits without clearing the visible generation", async ({
+  page,
+}) => {
+  await page.waitForFunction(
+    () => {
+      const text = document.querySelector("#status-line")?.textContent ?? "";
+      return /^[1-9]\d* placements/.test(text);
+    },
+    null,
+    { timeout: 15_000 },
+  );
+
+  const beforeLog = await page.locator("#placement-log").textContent();
+  expect(beforeLog).toContain("placements logged:");
+
+  await page.fill("#radius-input", "130");
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  await page.waitForTimeout(2_300);
+  await expect(page.locator("#radius-input")).toHaveValue("130");
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  await expect(page.locator("#status-line")).not.toContainText("0 placements");
+});
+
 test("large strict export reports a visible error instead of silently doing nothing", async ({
   page,
 }) => {
@@ -240,7 +379,7 @@ test("large strict export reports a visible error instead of silently doing noth
   await page.selectOption("#board-select", "LatticeHex");
   await page.fill("#radius-input", "3000");
 
-  await page.click("#download-png-button");
+  await page.click("#download-full-png-button");
   await expect(page.locator("#status-line")).toContainText("Export failed", {
     timeout: 5_000,
   });

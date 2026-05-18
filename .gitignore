@@ -1,8 +1,7 @@
 /target/
 /dist/
 /.trunk/
-AGENTS.md
-first_instructions.md
+current_prompt.md
 
 # Playwright
 node_modules/

@@ -27,8 +27,15 @@ pub enum DisplayMode {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EnemyMode {
-    MoveSet,
+    AttackSet,
     Color,
+    ColorAttackSet,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PlacementSearchMode {
+    SpiralPath,
+    CenterDistance,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -292,6 +299,7 @@ pub struct EngineSettings {
     pub track_opacity: f32,
     pub proactive_attacking: bool,
     pub enemy_mode: EnemyMode,
+    pub placement_search: PlacementSearchMode,
     pub army_preset: ArmyPreset,
     pub custom_army: Vec<CustomPiece>,
     pub continuous_offset: f64,
@@ -314,6 +322,7 @@ impl Default for EngineSettings {
             track_opacity: 0.0,
             proactive_attacking: false,
             enemy_mode: EnemyMode::Color,
+            placement_search: PlacementSearchMode::SpiralPath,
             army_preset: ArmyPreset::CustomFinite,
             custom_army: vec![
                 CustomPiece::with_auto_color(2, 1),

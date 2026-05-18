@@ -51,15 +51,47 @@ impl SquareSpiral {
 
     #[must_use]
     pub fn coord_at_index(index: u64) -> SquareCoord {
-        Self::new()
-            .nth(index as usize)
-            .expect("square spiral is infinite")
+        if index == 0 {
+            return SquareCoord::new(0, 0);
+        }
+
+        let mut radius = ((index as f64).sqrt().ceil() as u64).div_ceil(2);
+        while square_ring_max_index(radius) < index {
+            radius += 1;
+        }
+        while radius > 0 && square_ring_max_index(radius - 1) >= index {
+            radius -= 1;
+        }
+
+        let r = radius as i64;
+        let side = 2 * radius;
+        let start = (2 * radius - 1).pow(2);
+        let offset = index - start;
+
+        if offset < side {
+            SquareCoord::new(r, -r + 1 + offset as i64)
+        } else if offset < 2 * side {
+            let t = offset - side;
+            SquareCoord::new(r - 1 - t as i64, r)
+        } else if offset < 3 * side {
+            let t = offset - 2 * side;
+            SquareCoord::new(-r, r - 1 - t as i64)
+        } else {
+            let t = offset - 3 * side;
+            SquareCoord::new(-r + 1 + t as i64, -r)
+        }
     }
 
     fn rotate_counter_clockwise(&mut self) {
         let (dx, dy) = self.dir;
         self.dir = (-dy, dx);
     }
+}
+
+#[must_use]
+fn square_ring_max_index(radius: u64) -> u64 {
+    let side = radius.saturating_mul(2).saturating_add(1);
+    side.saturating_mul(side).saturating_sub(1)
 }
 
 impl Iterator for SquareSpiral {

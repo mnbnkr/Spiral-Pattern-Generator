@@ -14,6 +14,7 @@ const FLOATS_PER_VERTEX: usize = 5;
 const BYTES_PER_FLOAT: usize = std::mem::size_of::<f32>();
 const INITIAL_VERTEX_CAPACITY: usize = 16_384;
 const MAX_TRACK_POINTS: usize = 160_000;
+const MAX_TRACK_SEGMENTS: usize = 250_000;
 const MAX_EXPORT_PIXELS: usize = 64_000_000;
 const MAX_EXPORT_DIMENSION: u32 = 32_767;
 
@@ -49,6 +50,7 @@ precision mediump float;
 
 uniform int u_shape;
 uniform float u_alpha;
+uniform float u_saturation;
 
 varying vec3 v_color;
 
@@ -64,15 +66,24 @@ void main() {
             discard;
         }
     } else if (u_shape == 3) {
-        vec2 p = gl_PointCoord * 2.0 - 1.0;
+        vec2 p = 1.0 - gl_PointCoord * 2.0;
         if (p.y < -0.5 || p.y > 1.0 || abs(p.x) > (1.0 - p.y) * 0.5773503) {
             discard;
         }
     }
 
-    gl_FragColor = vec4(v_color, u_alpha);
+    float luminance = dot(v_color, vec3(0.2126, 0.7152, 0.0722));
+    vec3 color = mix(vec3(luminance), v_color, clamp(u_saturation, 0.0, 1.0));
+    gl_FragColor = vec4(color, u_alpha);
 }
 "#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportKind {
+    FullPng,
+    Png,
+    JpegHalf,
+}
 
 pub struct CanvasRenderer {
     canvas: HtmlCanvasElement,
@@ -87,6 +98,7 @@ pub struct CanvasRenderer {
     pan_uniform: WebGlUniformLocation,
     shape_uniform: WebGlUniformLocation,
     alpha_uniform: WebGlUniformLocation,
+    saturation_uniform: WebGlUniformLocation,
     vertices: Vec<f32>,
     track_vertices: Vec<f32>,
     pending_upload: PendingUpload,
@@ -95,6 +107,7 @@ pub struct CanvasRenderer {
     track_buffer: WebGlBuffer,
     settings: EngineSettings,
     color_state: ColorState,
+    color_saturation: f32,
     pan_x: f64,
     pan_y: f64,
     track_key: Option<TrackKey>,
@@ -133,6 +146,7 @@ impl CanvasRenderer {
         let pan_uniform = uniform_location(&gl, &program, "u_pan")?;
         let shape_uniform = uniform_location(&gl, &program, "u_shape")?;
         let alpha_uniform = uniform_location(&gl, &program, "u_alpha")?;
+        let saturation_uniform = uniform_location(&gl, &program, "u_saturation")?;
         let track_buffer = gl
             .create_buffer()
             .ok_or_else(|| JsValue::from_str("failed to create WebGL track buffer"))?;
@@ -155,6 +169,7 @@ impl CanvasRenderer {
             pan_uniform,
             shape_uniform,
             alpha_uniform,
+            saturation_uniform,
             vertices: Vec::new(),
             track_vertices: Vec::new(),
             pending_upload: PendingUpload::Full,
@@ -163,6 +178,7 @@ impl CanvasRenderer {
             track_buffer,
             settings: EngineSettings::default(),
             color_state: ColorState::default(),
+            color_saturation: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
             track_key: None,
@@ -188,6 +204,11 @@ impl CanvasRenderer {
         self.redraw()
     }
 
+    pub fn set_color_saturation(&mut self, color_saturation: f32) -> Result<(), JsValue> {
+        self.color_saturation = color_saturation.clamp(0.0, 1.0);
+        self.redraw()
+    }
+
     pub fn clear_placements(&mut self) -> Result<(), JsValue> {
         self.vertices.clear();
         self.pending_upload = PendingUpload::Full;
@@ -197,6 +218,10 @@ impl CanvasRenderer {
     }
 
     pub fn pan_by_pixels(&mut self, dx: f64, dy: f64) -> Result<(), JsValue> {
+        if self.settings.display_mode != DisplayMode::PixelOneToOne {
+            return Ok(());
+        }
+
         let scale = self.world_scale(self.canvas.width() as f64, self.canvas.height() as f64);
         if scale <= f64::EPSILON {
             return Ok(());
@@ -213,8 +238,8 @@ impl CanvasRenderer {
             return Ok(self.settings.zoom);
         }
 
-        let old_zoom = self.settings.zoom.clamp(1, 16);
-        let new_zoom = (old_zoom as i32 + delta).clamp(1, 16) as u8;
+        let old_zoom = self.settings.zoom.clamp(1, 32);
+        let new_zoom = (old_zoom as i32 + delta).clamp(1, 32) as u8;
         if new_zoom == old_zoom {
             return Ok(old_zoom);
         }
@@ -225,14 +250,15 @@ impl CanvasRenderer {
         let py = client_y * dpr;
         let width = self.canvas.width() as f64;
         let height = self.canvas.height() as f64;
+        let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
         let old_scale = self.world_scale(width, height);
-        let world_x = (px - width * 0.5) / old_scale - self.pan_x;
-        let world_y = (height * 0.5 - py) / old_scale - self.pan_y;
+        let world_x = (px - width * 0.5) / old_scale - (self.pan_x - bounds.center_x());
+        let world_y = (height * 0.5 - py) / old_scale - (self.pan_y - bounds.center_y());
 
         self.settings.zoom = new_zoom;
         let new_scale = self.world_scale(width, height);
-        self.pan_x = (px - width * 0.5) / new_scale - world_x;
-        self.pan_y = (height * 0.5 - py) / new_scale - world_y;
+        self.pan_x = (px - width * 0.5) / new_scale + bounds.center_x() - world_x;
+        self.pan_y = (height * 0.5 - py) / new_scale + bounds.center_y() - world_y;
         self.clamp_pan_to_view();
         self.redraw()?;
         Ok(new_zoom)
@@ -316,8 +342,8 @@ impl CanvasRenderer {
             .uniform1f(Some(&self.scale_uniform), render_state.scale);
         self.gl.uniform2f(
             Some(&self.pan_uniform),
-            self.pan_x as f32,
-            self.pan_y as f32,
+            (self.pan_x - render_state.center_x) as f32,
+            (self.pan_y - render_state.center_y) as f32,
         );
         self.gl.clear(Gl::COLOR_BUFFER_BIT);
 
@@ -338,6 +364,10 @@ impl CanvasRenderer {
         self.gl
             .uniform1i(Some(&self.shape_uniform), render_state.shape);
         self.gl.uniform1f(Some(&self.alpha_uniform), 1.0);
+        self.gl.uniform1f(
+            Some(&self.saturation_uniform),
+            self.color_saturation.clamp(0.0, 1.0),
+        );
         self.gl.draw_arrays(
             Gl::POINTS,
             0,
@@ -369,8 +399,14 @@ impl CanvasRenderer {
             Some(&self.alpha_uniform),
             self.settings.track_opacity.clamp(0.0, 1.0),
         );
+        self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
+        let primitive = if self.settings.board == BoardKind::ContinuousArchimedean {
+            Gl::LINE_STRIP
+        } else {
+            Gl::LINES
+        };
         self.gl.draw_arrays(
-            Gl::LINE_STRIP,
+            primitive,
             0,
             (self.track_vertices.len() / FLOATS_PER_VERTEX) as i32,
         );
@@ -403,10 +439,10 @@ impl CanvasRenderer {
         &self,
         mime_type: &str,
         filename: &str,
-        resolution_scale: f64,
+        kind: ExportKind,
         encoder_quality: Option<f64>,
     ) -> Result<(), JsValue> {
-        let export_canvas = self.pixel_export_canvas(resolution_scale)?;
+        let export_canvas = self.pixel_export_canvas(kind)?;
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
         let document = window
             .document()
@@ -510,15 +546,15 @@ impl CanvasRenderer {
         Ok(())
     }
 
-    fn pixel_export_canvas(&self, resolution_scale: f64) -> Result<HtmlCanvasElement, JsValue> {
-        let spec = self.export_spec(resolution_scale);
-        let pixel_count = spec.width as usize * spec.height as usize;
+    fn pixel_export_canvas(&self, kind: ExportKind) -> Result<HtmlCanvasElement, JsValue> {
+        let spec = self.export_spec(kind, 1.0);
         if spec.width > MAX_EXPORT_DIMENSION || spec.height > MAX_EXPORT_DIMENSION {
             return Err(JsValue::from_str(&format!(
                 "strict full-scale export is too large: {}x{} exceeds browser canvas limits",
                 spec.width, spec.height
             )));
         }
+        let pixel_count = checked_pixel_count(spec.width, spec.height)?;
         if pixel_count > MAX_EXPORT_PIXELS {
             return Err(JsValue::from_str(&format!(
                 "strict full-scale export is too large: {}x{} would exceed {} pixels",
@@ -526,17 +562,52 @@ impl CanvasRenderer {
             )));
         }
 
-        let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
-        let document = window
-            .document()
-            .ok_or_else(|| JsValue::from_str("document unavailable"))?;
-        let canvas = document
-            .create_element("canvas")?
-            .dyn_into::<HtmlCanvasElement>()?;
-        canvas.set_width(spec.width);
-        canvas.set_height(spec.height);
+        if !spec.square_pixel_cells {
+            let supersampled = self.export_spec(kind, 2.0);
+            if supersampled.width > MAX_EXPORT_DIMENSION
+                || supersampled.height > MAX_EXPORT_DIMENSION
+            {
+                return Err(JsValue::from_str(&format!(
+                    "strict smoothed export is too large: {}x{} supersample would exceed browser limits",
+                    supersampled.width, supersampled.height
+                )));
+            }
+            let supersampled_pixel_count =
+                checked_pixel_count(supersampled.width, supersampled.height)?;
+            if supersampled_pixel_count > MAX_EXPORT_PIXELS {
+                return Err(JsValue::from_str(&format!(
+                    "strict smoothed export is too large: {}x{} supersample would exceed browser limits",
+                    supersampled.width, supersampled.height
+                )));
+            }
 
-        let mut pixels = vec![0_u8; pixel_count * 4];
+            let mut high_pixels = vec![0_u8; checked_rgba_len(supersampled_pixel_count)?];
+            fill_background(&mut high_pixels);
+            for vertex in self.vertices.chunks_exact(5) {
+                let center_x = vertex[0] as f64;
+                let center_y = vertex[1] as f64;
+                let color = [
+                    channel_to_u8(vertex[2]),
+                    channel_to_u8(vertex[3]),
+                    channel_to_u8(vertex[4]),
+                    255,
+                ];
+                draw_export_piece(&mut high_pixels, &supersampled, center_x, center_y, color);
+            }
+
+            let mut pixels = vec![0_u8; checked_rgba_len(pixel_count)?];
+            downsample_2x(
+                &high_pixels,
+                supersampled.width,
+                supersampled.height,
+                &mut pixels,
+                spec.width,
+                spec.height,
+            );
+            return canvas_from_pixels(spec.width, spec.height, pixels);
+        }
+
+        let mut pixels = vec![0_u8; checked_rgba_len(pixel_count)?];
         fill_background(&mut pixels);
 
         for vertex in self.vertices.chunks_exact(5) {
@@ -551,40 +622,28 @@ impl CanvasRenderer {
             draw_export_piece(&mut pixels, &spec, center_x, center_y, color);
         }
 
-        let image = ImageData::new_with_u8_clamped_array_and_sh(
-            Clamped(pixels.as_mut_slice()),
-            spec.width,
-            spec.height,
-        )?;
-        let context = canvas
-            .get_context("2d")?
-            .ok_or_else(|| JsValue::from_str("2d context unavailable"))?
-            .dyn_into::<CanvasRenderingContext2d>()?;
-        context.put_image_data(&image, 0.0, 0.0)?;
-        Ok(canvas)
+        canvas_from_pixels(spec.width, spec.height, pixels)
     }
 
     fn world_scale(&self, width: f64, height: f64) -> f64 {
         match self.settings.display_mode {
             DisplayMode::FitScreen => {
-                let extent = self.fit_extent();
-                width.min(height) / (2.0 * extent + 4.0)
+                let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
+                (width / (bounds.width() + 4.0)).min(height / (bounds.height() + 4.0))
             }
-            DisplayMode::PixelOneToOne => self.settings.zoom.max(1) as f64,
+            DisplayMode::PixelOneToOne => self.settings.zoom.clamp(1, 32) as f64 * 1.25,
         }
     }
 
-    fn fit_extent(&self) -> f64 {
-        match self.settings.board {
-            BoardKind::LatticeTriangle => 3.0_f64.sqrt() * self.settings.radius.max(1.0),
-            _ => self.settings.radius.max(1.0),
-        }
+    fn view_bounds(&self, margin: f64) -> WorldBounds {
+        board_world_bounds(&self.settings, margin)
     }
 
     fn render_state(&self, width: u32, height: u32) -> RenderState {
         let scale = self.world_scale(width as f64, height as f64);
         let radius_px = (scale * rendered_piece_radius(&self.settings)).max(1.0);
         let shape = shader_shape(&self.settings);
+        let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
 
         RenderState {
             width,
@@ -592,54 +651,28 @@ impl CanvasRenderer {
             scale: scale as f32,
             point_size: (radius_px * 2.0) as f32,
             shape,
+            center_x: bounds.center_x(),
+            center_y: bounds.center_y(),
         }
     }
 
-    fn export_spec(&self, resolution_scale: f64) -> ExportSpec {
-        let radius = self.settings.radius.max(1.0);
+    fn export_spec(&self, kind: ExportKind, supersample: f64) -> ExportSpec {
         let board = self.settings.board;
         let square_pixel_cells =
             board == BoardKind::LatticeSquare && self.settings.shape == ShapeKind::Square;
-        let base_scale = if square_pixel_cells { 1.0 } else { 4.0 };
-        let scale = (base_scale * resolution_scale.clamp(0.25, 1.0)).max(0.25);
         let piece_radius = rendered_piece_radius(&self.settings).max(0.0);
+        let scale = export_scale(kind, square_pixel_cells, piece_radius) * supersample.max(1.0);
         let margin = if square_pixel_cells {
             0.0
         } else {
             piece_radius
         };
 
-        let (min_x, max_x, min_y, max_y) = match board {
-            BoardKind::LatticeSquare | BoardKind::ContinuousArchimedean => (
-                -radius - margin,
-                radius + margin,
-                -radius - margin,
-                radius + margin,
-            ),
-            BoardKind::LatticeHex => {
-                let hex_extent_x = 3.0_f64.sqrt() * radius;
-                let hex_extent_y = 1.5 * radius;
-                (
-                    -hex_extent_x - margin,
-                    hex_extent_x + margin,
-                    -hex_extent_y - margin,
-                    hex_extent_y + margin,
-                )
-            }
-            BoardKind::LatticeTriangle => {
-                let tri_extent_x = 1.5 * radius;
-                let tri_extent_y = 3.0_f64.sqrt() * radius;
-                (
-                    -tri_extent_x - margin,
-                    tri_extent_x + margin,
-                    -tri_extent_y - margin,
-                    tri_extent_y + margin,
-                )
-            }
-        };
+        let bounds = board_world_bounds(&self.settings, margin);
+        let (min_x, max_x, min_y, max_y) = (bounds.min_x, bounds.max_x, bounds.min_y, bounds.max_y);
 
-        let width = ((max_x - min_x) * scale).round() as u32 + 1;
-        let height = ((max_y - min_y) * scale).round() as u32 + 1;
+        let width = export_dimension(max_x - min_x, scale);
+        let height = export_dimension(max_y - min_y, scale);
         let shape = export_shape(&self.settings);
 
         ExportSpec {
@@ -650,6 +683,7 @@ impl CanvasRenderer {
             height: height.max(1),
             piece_radius,
             shape,
+            square_pixel_cells,
         }
     }
 
@@ -661,11 +695,21 @@ impl CanvasRenderer {
             return;
         }
 
-        let extent = self.fit_extent() + rendered_piece_radius(&self.settings);
+        if self.settings.display_mode != DisplayMode::PixelOneToOne {
+            self.pan_x = 0.0;
+            self.pan_y = 0.0;
+            return;
+        }
+
+        let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
+        let half_board_width = bounds.width() * 0.5;
+        let half_board_height = bounds.height() * 0.5;
         let half_width = self.canvas.width() as f64 / (2.0 * scale);
         let half_height = self.canvas.height() as f64 / (2.0 * scale);
-        let max_x = (extent - half_width).max(0.0);
-        let max_y = (extent - half_height).max(0.0);
+        let edge_room =
+            half_width.min(half_height) * 0.25 + rendered_piece_radius(&self.settings) + 4.0;
+        let max_x = (half_board_width + edge_room - half_width).max(0.0);
+        let max_y = (half_board_height + edge_room - half_height).max(0.0);
         self.pan_x = self.pan_x.clamp(-max_x, max_x);
         self.pan_y = self.pan_y.clamp(-max_y, max_y);
     }
@@ -685,6 +729,8 @@ struct RenderState {
     scale: f32,
     point_size: f32,
     shape: i32,
+    center_x: f64,
+    center_y: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -696,6 +742,37 @@ struct ExportSpec {
     height: u32,
     piece_radius: f64,
     shape: ExportShape,
+    square_pixel_cells: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorldBounds {
+    min_x: f64,
+    max_x: f64,
+    min_y: f64,
+    max_y: f64,
+}
+
+impl WorldBounds {
+    #[must_use]
+    fn width(self) -> f64 {
+        (self.max_x - self.min_x).max(1.0)
+    }
+
+    #[must_use]
+    fn height(self) -> f64 {
+        (self.max_y - self.min_y).max(1.0)
+    }
+
+    #[must_use]
+    fn center_x(self) -> f64 {
+        0.5 * (self.min_x + self.max_x)
+    }
+
+    #[must_use]
+    fn center_y(self) -> f64 {
+        0.5 * (self.min_y + self.max_y)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -765,6 +842,49 @@ fn export_shape(settings: &EngineSettings) -> ExportShape {
     }
 }
 
+fn export_scale(kind: ExportKind, square_pixel_cells: bool, piece_radius: f64) -> f64 {
+    let full_scale: f64 = if square_pixel_cells { 1.0 } else { 4.0 };
+    match kind {
+        ExportKind::FullPng => full_scale,
+        ExportKind::Png if square_pixel_cells => full_scale,
+        ExportKind::Png => full_scale.min(1.0 / piece_radius.max(0.125)),
+        ExportKind::JpegHalf => full_scale * 0.5,
+    }
+}
+
+fn board_world_bounds(settings: &EngineSettings, margin: f64) -> WorldBounds {
+    let radius = settings.radius.max(1.0);
+    let margin = margin.max(0.0);
+
+    match settings.board {
+        BoardKind::LatticeSquare | BoardKind::ContinuousArchimedean => WorldBounds {
+            min_x: -radius - margin,
+            max_x: radius + margin,
+            min_y: -radius - margin,
+            max_y: radius + margin,
+        },
+        BoardKind::LatticeHex => {
+            let hex_extent_x = 3.0_f64.sqrt() * radius;
+            let hex_extent_y = 1.5 * radius;
+            WorldBounds {
+                min_x: -hex_extent_x - margin,
+                max_x: hex_extent_x + margin,
+                min_y: -hex_extent_y - margin,
+                max_y: hex_extent_y + margin,
+            }
+        }
+        BoardKind::LatticeTriangle => {
+            let shell = settings.radius.max(0.0).floor().max(1.0);
+            WorldBounds {
+                min_x: -1.5 * shell - margin,
+                max_x: 1.5 * shell - 0.5 + margin,
+                min_y: -0.5 * 3.0_f64.sqrt() * shell - margin,
+                max_y: 3.0_f64.sqrt() * shell + margin,
+            }
+        }
+    }
+}
+
 fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     if settings.track_opacity <= f32::EPSILON {
         return Vec::new();
@@ -773,44 +893,33 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     let mut vertices = Vec::new();
     match settings.board {
         BoardKind::LatticeSquare => {
-            let bound = settings.radius.max(0.0).floor() as i64;
-            for coord in SquareSpiral::new() {
-                if coord.x.abs().max(coord.y.abs()) > bound {
-                    break;
-                }
-                if vertices.len() / FLOATS_PER_VERTEX >= MAX_TRACK_POINTS {
-                    break;
-                }
-                let point = coord.to_point();
-                push_track_vertex(&mut vertices, point.x, point.y);
-            }
+            let bound = settings.radius.max(0.0).floor() as u64;
+            let side = bound.saturating_mul(2).saturating_add(1);
+            let total_points = side.saturating_mul(side);
+            push_sampled_track_segments(&mut vertices, total_points, |index| {
+                let point = SquareSpiral::coord_at_index(index).to_point();
+                (point.x, point.y)
+            });
         }
         BoardKind::LatticeHex => {
-            let bound = settings.radius.max(0.0).floor() as i64;
-            for coord in HexSpiral::new() {
-                let (x, y, z) = coord.cube();
-                if x.abs().max(y.abs()).max(z.abs()) > bound {
-                    break;
-                }
-                if vertices.len() / FLOATS_PER_VERTEX >= MAX_TRACK_POINTS {
-                    break;
-                }
-                let point = coord.to_point();
-                push_track_vertex(&mut vertices, point.x, point.y);
-            }
+            let bound = settings.radius.max(0.0).floor() as u64;
+            let total_points = 1_u64.saturating_add(
+                3_u64
+                    .saturating_mul(bound)
+                    .saturating_mul(bound.saturating_add(1)),
+            );
+            push_sampled_track_segments(&mut vertices, total_points, |index| {
+                let point = HexSpiral::coord_at_index(index).to_point();
+                (point.x, point.y)
+            });
         }
         BoardKind::LatticeTriangle => {
-            let bound = settings.radius.max(0.0).floor() as i64;
-            for (index, coord) in TriangleSpiral::new().enumerate() {
-                if TriangleSpiral::radius_for_index(index as u64) > bound as u64 {
-                    break;
-                }
-                if vertices.len() / FLOATS_PER_VERTEX >= MAX_TRACK_POINTS {
-                    break;
-                }
-                let point = coord.to_point();
-                push_track_vertex(&mut vertices, point.x, point.y);
-            }
+            let bound = settings.radius.max(0.0).floor() as u64;
+            let total_points = triangular_number(bound.saturating_mul(3)).saturating_add(1);
+            push_sampled_track_segments(&mut vertices, total_points, |index| {
+                let point = TriangleSpiral::coord_at_index(index).to_point();
+                (point.x, point.y)
+            });
         }
         BoardKind::ContinuousArchimedean => {
             let radius = settings.radius.max(0.0);
@@ -831,6 +940,69 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     vertices
 }
 
+fn push_sampled_track_segments<F>(vertices: &mut Vec<f32>, total_points: u64, mut point_at: F)
+where
+    F: FnMut(u64) -> (f64, f64),
+{
+    if total_points < 2 {
+        return;
+    }
+
+    let total_segments = total_points - 1;
+    let stride = total_segments.div_ceil(MAX_TRACK_SEGMENTS as u64).max(1);
+    let mut segment = 0_u64;
+    let mut last_pushed = None;
+
+    while segment < total_segments {
+        push_track_segment(vertices, segment, &mut point_at);
+        last_pushed = Some(segment);
+        segment = segment.saturating_add(stride);
+        if segment == u64::MAX {
+            break;
+        }
+    }
+
+    let final_segment = total_segments - 1;
+    if last_pushed != Some(final_segment) {
+        push_track_segment(vertices, final_segment, &mut point_at);
+    }
+}
+
+fn push_track_segment<F>(vertices: &mut Vec<f32>, start_index: u64, point_at: &mut F)
+where
+    F: FnMut(u64) -> (f64, f64),
+{
+    let start = point_at(start_index);
+    let end = point_at(start_index + 1);
+    push_track_vertex(vertices, start.0, start.1);
+    push_track_vertex(vertices, end.0, end.1);
+}
+
+#[must_use]
+fn triangular_number(n: u64) -> u64 {
+    n.saturating_mul(n.saturating_add(1)) / 2
+}
+
+fn export_dimension(span: f64, scale: f64) -> u32 {
+    let pixels = span.max(0.0) * scale.max(0.0);
+    if !pixels.is_finite() || pixels >= u32::MAX as f64 {
+        return u32::MAX;
+    }
+    (pixels.round() as u32).saturating_add(1).max(1)
+}
+
+fn checked_pixel_count(width: u32, height: u32) -> Result<usize, JsValue> {
+    (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| JsValue::from_str("export dimensions are too large"))
+}
+
+fn checked_rgba_len(pixel_count: usize) -> Result<usize, JsValue> {
+    pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| JsValue::from_str("export pixel buffer is too large"))
+}
+
 fn push_track_vertex(vertices: &mut Vec<f32>, x: f64, y: f64) {
     vertices.extend_from_slice(&[x as f32, y as f32, 0.70, 0.78, 0.86]);
 }
@@ -839,6 +1011,65 @@ fn fill_background(pixels: &mut [u8]) {
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.copy_from_slice(&[8, 9, 10, 255]);
     }
+}
+
+fn downsample_2x(
+    source: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target: &mut [u8],
+    target_width: u32,
+    target_height: u32,
+) {
+    for y in 0..target_height {
+        for x in 0..target_width {
+            let mut accum = [0_u32; 4];
+            let mut count = 0_u32;
+            for sy in (y * 2)..=((y * 2 + 1).min(source_height.saturating_sub(1))) {
+                for sx in (x * 2)..=((x * 2 + 1).min(source_width.saturating_sub(1))) {
+                    let source_index = ((sy * source_width + sx) * 4) as usize;
+                    if let Some(pixel) = source.get(source_index..source_index + 4) {
+                        for channel in 0..4 {
+                            accum[channel] += pixel[channel] as u32;
+                        }
+                        count += 1;
+                    }
+                }
+            }
+
+            let target_index = ((y * target_width + x) * 4) as usize;
+            if let Some(pixel) = target.get_mut(target_index..target_index + 4) {
+                let count = count.max(1);
+                for channel in 0..4 {
+                    pixel[channel] = (accum[channel] / count) as u8;
+                }
+            }
+        }
+    }
+}
+
+fn canvas_from_pixels(
+    width: u32,
+    height: u32,
+    mut pixels: Vec<u8>,
+) -> Result<HtmlCanvasElement, JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("document unavailable"))?;
+    let canvas = document
+        .create_element("canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+    canvas.set_width(width);
+    canvas.set_height(height);
+    let image =
+        ImageData::new_with_u8_clamped_array_and_sh(Clamped(pixels.as_mut_slice()), width, height)?;
+    let context = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("2d context unavailable"))?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+    context.put_image_data(&image, 0.0, 0.0)?;
+    Ok(canvas)
 }
 
 fn draw_export_piece(
@@ -900,8 +1131,8 @@ fn export_shape_contains(
                 && dx / 3.0_f64.sqrt() + dy <= 1.0 + epsilon
         }
         ExportShape::Triangle => {
-            let px = (world_x - center_x) / piece_radius.max(epsilon);
-            let py = (world_y - center_y) / piece_radius.max(epsilon);
+            let px = -(world_x - center_x) / piece_radius.max(epsilon);
+            let py = -(world_y - center_y) / piece_radius.max(epsilon);
             py >= -0.5 - epsilon
                 && py <= 1.0 + epsilon
                 && px.abs() <= (1.0 - py) / 3.0_f64.sqrt() + epsilon
@@ -1011,5 +1242,140 @@ mod tests {
         };
 
         assert!((rendered_piece_radius(&settings) - 1.0 / 3.0_f64.sqrt()).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn triangle_export_shape_is_flipped_downward() {
+        assert!(export_shape_contains(
+            ExportShape::Triangle,
+            0.0,
+            0.0,
+            0.0,
+            -0.9,
+            1.0
+        ));
+        assert!(!export_shape_contains(
+            ExportShape::Triangle,
+            0.0,
+            0.0,
+            0.0,
+            0.9,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn export_scales_keep_square_nearest_and_cap_regular_png() {
+        assert_eq!(export_scale(ExportKind::FullPng, true, 0.5), 1.0);
+        assert_eq!(export_scale(ExportKind::Png, true, 0.5), 1.0);
+        assert_eq!(export_scale(ExportKind::JpegHalf, true, 0.5), 0.5);
+        assert_eq!(export_scale(ExportKind::FullPng, false, 0.5), 4.0);
+        assert_eq!(export_scale(ExportKind::Png, false, 0.5), 2.0);
+    }
+
+    #[test]
+    fn lattice_track_sampling_reaches_requested_radius() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+        ] {
+            let settings = EngineSettings {
+                board,
+                radius: 1_000.0,
+                track_opacity: 0.5,
+                ..EngineSettings::default()
+            };
+            let vertices = build_track_vertices(&settings);
+            let last = &vertices[vertices.len() - FLOATS_PER_VERTEX..];
+            let distance = match board {
+                BoardKind::LatticeSquare => last[0].abs().max(last[1].abs()) as f64,
+                BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
+                    (last[0] as f64).hypot(last[1] as f64)
+                }
+                BoardKind::ContinuousArchimedean => unreachable!(),
+            };
+
+            assert!(vertices.len() / FLOATS_PER_VERTEX <= (MAX_TRACK_SEGMENTS + 1) * 2);
+            assert!(distance > 900.0, "board={board:?}, distance={distance}");
+        }
+    }
+
+    #[test]
+    fn lattice_track_radius_150_draws_every_adjacent_segment() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+        ] {
+            let settings = EngineSettings {
+                board,
+                radius: 150.0,
+                track_opacity: 0.5,
+                ..EngineSettings::default()
+            };
+            let vertices = build_track_vertices(&settings);
+            let expected_points = match board {
+                BoardKind::LatticeSquare => {
+                    let side = 150_u64 * 2 + 1;
+                    side * side
+                }
+                BoardKind::LatticeHex => 1 + 3 * 150_u64 * 151,
+                BoardKind::LatticeTriangle => triangular_number(150_u64 * 3) + 1,
+                BoardKind::ContinuousArchimedean => unreachable!(),
+            };
+
+            assert_eq!(
+                vertices.len() / FLOATS_PER_VERTEX,
+                (expected_points as usize - 1) * 2,
+                "board={board:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_lattice_track_segments_do_not_connect_distant_spiral_points() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+        ] {
+            let settings = EngineSettings {
+                board,
+                radius: 1_000.0,
+                track_opacity: 0.5,
+                ..EngineSettings::default()
+            };
+            let vertices = build_track_vertices(&settings);
+            let max_segment = vertices
+                .chunks_exact(FLOATS_PER_VERTEX * 2)
+                .map(|segment| {
+                    let x0 = segment[0] as f64;
+                    let y0 = segment[1] as f64;
+                    let x1 = segment[FLOATS_PER_VERTEX] as f64;
+                    let y1 = segment[FLOATS_PER_VERTEX + 1] as f64;
+                    (x1 - x0).hypot(y1 - y0)
+                })
+                .fold(0.0_f64, f64::max);
+
+            assert!(
+                max_segment <= 2.0,
+                "board={board:?}, max segment length={max_segment}"
+            );
+        }
+    }
+
+    #[test]
+    fn triangle_world_bounds_follow_asymmetric_triangle_shell() {
+        let settings = EngineSettings {
+            board: BoardKind::LatticeTriangle,
+            radius: 10.0,
+            ..EngineSettings::default()
+        };
+        let bounds = board_world_bounds(&settings, 0.0);
+
+        assert!(bounds.center_y() > 0.0);
+        assert!(bounds.min_y > -3.0_f64.sqrt() * 10.0);
+        assert_eq!(bounds.max_x, 14.5);
     }
 }

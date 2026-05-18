@@ -8,7 +8,7 @@ use crate::math::{
 };
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
-    EngineStats, PieceColor, PieceSignature, Placement, ShapeKind, SpotCoord,
+    EngineStats, PieceColor, PieceSignature, Placement, PlacementSearchMode, ShapeKind, SpotCoord,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,6 +49,25 @@ struct PlacedPiece {
     move_group: (i32, i32),
     color_group: u64,
     attack_radius: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PassiveAttackSummary {
+    blocked: bool,
+    color_groups: FxHashSet<u64>,
+    move_groups: FxHashSet<(i32, i32)>,
+}
+
+impl PassiveAttackSummary {
+    fn add_attacker(&mut self, attacker: &PlacedPiece) {
+        self.color_groups.insert(attacker.color_group);
+        self.move_groups.insert(attacker.move_group);
+    }
+
+    #[must_use]
+    fn has_attacks(&self) -> bool {
+        !self.color_groups.is_empty() || !self.move_groups.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +124,12 @@ impl BoardSpot {
     }
 
     #[must_use]
+    fn center_distance_squared(&self) -> f64 {
+        let center = self.center();
+        center.x.mul_add(center.x, center.y * center.y)
+    }
+
+    #[must_use]
     fn spot_coord(&self) -> SpotCoord {
         match self {
             Self::Square { coord, .. } => SpotCoord::Square {
@@ -148,10 +173,14 @@ pub struct SimulationEngine {
     stats: EngineStats,
     next_id: u64,
     next_army_index: u64,
-    spot_seek_scan_indices: Vec<u64>,
-    next_piece_spot_index: u64,
+    custom_spiral_path_scan_order_indices: Vec<u64>,
+    custom_center_distance_scan_order_indices: Vec<u64>,
+    next_piece_spot_order_index: u64,
     piece_seek_candidate_index: Option<usize>,
     spots: Vec<BoardSpot>,
+    spots_exhausted: bool,
+    first_out_of_radius_spot: Option<BoardSpot>,
+    center_ordered_spot_indices: Option<Vec<u64>>,
     square_spiral: SquareSpiral,
     hex_spiral: HexSpiral,
     triangle_spiral: TriangleSpiral,
@@ -172,18 +201,20 @@ impl SimulationEngine {
     pub fn new(settings: EngineSettings) -> Self {
         let mode = SimulationMode::from_preset(settings.army_preset);
         let continuous_spiral = ArchimedeanSpiral::spots(settings.continuous_offset);
-        let custom_army_len = settings.custom_army.len();
-
         Self {
             settings,
             mode,
             stats: EngineStats::default(),
             next_id: 0,
             next_army_index: 0,
-            spot_seek_scan_indices: vec![0; custom_army_len],
-            next_piece_spot_index: 0,
+            custom_spiral_path_scan_order_indices: Vec::new(),
+            custom_center_distance_scan_order_indices: Vec::new(),
+            next_piece_spot_order_index: 0,
             piece_seek_candidate_index: None,
             spots: Vec::new(),
+            spots_exhausted: false,
+            first_out_of_radius_spot: None,
+            center_ordered_spot_indices: None,
             square_spiral: SquareSpiral::new(),
             hex_spiral: HexSpiral::new(),
             triangle_spiral: TriangleSpiral::new(),
@@ -205,11 +236,15 @@ impl SimulationEngine {
     }
 
     pub fn update_settings(&mut self, settings: EngineSettings) -> bool {
+        let radius_increased = settings.radius > self.settings.radius;
         if self.requires_reset_for_settings(&settings) {
             self.reset(settings);
             true
         } else {
             self.settings = settings;
+            if radius_increased {
+                self.reopen_spiral_path_radius_bound();
+            }
             false
         }
     }
@@ -275,16 +310,31 @@ impl SimulationEngine {
             return None;
         }
 
-        if self.spot_seek_scan_indices.len() != army_len {
-            self.spot_seek_scan_indices.resize(army_len, 0);
-        }
-
         let army_index = (self.next_army_index as usize) % army_len;
+        match self.settings.placement_search {
+            PlacementSearchMode::SpiralPath => {
+                self.next_spiral_path_spot_seeking_placement(remaining_work, army_len, army_index)
+            }
+            PlacementSearchMode::CenterDistance => self
+                .next_center_distance_spot_seeking_placement(remaining_work, army_len, army_index),
+        }
+    }
+
+    fn next_spiral_path_spot_seeking_placement(
+        &mut self,
+        remaining_work: &mut u64,
+        army_len: usize,
+        army_index: usize,
+    ) -> Option<Placement> {
+        self.ensure_custom_scan_cursors(army_len);
+        let mut scan_index = self.custom_spiral_path_scan_order_indices[army_index];
         let piece = self.custom_candidate(army_index);
-        let mut scan_index = self.spot_seek_scan_indices[army_index];
 
         while *remaining_work > 0 {
-            let spot = self.spot_at(scan_index)?;
+            let Some(spot) = self.spot_at_search_order(scan_index) else {
+                self.stats.exhausted = true;
+                return None;
+            };
             scan_index += 1;
             *remaining_work -= 1;
 
@@ -294,27 +344,91 @@ impl SimulationEngine {
 
             self.stats.spots_tested += 1;
 
+            let summary = self.passive_attack_summary(&spot);
+            if summary.blocked || self.passive_summary_impossible_for_custom_candidates(&summary) {
+                self.stats.skipped_spots += 1;
+                continue;
+            }
+
+            if self.passive_summary_rejects_candidate(&summary, &piece) {
+                self.stats.passive_rejections += 1;
+                self.stats.skipped_spots += 1;
+                continue;
+            }
+
             if self.is_valid_candidate(&spot, &piece) {
+                self.custom_spiral_path_scan_order_indices[army_index] = scan_index;
                 self.next_army_index += 1;
-                self.spot_seek_scan_indices[army_index] = scan_index;
                 return Some(self.place_piece(spot, piece));
             }
 
             self.stats.skipped_spots += 1;
         }
 
-        self.spot_seek_scan_indices[army_index] = scan_index;
+        self.custom_spiral_path_scan_order_indices[army_index] = scan_index;
+        None
+    }
+
+    fn next_center_distance_spot_seeking_placement(
+        &mut self,
+        remaining_work: &mut u64,
+        army_len: usize,
+        army_index: usize,
+    ) -> Option<Placement> {
+        self.ensure_custom_scan_cursors(army_len);
+        let mut order_index = self.custom_center_distance_scan_order_indices[army_index];
+        let piece = self.custom_candidate(army_index);
+
+        while *remaining_work > 0 {
+            let Some(spot) = self.spot_at_search_order(order_index) else {
+                self.stats.exhausted = true;
+                return None;
+            };
+            order_index += 1;
+            *remaining_work -= 1;
+
+            if self.occupied_spots.contains_key(&spot.index()) {
+                continue;
+            }
+
+            self.stats.spots_tested += 1;
+
+            let summary = self.passive_attack_summary(&spot);
+            if summary.blocked || self.passive_summary_impossible_for_custom_candidates(&summary) {
+                self.stats.skipped_spots += 1;
+                continue;
+            }
+
+            if self.passive_summary_rejects_candidate(&summary, &piece) {
+                self.stats.passive_rejections += 1;
+                self.stats.skipped_spots += 1;
+                continue;
+            }
+
+            if self.is_valid_candidate(&spot, &piece) {
+                self.custom_center_distance_scan_order_indices[army_index] = order_index;
+                self.next_army_index += 1;
+                return Some(self.place_piece(spot, piece));
+            }
+
+            self.stats.skipped_spots += 1;
+        }
+
+        self.custom_center_distance_scan_order_indices[army_index] = order_index;
         None
     }
 
     fn next_piece_seeking_placement(&mut self, remaining_work: &mut u64) -> Option<Placement> {
         while *remaining_work > 0 {
-            let spot = self.spot_at(self.next_piece_spot_index)?;
+            let Some(spot) = self.spot_at_search_order(self.next_piece_spot_order_index) else {
+                self.stats.exhausted = true;
+                return None;
+            };
             if !self.should_skip_piece_seeking_spot(&spot) {
                 break;
             }
 
-            self.next_piece_spot_index += 1;
+            self.next_piece_spot_order_index += 1;
             self.piece_seek_candidate_index = None;
             self.stats.spots_tested += 1;
             self.stats.skipped_spots += 1;
@@ -325,7 +439,11 @@ impl SimulationEngine {
             return None;
         }
 
-        let spot = self.spot_at(self.next_piece_spot_index)?;
+        let Some(spot) = self.spot_at_search_order(self.next_piece_spot_order_index) else {
+            self.stats.exhausted = true;
+            return None;
+        };
+        let summary = self.passive_attack_summary(&spot);
         let mut candidate_index = self
             .piece_seek_candidate_index
             .unwrap_or_else(|| self.lowest_unused_prime_index());
@@ -341,9 +459,15 @@ impl SimulationEngine {
             self.stats.piece_candidates_tested += 1;
             *remaining_work -= 1;
 
+            if self.passive_summary_rejects_candidate(&summary, &piece) {
+                self.stats.passive_rejections += 1;
+                candidate_index += 1;
+                continue;
+            }
+
             if self.is_valid_candidate(&spot, &piece) {
                 self.prime_used[candidate_index] = true;
-                self.next_piece_spot_index += 1;
+                self.next_piece_spot_order_index += 1;
                 self.piece_seek_candidate_index = None;
                 return Some(self.place_piece(spot, piece));
             }
@@ -356,35 +480,34 @@ impl SimulationEngine {
     }
 
     fn should_skip_piece_seeking_spot(&self, spot: &BoardSpot) -> bool {
+        let summary = self.passive_attack_summary(spot);
+        summary.blocked || self.passive_summary_impossible_for_prime_candidates(&summary)
+    }
+
+    fn passive_attack_summary(&self, spot: &BoardSpot) -> PassiveAttackSummary {
+        let mut summary = PassiveAttackSummary::default();
+
         match self.settings.board {
             BoardKind::LatticeSquare | BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
                 let Some(coord) = spot.lattice_coord() else {
-                    return false;
+                    summary.blocked = true;
+                    return summary;
                 };
+
                 if self.lattice_index.contains(coord) {
-                    return true;
+                    summary.blocked = true;
+                    return summary;
                 }
 
-                match self.settings.enemy_mode {
-                    EnemyMode::MoveSet => !self.lattice_index.attackers_at(coord).is_empty(),
-                    EnemyMode::Color => {
-                        let mut groups = FxHashSet::default();
-                        for attacker_id in self.lattice_index.attackers_at(coord) {
-                            if let Some(attacker) = self.placed.get(*attacker_id as usize) {
-                                groups.insert(attacker.color_group);
-                                if groups.len() > 1 {
-                                    return true;
-                                }
-                            }
-                        }
-                        self.required_color_group_is_unavailable(&groups)
+                for attacker_id in self.lattice_index.attackers_at(coord) {
+                    if let Some(attacker) = self.placed.get(*attacker_id as usize) {
+                        summary.add_attacker(attacker);
                     }
                 }
             }
             BoardKind::ContinuousArchimedean => {
                 let center = spot.center();
                 let body_radius = self.settings.piece_radius;
-                let mut passive_color_groups = FxHashSet::default();
 
                 for id in self.continuous_body_probe_ids(center, body_radius) {
                     let Some(existing) = self.placed.get(id as usize) else {
@@ -392,7 +515,8 @@ impl SimulationEngine {
                     };
 
                     if bodies_overlap(center, existing.center, body_radius) {
-                        return true;
+                        summary.blocked = true;
+                        return summary;
                     }
                 }
 
@@ -407,21 +531,63 @@ impl SimulationEngine {
                         existing.attack_radius,
                         body_radius,
                     ) {
-                        match self.settings.enemy_mode {
-                            EnemyMode::MoveSet => return true,
-                            EnemyMode::Color => {
-                                passive_color_groups.insert(existing.color_group);
-                                if passive_color_groups.len() > 1 {
-                                    return true;
-                                }
-                            }
-                        }
+                        summary.add_attacker(existing);
                     }
                 }
-
-                self.required_color_group_is_unavailable(&passive_color_groups)
             }
         }
+
+        summary
+    }
+
+    fn passive_summary_impossible_for_prime_candidates(
+        &self,
+        summary: &PassiveAttackSummary,
+    ) -> bool {
+        if self.enemy_mode_uses_color() {
+            if summary.color_groups.len() > 1 {
+                return true;
+            }
+
+            if self.required_color_group_is_unavailable(&summary.color_groups) {
+                return true;
+            }
+        }
+
+        if self.enemy_mode_uses_attack_set() && summary.has_attacks() {
+            return true;
+        }
+
+        false
+    }
+
+    fn passive_summary_impossible_for_custom_candidates(
+        &self,
+        summary: &PassiveAttackSummary,
+    ) -> bool {
+        (self.enemy_mode_uses_color() && summary.color_groups.len() > 1)
+            || (self.enemy_mode_uses_attack_set() && summary.move_groups.len() > 1)
+    }
+
+    fn passive_summary_rejects_candidate(
+        &self,
+        summary: &PassiveAttackSummary,
+        candidate: &CandidatePiece,
+    ) -> bool {
+        if self.enemy_mode_uses_color()
+            && summary
+                .color_groups
+                .iter()
+                .any(|group| *group != candidate.color_group)
+        {
+            return true;
+        }
+
+        self.enemy_mode_uses_attack_set()
+            && summary
+                .move_groups
+                .iter()
+                .any(|group| *group != candidate.move_group)
     }
 
     fn required_color_group_is_unavailable(&self, passive_groups: &FxHashSet<u64>) -> bool {
@@ -647,9 +813,35 @@ impl SimulationEngine {
     }
 
     fn are_enemies(&self, existing: &PlacedPiece, candidate: &CandidatePiece) -> bool {
-        match self.settings.enemy_mode {
-            EnemyMode::MoveSet => existing.move_group != candidate.move_group,
-            EnemyMode::Color => existing.color_group != candidate.color_group,
+        if self.enemy_mode_uses_color() && existing.color_group != candidate.color_group {
+            return true;
+        }
+
+        self.enemy_mode_uses_attack_set() && existing.move_group != candidate.move_group
+    }
+
+    fn enemy_mode_uses_color(&self) -> bool {
+        matches!(
+            self.settings.enemy_mode,
+            EnemyMode::Color | EnemyMode::ColorAttackSet
+        )
+    }
+
+    fn enemy_mode_uses_attack_set(&self) -> bool {
+        matches!(
+            self.settings.enemy_mode,
+            EnemyMode::AttackSet | EnemyMode::ColorAttackSet
+        )
+    }
+
+    fn ensure_custom_scan_cursors(&mut self, army_len: usize) {
+        if self.custom_spiral_path_scan_order_indices.len() != army_len {
+            self.custom_spiral_path_scan_order_indices
+                .resize(army_len, 0);
+        }
+        if self.custom_center_distance_scan_order_indices.len() != army_len {
+            self.custom_center_distance_scan_order_indices
+                .resize(army_len, 0);
         }
     }
 
@@ -661,14 +853,24 @@ impl SimulationEngine {
         let current = &self.settings;
 
         current.board != next.board
-            || current.radius != next.radius
+            || self.radius_change_requires_reset(next)
             || continuous_piece_radius_changes_simulation(current, next)
             || current.proactive_attacking != next.proactive_attacking
             || current.enemy_mode != next.enemy_mode
+            || current.placement_search != next.placement_search
             || current.army_preset != next.army_preset
             || current.custom_army != next.custom_army
             || current.continuous_offset != next.continuous_offset
             || current.prime_modulo_divisor != next.prime_modulo_divisor
+    }
+
+    fn radius_change_requires_reset(&self, next: &EngineSettings) -> bool {
+        let current = &self.settings;
+        if current.radius == next.radius {
+            return false;
+        }
+
+        current.placement_search != PlacementSearchMode::SpiralPath || next.radius < current.radius
     }
 
     fn custom_candidate(&self, index: usize) -> CandidatePiece {
@@ -749,49 +951,101 @@ impl SimulationEngine {
         }
     }
 
-    fn spot_at(&mut self, index: u64) -> Option<BoardSpot> {
-        if self.stats.exhausted && self.spots.len() <= index as usize {
+    fn spot_at_search_order(&mut self, order_index: u64) -> Option<BoardSpot> {
+        match self.settings.placement_search {
+            PlacementSearchMode::SpiralPath => self.spot_at(index_from_u64(order_index)?),
+            PlacementSearchMode::CenterDistance => {
+                let spot_index = self.center_ordered_spot_index(order_index)?;
+                self.spot_at(index_from_u64(spot_index)?)
+            }
+        }
+    }
+
+    fn center_ordered_spot_index(&mut self, order_index: u64) -> Option<u64> {
+        self.ensure_center_ordered_spot_indices();
+        self.center_ordered_spot_indices
+            .as_ref()?
+            .get(index_from_u64(order_index)?)
+            .copied()
+    }
+
+    fn ensure_center_ordered_spot_indices(&mut self) {
+        if self.center_ordered_spot_indices.is_some() {
+            return;
+        }
+
+        while !self.spots_exhausted {
+            let next_index = self.spots.len() as u64;
+            let Some(next_index) = index_from_u64(next_index) else {
+                self.spots_exhausted = true;
+                break;
+            };
+            if self.spot_at(next_index).is_none() {
+                break;
+            }
+        }
+
+        let mut indices: Vec<u64> = (0..self.spots.len() as u64).collect();
+        indices.sort_by(|left, right| {
+            let left_spot = &self.spots[*left as usize];
+            let right_spot = &self.spots[*right as usize];
+            left_spot
+                .center_distance_squared()
+                .total_cmp(&right_spot.center_distance_squared())
+                .then_with(|| left_spot.index().cmp(&right_spot.index()))
+        });
+        self.center_ordered_spot_indices = Some(indices);
+    }
+
+    fn spot_at(&mut self, index: usize) -> Option<BoardSpot> {
+        if self.spots_exhausted && self.spots.len() <= index {
             return None;
         }
 
-        while self.spots.len() <= index as usize {
+        while self.spots.len() <= index {
             let next_index = self.spots.len() as u64;
-            let spot = match self.settings.board {
-                BoardKind::LatticeSquare => {
-                    let coord = self.square_spiral.next()?;
-                    BoardSpot::Square {
-                        index: next_index,
-                        coord,
+            let spot = if let Some(spot) = self.first_out_of_radius_spot.take() {
+                spot
+            } else {
+                match self.settings.board {
+                    BoardKind::LatticeSquare => {
+                        let coord = self.square_spiral.next()?;
+                        BoardSpot::Square {
+                            index: next_index,
+                            coord,
+                        }
                     }
-                }
-                BoardKind::LatticeHex => {
-                    let coord = self.hex_spiral.next()?;
-                    BoardSpot::Hex {
-                        index: next_index,
-                        coord,
+                    BoardKind::LatticeHex => {
+                        let coord = self.hex_spiral.next()?;
+                        BoardSpot::Hex {
+                            index: next_index,
+                            coord,
+                        }
                     }
-                }
-                BoardKind::LatticeTriangle => {
-                    let coord = self.triangle_spiral.next()?;
-                    BoardSpot::Triangle {
-                        index: next_index,
-                        coord,
-                        spiral_radius: TriangleSpiral::radius_for_index(next_index),
+                    BoardKind::LatticeTriangle => {
+                        let coord = self.triangle_spiral.next()?;
+                        BoardSpot::Triangle {
+                            index: next_index,
+                            coord,
+                            spiral_radius: TriangleSpiral::radius_for_index(next_index),
+                        }
                     }
-                }
-                BoardKind::ContinuousArchimedean => {
-                    let spot = self.continuous_spiral.next()?;
-                    BoardSpot::Continuous {
-                        index: next_index,
-                        theta: spot.theta,
-                        center: spot.center,
+                    BoardKind::ContinuousArchimedean => {
+                        let spot = self.continuous_spiral.next()?;
+                        BoardSpot::Continuous {
+                            index: next_index,
+                            theta: spot.theta,
+                            center: spot.center,
+                        }
                     }
                 }
             };
 
             if !self.spot_within_generation_radius(&spot) {
-                self.stats.current_radius = self.stats.current_radius.max(spot.generation_radius());
-                self.stats.exhausted = true;
+                self.first_out_of_radius_spot = Some(spot);
+                self.stats.current_radius =
+                    self.stats.current_radius.max(self.settings.radius.max(0.0));
+                self.spots_exhausted = true;
                 return None;
             }
 
@@ -799,7 +1053,7 @@ impl SimulationEngine {
             self.spots.push(spot);
         }
 
-        self.spots.get(index as usize).cloned()
+        self.spots.get(index).cloned()
     }
 
     fn spot_within_generation_radius(&self, spot: &BoardSpot) -> bool {
@@ -816,6 +1070,21 @@ impl SimulationEngine {
             }
             BoardSpot::Triangle { spiral_radius, .. } => *spiral_radius <= radius.floor() as u64,
             BoardSpot::Continuous { center, .. } => center.radius() <= radius + 1.0e-9,
+        }
+    }
+
+    fn reopen_spiral_path_radius_bound(&mut self) {
+        if self.settings.placement_search != PlacementSearchMode::SpiralPath {
+            return;
+        }
+
+        let Some(spot) = self.first_out_of_radius_spot.as_ref() else {
+            return;
+        };
+
+        if self.spot_within_generation_radius(spot) {
+            self.spots_exhausted = false;
+            self.stats.exhausted = false;
         }
     }
 
@@ -983,6 +1252,10 @@ fn signature_gap(piece: PieceSignature) -> u32 {
     piece.a.abs_diff(piece.b)
 }
 
+fn index_from_u64(index: u64) -> Option<usize> {
+    usize::try_from(index).ok()
+}
+
 fn continuous_piece_radius_changes_simulation(
     current: &EngineSettings,
     next: &EngineSettings,
@@ -1093,6 +1366,49 @@ mod tests {
     }
 
     #[test]
+    fn increasing_spiral_path_radius_resumes_from_first_previous_outside_spot() {
+        let mut settings = EngineSettings {
+            radius: 1.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        };
+        let mut engine = SimulationEngine::new(settings.clone());
+        let first = engine.step_budget(20, 10_000);
+
+        assert_eq!(first.len(), 9);
+        assert!(engine.stats().exhausted);
+
+        settings.radius = 2.0;
+        assert!(!engine.update_settings(settings));
+        assert!(!engine.stats().exhausted);
+        let resumed = engine.step_budget(1, 10_000);
+
+        assert_eq!(resumed[0].spot_index, 9);
+        assert_eq!(resumed[0].coord, SpotCoord::Square { x: 2, y: -1 });
+    }
+
+    #[test]
+    fn decreasing_radius_still_resets_generation() {
+        let mut settings = EngineSettings {
+            radius: 2.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        };
+        let mut engine = SimulationEngine::new(settings.clone());
+        let first = engine.step_budget(10, 10_000);
+
+        assert_eq!(first.last().map(|placement| placement.spot_index), Some(9));
+
+        settings.radius = 1.0;
+        assert!(engine.update_settings(settings));
+        let restarted = engine.step_budget(1, 10_000);
+
+        assert_eq!(restarted[0].spot_index, 0);
+    }
+
+    #[test]
     fn radius_limits_hex_generation() {
         let settings = EngineSettings {
             board: BoardKind::LatticeHex,
@@ -1173,9 +1489,220 @@ mod tests {
     }
 
     #[test]
+    fn custom_color_mode_rejects_enemy_attacks_but_allows_ally_attacks() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            placement_search: PlacementSearchMode::SpiralPath,
+            enemy_mode: EnemyMode::Color,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(2, 1),
+            ],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(64, 1_000_000);
+
+        let mut earlier: Vec<&Placement> = Vec::new();
+        let mut allowed_on_ally_attacked_spot = false;
+        for placement in &batch {
+            let SpotCoord::Square { x, y } = placement.coord else {
+                panic!("expected square placement");
+            };
+            for attacker in &earlier {
+                let SpotCoord::Square { x: ax, y: ay } = attacker.coord else {
+                    panic!("expected square placement");
+                };
+                let attacked = square_attack_offsets(attacker.piece)
+                    .into_iter()
+                    .any(|(dx, dy)| ax + dx == x && ay + dy == y);
+                if attacked && attacker.color.key.group == placement.color.key.group {
+                    allowed_on_ally_attacked_spot = true;
+                }
+                assert!(
+                    !attacked || attacker.color.key.group == placement.color.key.group,
+                    "spot {} at ({x},{y}) was attacked by enemy color group {} from spot {}",
+                    placement.spot_index,
+                    attacker.color.key.group,
+                    attacker.spot_index
+                );
+            }
+            earlier.push(placement);
+        }
+
+        assert!(
+            allowed_on_ally_attacked_spot,
+            "test did not exercise an own-color attacked placement"
+        );
+    }
+
+    #[test]
+    fn custom_two_color_square_knights_match_spiral_readback_sequences() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            placement_search: PlacementSearchMode::SpiralPath,
+            enemy_mode: EnemyMode::Color,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(2, 1),
+            ],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(96, 2_000_000);
+        assert_eq!(batch.len(), 96);
+
+        let first_knight = [
+            0, 2, 5, 9, 11, 15, 20, 21, 30, 31, 36, 40, 42, 47, 48, 50, 56, 61, 65, 67, 69,
+        ];
+        let second_knight = [
+            1, 3, 4, 6, 10, 12, 24, 25, 34, 35, 37, 41, 44, 49, 55, 57, 58, 63, 64, 66, 68,
+        ];
+
+        let mut readback = batch.clone();
+        readback.sort_by_key(|placement| placement.spot_index);
+        let first_actual: Vec<_> = readback
+            .iter()
+            .filter(|placement| placement.color.key.group == 0)
+            .take(first_knight.len())
+            .map(|placement| placement.spot_index)
+            .collect();
+        let second_actual: Vec<_> = readback
+            .iter()
+            .filter(|placement| placement.color.key.group == 1)
+            .take(second_knight.len())
+            .map(|placement| placement.spot_index)
+            .collect();
+
+        assert_eq!(first_actual, first_knight);
+        assert_eq!(second_actual, second_knight);
+    }
+
+    #[test]
+    fn custom_enemy_modes_never_accept_enemy_attacked_spots_on_any_board() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+            BoardKind::ContinuousArchimedean,
+        ] {
+            for (enemy_mode, custom_army) in [
+                (
+                    EnemyMode::Color,
+                    vec![
+                        CustomPiece::with_auto_color(2, 1),
+                        CustomPiece::with_auto_color(2, 1),
+                    ],
+                ),
+                (
+                    EnemyMode::AttackSet,
+                    vec![
+                        CustomPiece::with_auto_color(2, 1),
+                        CustomPiece::with_auto_color(3, 1),
+                    ],
+                ),
+                (
+                    EnemyMode::ColorAttackSet,
+                    vec![
+                        CustomPiece::with_auto_color(2, 1),
+                        CustomPiece::with_auto_color(3, 1),
+                    ],
+                ),
+            ] {
+                let mut engine = SimulationEngine::new(EngineSettings {
+                    board,
+                    shape: if board == BoardKind::LatticeTriangle {
+                        ShapeKind::Triangle
+                    } else if board == BoardKind::ContinuousArchimedean {
+                        ShapeKind::Circle
+                    } else {
+                        ShapeKind::Square
+                    },
+                    placement_search: PlacementSearchMode::SpiralPath,
+                    enemy_mode,
+                    piece_radius: 0.5,
+                    custom_army,
+                    ..EngineSettings::default()
+                });
+                let batch = engine.step_budget(48, 2_000_000);
+                assert_eq!(batch.len(), 48, "board={board:?}, mode={enemy_mode:?}");
+
+                let mut earlier: Vec<&Placement> = Vec::new();
+                for placement in &batch {
+                    for attacker in &earlier {
+                        if !placements_are_enemies(enemy_mode, attacker, placement) {
+                            continue;
+                        }
+                        assert!(
+                            !placement_attacks(attacker, placement, board, 0.5),
+                            "board={board:?}, mode={enemy_mode:?}, spot {} was attacked by enemy spot {}",
+                            placement.spot_index,
+                            attacker.spot_index
+                        );
+                    }
+                    earlier.push(placement);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_spiral_path_keeps_independent_turn_cursors() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            placement_search: PlacementSearchMode::SpiralPath,
+            enemy_mode: EnemyMode::Color,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(2, 1),
+            ],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(8, 1_000_000);
+
+        let indices: Vec<_> = batch.iter().map(|placement| placement.spot_index).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 5, 4, 9, 6]);
+    }
+
+    #[test]
+    fn color_attack_set_requires_matching_color_and_attack_set() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            placement_search: PlacementSearchMode::SpiralPath,
+            enemy_mode: EnemyMode::ColorAttackSet,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(3, 1),
+            ],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(24, 2_000_000);
+        assert_eq!(batch.len(), 24);
+
+        let mut earlier: Vec<&Placement> = Vec::new();
+        for placement in &batch {
+            for attacker in &earlier {
+                if placement_attacks(attacker, placement, BoardKind::LatticeSquare, 0.5) {
+                    assert_eq!(
+                        attacker.color.key.group, placement.color.key.group,
+                        "spot {} was attacked by a different color group",
+                        placement.spot_index
+                    );
+                    assert_eq!(
+                        move_group(attacker.piece),
+                        move_group(placement.piece),
+                        "spot {} was attacked by a different attack set",
+                        placement.spot_index
+                    );
+                }
+            }
+            earlier.push(placement);
+        }
+    }
+
+    #[test]
     fn proactive_rule_rejects_candidate_that_attacks_enemy() {
         let mut passive = EngineSettings {
-            enemy_mode: EnemyMode::MoveSet,
+            enemy_mode: EnemyMode::AttackSet,
             custom_army: vec![
                 CustomPiece::with_auto_color(3, 0),
                 CustomPiece::with_auto_color(1, 0),
@@ -1192,7 +1719,9 @@ mod tests {
         let active_batch = active_engine.step_batch(2);
 
         assert_eq!(passive_batch[1].spot_index, 1);
-        assert_ne!(active_batch[1].spot_index, 1);
+        assert_eq!(passive_batch[1].piece, PieceSignature::new(1, 0));
+        assert!(active_batch[1].spot_index > passive_batch[1].spot_index);
+        assert_eq!(active_batch[1].piece, PieceSignature::new(1, 0));
         assert!(active_engine.stats().proactive_rejections > 0);
     }
 
@@ -1200,7 +1729,7 @@ mod tests {
     fn proactive_rule_changes_lattice_hex_placements() {
         let mut passive = EngineSettings {
             board: BoardKind::LatticeHex,
-            enemy_mode: EnemyMode::MoveSet,
+            enemy_mode: EnemyMode::AttackSet,
             custom_army: vec![
                 CustomPiece::with_auto_color(3, 0),
                 CustomPiece::with_auto_color(1, 0),
@@ -1217,7 +1746,9 @@ mod tests {
         let active_batch = active_engine.step_batch(2);
 
         assert_eq!(passive_batch[1].spot_index, 1);
-        assert_ne!(active_batch[1].spot_index, 1);
+        assert_eq!(passive_batch[1].piece, PieceSignature::new(1, 0));
+        assert!(active_batch[1].spot_index > passive_batch[1].spot_index);
+        assert_eq!(active_batch[1].piece, PieceSignature::new(1, 0));
         assert!(active_engine.stats().proactive_rejections > 0);
     }
 
@@ -1227,7 +1758,7 @@ mod tests {
             board: BoardKind::ContinuousArchimedean,
             shape: ShapeKind::Circle,
             piece_radius: 0.50,
-            enemy_mode: EnemyMode::MoveSet,
+            enemy_mode: EnemyMode::AttackSet,
             custom_army: vec![
                 CustomPiece::with_auto_color(3, 0),
                 CustomPiece::with_auto_color(1, 0),
@@ -1244,8 +1775,80 @@ mod tests {
         let active_batch = active_engine.step_batch(2);
 
         assert_eq!(passive_batch[1].spot_index, 1);
-        assert_ne!(active_batch[1].spot_index, 1);
+        assert_eq!(passive_batch[1].piece, PieceSignature::new(1, 0));
+        assert!(active_batch[1].spot_index > passive_batch[1].spot_index);
+        assert_eq!(active_batch[1].piece, PieceSignature::new(1, 0));
         assert!(active_engine.stats().proactive_rejections > 0);
+    }
+
+    #[test]
+    fn spiral_path_custom_mode_keeps_each_army_entry_moving_forward() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+            BoardKind::ContinuousArchimedean,
+        ] {
+            let mut engine = SimulationEngine::new(EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else if board == BoardKind::ContinuousArchimedean {
+                    ShapeKind::Circle
+                } else {
+                    ShapeKind::Square
+                },
+                placement_search: PlacementSearchMode::SpiralPath,
+                custom_army: vec![
+                    CustomPiece::with_auto_color(3, 0),
+                    CustomPiece::with_auto_color(1, 0),
+                ],
+                ..EngineSettings::default()
+            });
+            let batch = engine.step_budget(40, 2_000_000);
+            assert!(batch.len() >= 20, "board={board:?}");
+            for color_group in [0, 1] {
+                let indices = batch
+                    .iter()
+                    .filter(|placement| placement.color.key.group == color_group)
+                    .map(|placement| placement.spot_index)
+                    .collect::<Vec<_>>();
+                assert!(
+                    indices.windows(2).all(|pair| pair[1] > pair[0]),
+                    "board={board:?}, color_group={color_group}, indices={indices:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn center_distance_custom_mode_uses_origin_distance_then_spiral_index() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            placement_search: PlacementSearchMode::CenterDistance,
+            radius: 2.0,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(9, 10_000);
+        let indices: Vec<_> = batch.iter().map(|placement| placement.spot_index).collect();
+
+        assert_eq!(indices, vec![0, 1, 3, 5, 7, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn center_distance_prime_mode_orders_spots_by_origin_distance() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            placement_search: PlacementSearchMode::CenterDistance,
+            army_preset: ArmyPreset::PrimeKnight,
+            enemy_mode: EnemyMode::Color,
+            prime_modulo_divisor: 2,
+            radius: 2.0,
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(5, 100_000);
+        let indices: Vec<_> = batch.iter().map(|placement| placement.spot_index).collect();
+
+        assert_eq!(indices, vec![0, 1, 3, 5, 7]);
     }
 
     #[test]
@@ -1263,11 +1866,11 @@ mod tests {
     }
 
     #[test]
-    fn piece_seeking_move_set_skips_passively_attacked_spots() {
+    fn piece_seeking_attack_set_skips_passively_attacked_spots() {
         let settings = EngineSettings {
             board: BoardKind::LatticeHex,
             army_preset: ArmyPreset::PrimeKnight,
-            enemy_mode: EnemyMode::MoveSet,
+            enemy_mode: EnemyMode::AttackSet,
             ..EngineSettings::default()
         };
         let mut engine = SimulationEngine::new(settings);
@@ -1358,6 +1961,48 @@ mod tests {
         assert_eq!(batch[0].shape, ShapeKind::Circle);
     }
 
+    fn placement_attacks(
+        attacker: &Placement,
+        target: &Placement,
+        board: BoardKind,
+        body_radius: f64,
+    ) -> bool {
+        match (attacker.coord, target.coord) {
+            (SpotCoord::Square { x: ax, y: ay }, SpotCoord::Square { x, y }) => {
+                lattice_attack_targets(board, (ax, ay), attacker.piece).contains(&(x, y))
+            }
+            (SpotCoord::Hex { q: aq, r: ar }, SpotCoord::Hex { q, r }) => {
+                lattice_attack_targets(board, (aq, ar), attacker.piece).contains(&(q, r))
+            }
+            (SpotCoord::Triangle { u: au, v: av }, SpotCoord::Triangle { u, v }) => {
+                lattice_attack_targets(board, (au, av), attacker.piece).contains(&(u, v))
+            }
+            (SpotCoord::Continuous { x: ax, y: ay, .. }, SpotCoord::Continuous { x, y, .. }) => {
+                attack_circle_hits_body(
+                    Point2::new(ax, ay),
+                    Point2::new(x, y),
+                    attack_radius_from_move(attacker.piece.a, attacker.piece.b),
+                    body_radius,
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn placements_are_enemies(
+        enemy_mode: EnemyMode,
+        attacker: &Placement,
+        target: &Placement,
+    ) -> bool {
+        let different_color = attacker.color.key.group != target.color.key.group;
+        let different_attack_set = move_group(attacker.piece) != move_group(target.piece);
+        match enemy_mode {
+            EnemyMode::Color => different_color,
+            EnemyMode::AttackSet => different_attack_set,
+            EnemyMode::ColorAttackSet => different_color || different_attack_set,
+        }
+    }
+
     fn straight_then_turn_hex_offsets(long: i64, short: i64) -> FxHashSet<AxialCoord> {
         const DIRECTIONS: [AxialCoord; 6] = [
             AxialCoord { q: 1, r: 0 },
@@ -1387,7 +2032,7 @@ mod tests {
             shape: ShapeKind::Circle,
             piece_radius: 0.50,
             army_preset: ArmyPreset::PrimeKnight,
-            enemy_mode: EnemyMode::MoveSet,
+            enemy_mode: EnemyMode::AttackSet,
             ..EngineSettings::default()
         };
         let mut engine = SimulationEngine::new(settings);

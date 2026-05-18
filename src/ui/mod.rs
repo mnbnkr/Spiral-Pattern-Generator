@@ -11,10 +11,10 @@ use web_sys::{
 
 use crate::protocol::{
     AppToWorker, ArmyPreset, BoardKind, CustomPiece, DisplayMode, EnemyMode, EngineSettings,
-    EngineStats, Placement, ShapeKind, SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp,
-    rainbow_color,
+    EngineStats, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
+    VertexBufferUpdate, WorkerToApp, rainbow_color,
 };
-use crate::render::CanvasRenderer;
+use crate::render::{CanvasRenderer, ExportKind};
 
 const RADIUS_COMMIT_DELAY_MS: i32 = 2_000;
 
@@ -29,6 +29,7 @@ struct AppState {
     renderer: CanvasRenderer,
     settings: EngineSettings,
     worker_settings: EngineSettings,
+    visible_settings: EngineSettings,
     last_stats: EngineStats,
     running: bool,
     has_run: bool,
@@ -38,11 +39,15 @@ struct AppState {
     total_logged: u64,
     last_ui_refresh_ms: f64,
     render_scheduled: bool,
+    snapshot_stale: bool,
+    generation_staged: bool,
+    preserve_next_empty_worker_reset: bool,
     radius_commit_pending: bool,
     radius_commit_generation: u64,
     canvas_dragging: bool,
     canvas_last_x: f64,
     canvas_last_y: f64,
+    board_select_pointer_value: Option<String>,
     preferred_square_shape: ShapeKind,
     preferred_hex_shape: ShapeKind,
     preferred_triangle_shape: ShapeKind,
@@ -63,7 +68,12 @@ pub fn boot_app() -> Result<(), JsValue> {
     let document = current_document()?;
     let worker = Worker::new("./spg_worker_loader.js")?;
     let renderer = CanvasRenderer::new("sim-canvas")?;
-    let settings = read_settings(&document, EngineSettings::default().custom_army)?;
+    let default_settings = EngineSettings::default();
+    let settings = read_settings(
+        &document,
+        default_settings.custom_army.clone(),
+        &default_settings,
+    )?;
 
     let state = Rc::new(RefCell::new(AppState {
         worker,
@@ -75,6 +85,7 @@ pub fn boot_app() -> Result<(), JsValue> {
         allow_default_auto_start: true,
         renderer,
         worker_settings: settings.clone(),
+        visible_settings: settings.clone(),
         settings,
         last_stats: EngineStats::default(),
         running: false,
@@ -85,11 +96,15 @@ pub fn boot_app() -> Result<(), JsValue> {
         total_logged: 0,
         last_ui_refresh_ms: 0.0,
         render_scheduled: false,
+        snapshot_stale: false,
+        generation_staged: false,
+        preserve_next_empty_worker_reset: false,
         radius_commit_pending: false,
         radius_commit_generation: 0,
         canvas_dragging: false,
         canvas_last_x: 0.0,
         canvas_last_y: 0.0,
+        board_select_pointer_value: None,
         preferred_square_shape: ShapeKind::Square,
         preferred_hex_shape: ShapeKind::Hex,
         preferred_triangle_shape: ShapeKind::Triangle,
@@ -162,12 +177,11 @@ fn install_worker_handler_on(
                         return;
                     }
 
-                    if needs_initialize {
-                        if let Err(error) =
+                    if needs_initialize
+                        && let Err(error) =
                             send_to_worker(&worker, &AppToWorker::Initialize { settings })
-                        {
-                            log_error(&error);
-                        }
+                    {
+                        log_error(&error);
                     }
 
                     if start_after_ready {
@@ -216,9 +230,21 @@ fn install_worker_handler_on(
                 let exhausted = stats.exhausted;
                 let status = {
                     let mut state = callback_state.borrow_mut();
+                    if state.generation_staged
+                        || state.preserve_next_empty_worker_reset
+                        || state.snapshot_stale
+                    {
+                        if let Err(error) = state.renderer.clear_placements() {
+                            log_error(&error);
+                        }
+                        clear_placement_log_state(&mut state);
+                    }
                     if let Err(error) = state.renderer.apply_batch(&vertex_update, color_state) {
                         log_error(&error);
                     }
+                    state.visible_settings = state.worker_settings.clone();
+                    state.generation_staged = false;
+                    state.preserve_next_empty_worker_reset = false;
                     if let Err(error) =
                         append_placement_log(&mut state, &log_placements, stats.placements)
                     {
@@ -229,6 +255,9 @@ fn install_worker_handler_on(
                         state.running = false;
                         state.has_run = true;
                     }
+                    if let Err(error) = update_renderer_snapshot(&mut state) {
+                        log_error(&error);
+                    }
                     if should_refresh_worker_ui(&mut state, exhausted) {
                         if let Err(error) = refresh_placement_log(&state) {
                             log_error(&error);
@@ -238,26 +267,25 @@ fn install_worker_handler_on(
                         None
                     }
                 };
-                if let Some(status) = status {
-                    if let Err(error) = set_status(&status) {
-                        log_error(&error);
-                    }
+                if let Some(status) = status
+                    && let Err(error) = set_status(&status)
+                {
+                    log_error(&error);
                 }
                 if let Err(error) = schedule_render(Rc::clone(&callback_state)) {
                     log_error(&error);
                 }
                 if exhausted {
-                    if let Ok(document) = current_document() {
-                        if let Err(error) =
+                    if let Ok(document) = current_document()
+                        && let Err(error) =
                             update_run_buttons(&document, callback_state.borrow().running)
-                        {
-                            log_error(&error);
-                        }
-                    }
-                } else if callback_state.borrow().running {
-                    if let Err(error) = schedule_next_run_tick(Rc::clone(&callback_state)) {
+                    {
                         log_error(&error);
                     }
+                } else if callback_state.borrow().running
+                    && let Err(error) = schedule_next_run_tick(Rc::clone(&callback_state))
+                {
+                    log_error(&error);
                 }
             }
             Ok(WorkerToApp::Stats {
@@ -265,17 +293,57 @@ fn install_worker_handler_on(
                 color_state,
                 vertex_update,
             }) => {
+                let preserve_empty_reset = {
+                    let state = callback_state.borrow();
+                    state.preserve_next_empty_worker_reset
+                        && stats.placements == 0
+                        && matches!(&vertex_update, VertexBufferUpdate::Replace(vertices) if vertices.is_empty())
+                };
+                if preserve_empty_reset {
+                    let status = {
+                        let mut state = callback_state.borrow_mut();
+                        if let Err(error) = update_renderer_snapshot(&mut state) {
+                            log_error(&error);
+                        }
+                        status_text(&state, stats)
+                    };
+                    if let Ok(document) = current_document() {
+                        let state = callback_state.borrow();
+                        if let Err(error) = update_run_buttons(&document, state.running) {
+                            log_error(&error);
+                        }
+                    }
+                    if let Err(error) = set_status(&status) {
+                        log_error(&error);
+                    }
+                    return;
+                }
+
                 let exhausted = stats.exhausted;
                 let needs_render = !matches!(vertex_update, VertexBufferUpdate::None);
+                let empty_replace = stats.placements == 0
+                    && matches!(&vertex_update, VertexBufferUpdate::Replace(vertices) if vertices.is_empty());
                 let status = {
                     let mut state = callback_state.borrow_mut();
                     if let Err(error) = state.renderer.apply_stats(&vertex_update, color_state) {
                         log_error(&error);
                     }
+                    if !matches!(vertex_update, VertexBufferUpdate::None) {
+                        state.visible_settings = state.worker_settings.clone();
+                        state.generation_staged = false;
+                    }
+                    if empty_replace {
+                        state.first_log_lines.clear();
+                        state.recent_log_lines.clear();
+                        state.total_logged = 0;
+                    }
                     state.last_stats = stats;
                     if exhausted {
                         state.running = false;
                         state.has_run = true;
+                    }
+                    if let Err(error) = update_renderer_snapshot(&mut state) {
+                        log_error(&error);
                     }
                     state.last_ui_refresh_ms = js_sys::Date::now();
                     if let Err(error) = refresh_placement_log(&state) {
@@ -286,23 +354,20 @@ fn install_worker_handler_on(
                 if let Err(error) = set_status(&status) {
                     log_error(&error);
                 }
-                if needs_render {
-                    if let Err(error) = schedule_render(Rc::clone(&callback_state)) {
-                        log_error(&error);
-                    }
+                if needs_render && let Err(error) = schedule_render(Rc::clone(&callback_state)) {
+                    log_error(&error);
                 }
                 if exhausted {
-                    if let Ok(document) = current_document() {
-                        if let Err(error) =
+                    if let Ok(document) = current_document()
+                        && let Err(error) =
                             update_run_buttons(&document, callback_state.borrow().running)
-                        {
-                            log_error(&error);
-                        }
-                    }
-                } else if callback_state.borrow().running {
-                    if let Err(error) = schedule_next_run_tick(Rc::clone(&callback_state)) {
+                    {
                         log_error(&error);
                     }
+                } else if callback_state.borrow().running
+                    && let Err(error) = schedule_next_run_tick(Rc::clone(&callback_state))
+                {
+                    log_error(&error);
                 }
             }
             Ok(WorkerToApp::Error { message }) => {
@@ -362,10 +427,62 @@ fn append_placement_log(
 }
 
 fn reset_placement_log(state: &mut AppState) -> Result<(), JsValue> {
+    clear_placement_log_state(state);
+    refresh_placement_log(state)
+}
+
+fn clear_placement_log_state(state: &mut AppState) {
     state.first_log_lines.clear();
     state.recent_log_lines.clear();
     state.total_logged = 0;
-    refresh_placement_log(state)
+}
+
+fn update_renderer_snapshot(state: &mut AppState) -> Result<(), JsValue> {
+    state.snapshot_stale = state.last_stats.placements > 0
+        && !simulation_settings_match(&state.visible_settings, &state.settings);
+    let mut render_settings = if state.snapshot_stale {
+        state.visible_settings.clone()
+    } else {
+        state.settings.clone()
+    };
+    render_settings.radius = state.settings.radius;
+    render_settings.display_mode = state.settings.display_mode;
+    render_settings.zoom = state.settings.zoom;
+    render_settings.track_opacity = state.settings.track_opacity;
+    state.renderer.set_settings(render_settings)?;
+    state
+        .renderer
+        .set_color_saturation(if state.snapshot_stale { 0.5 } else { 1.0 })
+}
+
+fn simulation_settings_match(visible: &EngineSettings, current: &EngineSettings) -> bool {
+    visible.board == current.board
+        && radius_settings_match(visible, current)
+        && continuous_piece_radius_matches(visible, current)
+        && visible.proactive_attacking == current.proactive_attacking
+        && visible.enemy_mode == current.enemy_mode
+        && visible.placement_search == current.placement_search
+        && visible.army_preset == current.army_preset
+        && visible.custom_army == current.custom_army
+        && visible.continuous_offset == current.continuous_offset
+        && visible.prime_modulo_divisor == current.prime_modulo_divisor
+}
+
+fn radius_settings_match(visible: &EngineSettings, current: &EngineSettings) -> bool {
+    visible.radius == current.radius
+        || (visible.placement_search == PlacementSearchMode::SpiralPath
+            && current.placement_search == PlacementSearchMode::SpiralPath
+            && current.radius >= visible.radius)
+}
+
+fn continuous_piece_radius_matches(visible: &EngineSettings, current: &EngineSettings) -> bool {
+    if visible.board == BoardKind::ContinuousArchimedean
+        || current.board == BoardKind::ContinuousArchimedean
+    {
+        visible.piece_radius == current.piece_radius
+    } else {
+        true
+    }
 }
 
 fn refresh_placement_log(state: &AppState) -> Result<(), JsValue> {
@@ -392,9 +509,10 @@ fn placement_log_text(state: &AppState) -> String {
     }
 
     let mut out = format!(
-        "settings: board={:?} shape={:?} army={:?} enemy={:?} attacking={} radius={:.2} piece_radius={:.2} visual_progress={} track={:.2} offset={:.3} anchors={}..{}\nplacements logged: {}\n\nfirst placements:\n",
+        "settings: board={:?} shape={:?} search={:?} army={:?} enemy={:?} attacking={} radius={:.2} piece_radius={:.2} visual_progress={} track={:.2} offset={:.3} anchors={}..{}\nplacements logged: {}\n\nfirst placements:\n",
         state.settings.board,
         state.settings.shape,
+        state.settings.placement_search,
         state.settings.army_preset,
         state.settings.enemy_mode,
         state.settings.proactive_attacking,
@@ -523,10 +641,11 @@ fn schedule_next_run_tick(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
     let delay_ms = run_delay_ms(&state.borrow().settings.speed);
     let closure = Closure::<dyn FnMut()>::new(move || {
         let state = state.borrow();
-        if state.running && state.worker_ready {
-            if let Err(error) = send_to_worker(&state.worker, &AppToWorker::RunTick) {
-                log_error(&error);
-            }
+        if state.running
+            && state.worker_ready
+            && let Err(error) = send_to_worker(&state.worker, &AppToWorker::RunTick)
+        {
+            log_error(&error);
         }
     });
 
@@ -611,6 +730,7 @@ fn install_canvas_interaction_handlers(
         .ok_or_else(|| JsValue::from_str("missing canvas"))?;
 
     let down_state = Rc::clone(&state);
+    let down_canvas = canvas.clone();
     let mouse_down = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
         if event.button() != 0 {
             return;
@@ -620,6 +740,9 @@ fn install_canvas_interaction_handlers(
         state.canvas_dragging = true;
         state.canvas_last_x = event.client_x() as f64;
         state.canvas_last_y = event.client_y() as f64;
+        if let Err(error) = down_canvas.class_list().add_1("dragging") {
+            log_error(&error);
+        }
     });
     canvas.add_event_listener_with_callback("mousedown", mouse_down.as_ref().unchecked_ref())?;
     mouse_down.forget();
@@ -646,8 +769,12 @@ fn install_canvas_interaction_handlers(
     mouse_move.forget();
 
     let up_state = Rc::clone(&state);
+    let up_canvas = canvas.clone();
     let mouse_up = Closure::<dyn FnMut(MouseEvent)>::new(move |_event: MouseEvent| {
         up_state.borrow_mut().canvas_dragging = false;
+        if let Err(error) = up_canvas.class_list().remove_1("dragging") {
+            log_error(&error);
+        }
     });
     web_sys::window()
         .ok_or_else(|| JsValue::from_str("window unavailable"))?
@@ -713,6 +840,7 @@ fn install_control_handlers(
         "continuous-offset-input",
         "attacking-toggle",
         "enemy-mode-select",
+        "placement-search-select",
         "army-preset-select",
         "prime-divisor-input",
     ] {
@@ -745,14 +873,17 @@ fn install_control_handlers(
     for id in ["anchor-a-input", "anchor-b-input"] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::UpdateWorker)?;
     }
+    install_same_board_refresh_handler(document, Rc::clone(&state))?;
+    install_continuous_offset_blur_handler(document, Rc::clone(&state))?;
 
     install_add_piece_handler(document, Rc::clone(&state))?;
     install_button(document, "start-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        commit_pending_radius_change(state, &document, false)?;
+        commit_pending_radius_change(state, &document, false, true)?;
         if state.running {
             return Ok(());
         }
+        prepare_new_generation_if_staged(state, &document)?;
         state.running = true;
         state.has_run = true;
         update_run_buttons(&document, state.running)?;
@@ -768,7 +899,7 @@ fn install_control_handlers(
     })?;
     install_button(document, "pause-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        commit_pending_radius_change(state, &document, false)?;
+        commit_pending_radius_change(state, &document, false, false)?;
         if !state.running {
             return Ok(());
         }
@@ -780,10 +911,11 @@ fn install_control_handlers(
     })?;
     install_button(document, "step-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        commit_pending_radius_change(state, &document, false)?;
+        commit_pending_radius_change(state, &document, false, true)?;
         if state.running {
             return Ok(());
         }
+        prepare_new_generation_if_staged(state, &document)?;
         if !state.worker_ready {
             state.step_after_worker_ready = Some(1);
             state.has_run = true;
@@ -791,9 +923,9 @@ fn install_control_handlers(
             return Ok(());
         }
         ensure_worker_initialized(state)?;
-        if !state.has_run && state.last_stats.placements == 0 {
+        if state.last_stats.placements == 0 {
             let settings = state.settings.clone();
-            reset_worker_with_settings(state, &document, settings, false)?;
+            reset_worker_with_settings(state, &document, settings, false, true)?;
             set_status("Stepping")?;
             return schedule_step_batch(state.worker.clone());
         }
@@ -803,13 +935,41 @@ fn install_control_handlers(
     install_refresh_handler(document, Rc::clone(&state))?;
     install_button(
         document,
+        "download-full-png-button",
+        Rc::clone(&state),
+        |state| {
+            let document = current_document()?;
+            commit_pending_radius_change(state, &document, false, false)?;
+            let filename = download_filename(
+                &state.visible_settings,
+                state.last_stats,
+                "image-full",
+                "png",
+            );
+            match state
+                .renderer
+                .download_image("image/png", &filename, ExportKind::FullPng, None)
+            {
+                Ok(()) => set_status("Preparing full PNG export"),
+                Err(error) => {
+                    set_status(&format!("Export failed: {}", js_value_text(&error)))?;
+                    Ok(())
+                }
+            }
+        },
+    )?;
+    install_button(
+        document,
         "download-png-button",
         Rc::clone(&state),
         |state| {
-            let filename = download_filename(&state.settings, state.last_stats, "image", "png");
+            let document = current_document()?;
+            commit_pending_radius_change(state, &document, false, false)?;
+            let filename =
+                download_filename(&state.visible_settings, state.last_stats, "image", "png");
             match state
                 .renderer
-                .download_image("image/png", &filename, 1.0, None)
+                .download_image("image/png", &filename, ExportKind::Png, None)
             {
                 Ok(()) => set_status("Preparing PNG export"),
                 Err(error) => {
@@ -824,12 +984,20 @@ fn install_control_handlers(
         "download-jpeg-button",
         Rc::clone(&state),
         |state| {
-            let filename =
-                download_filename(&state.settings, state.last_stats, "image-half", "jpg");
-            match state
-                .renderer
-                .download_image("image/jpeg", &filename, 0.5, Some(0.82))
-            {
+            let document = current_document()?;
+            commit_pending_radius_change(state, &document, false, false)?;
+            let filename = download_filename(
+                &state.visible_settings,
+                state.last_stats,
+                "image-half",
+                "jpg",
+            );
+            match state.renderer.download_image(
+                "image/jpeg",
+                &filename,
+                ExportKind::JpegHalf,
+                Some(0.82),
+            ) {
                 Ok(()) => set_status("Preparing JPEG export"),
                 Err(error) => {
                     set_status(&format!("Export failed: {}", js_value_text(&error)))?;
@@ -861,9 +1029,132 @@ fn install_settings_handler(
         }
     });
 
-    element.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
-    element.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+    if element.dyn_ref::<HtmlSelectElement>().is_some() {
+        element.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+    } else if let Some(input) = element.dyn_ref::<HtmlInputElement>() {
+        if input.type_() == "checkbox" {
+            element.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+        } else {
+            element.add_event_listener_with_callback("input", closure.as_ref().unchecked_ref())?;
+        }
+    } else {
+        element.add_event_listener_with_callback("change", closure.as_ref().unchecked_ref())?;
+    }
     closure.forget();
+    Ok(())
+}
+
+fn install_continuous_offset_blur_handler(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let document = document.clone();
+    let offset_input = input(&document, "continuous-offset-input")?;
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let raw = match input_value(&document, "continuous-offset-input") {
+            Ok(value) => value,
+            Err(error) => {
+                log_error(&error);
+                return;
+            }
+        };
+        if validate_continuous_offset_text(&raw).0 {
+            return;
+        }
+
+        let fallback = if raw.trim().is_empty() {
+            0.0
+        } else {
+            state.borrow().settings.continuous_offset
+        };
+        match input(&document, "continuous-offset-input") {
+            Ok(input) => input.set_value(&continuous_offset_value_text(fallback)),
+            Err(error) => {
+                log_error(&error);
+                return;
+            }
+        }
+
+        if let Err(error) = sync_settings(&document, Rc::clone(&state), SyncAction::ResetWorker) {
+            log_error(&error);
+        }
+    });
+
+    offset_input.add_event_listener_with_callback("blur", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+fn install_same_board_refresh_handler(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let board_select = select(document, "board-select")?;
+
+    let down_state = Rc::clone(&state);
+    let down_select = board_select.clone();
+    let mouse_down = Closure::<dyn FnMut(MouseEvent)>::new(move |_event: MouseEvent| {
+        down_state.borrow_mut().board_select_pointer_value = Some(down_select.value());
+    });
+    board_select
+        .add_event_listener_with_callback("mousedown", mouse_down.as_ref().unchecked_ref())?;
+    mouse_down.forget();
+
+    let change_state = Rc::clone(&state);
+    let change = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        change_state.borrow_mut().board_select_pointer_value = None;
+    });
+    board_select.add_event_listener_with_callback("change", change.as_ref().unchecked_ref())?;
+    change.forget();
+
+    let blur_document = document.clone();
+    let blur_state = Rc::clone(&state);
+    let blur_select = board_select.clone();
+    let blur = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let timeout_document = blur_document.clone();
+        let timeout_state = Rc::clone(&blur_state);
+        let timeout_select = blur_select.clone();
+        let timeout = Closure::<dyn FnMut()>::new(move || {
+            let should_refresh = {
+                let mut state = timeout_state.borrow_mut();
+                let previous = state.board_select_pointer_value.take();
+                previous.as_deref() == Some(timeout_select.value().as_str())
+            };
+            if !should_refresh {
+                return;
+            }
+
+            let settings = timeout_state.borrow().settings.clone();
+            if let Err(error) = recreate_worker_with_settings(
+                &timeout_document,
+                Rc::clone(&timeout_state),
+                settings,
+                false,
+                true,
+                "Refreshed | Paused",
+            ) {
+                log_error(&error);
+            }
+        });
+
+        if let Err(error) = web_sys::window()
+            .ok_or_else(|| JsValue::from_str("window unavailable"))
+            .and_then(|window| {
+                window
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                        timeout.as_ref().unchecked_ref(),
+                        0,
+                    )
+                    .map(|_| ())
+            })
+        {
+            log_error(&error);
+        }
+        timeout.forget();
+    });
+    board_select.add_event_listener_with_callback("blur", blur.as_ref().unchecked_ref())?;
+    blur.forget();
+
     Ok(())
 }
 
@@ -942,6 +1233,7 @@ fn install_refresh_handler(
             Rc::clone(&state),
             settings,
             false,
+            true,
             "Refreshed | Paused",
         ) {
             log_error(&error);
@@ -973,6 +1265,7 @@ fn recreate_worker_with_settings(
     state: Rc<RefCell<AppState>>,
     settings: EngineSettings,
     restart_after_ready: bool,
+    clear_visible: bool,
     status: &str,
 ) -> Result<(), JsValue> {
     let replacement = Worker::new("./spg_worker_loader.js")?;
@@ -997,15 +1290,28 @@ fn recreate_worker_with_settings(
         state.radius_commit_pending = false;
         state.radius_commit_generation = state.radius_commit_generation.wrapping_add(1);
         state.running = restart_after_ready;
-        state.has_run = true;
-        state.last_stats = EngineStats::default();
+        state.has_run = restart_after_ready || state.has_run;
         state.last_ui_refresh_ms = 0.0;
         state.render_scheduled = false;
         state.settings = settings.clone();
         state.worker_settings = settings;
         update_run_buttons(document, state.running)?;
-        state.renderer.clear_placements()?;
-        reset_placement_log(&mut state)?;
+        if clear_visible {
+            state.last_stats = EngineStats::default();
+            state.visible_settings = state.settings.clone();
+            state.snapshot_stale = false;
+            state.generation_staged = false;
+            state.preserve_next_empty_worker_reset = false;
+            let renderer_settings = state.settings.clone();
+            state.renderer.set_settings(renderer_settings)?;
+            state.renderer.set_color_saturation(1.0)?;
+            state.renderer.clear_placements()?;
+            reset_placement_log(&mut state)?;
+        } else {
+            state.generation_staged = true;
+            state.preserve_next_empty_worker_reset = true;
+            update_renderer_snapshot(&mut state)?;
+        }
     }
 
     if restart_after_ready {
@@ -1056,10 +1362,10 @@ fn schedule_worker_bootstrap_fallback(
             if let Err(error) = send_to_worker(&worker, &AppToWorker::RunTick) {
                 log_error(&error);
             }
-        } else if let Some(max_steps) = step_after_ready {
-            if let Err(error) = send_to_worker(&worker, &AppToWorker::StepBatch { max_steps }) {
-                log_error(&error);
-            }
+        } else if let Some(max_steps) = step_after_ready
+            && let Err(error) = send_to_worker(&worker, &AppToWorker::StepBatch { max_steps })
+        {
+            log_error(&error);
         }
     });
 
@@ -1113,7 +1419,7 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         swatch.set_title(&format!("Order color {}", index + 1));
         row.append_child(&swatch)?;
 
-        let up = small_button(document, "Up", "Move up")?;
+        let up = small_button(document, "▲", "Move up")?;
         install_piece_action(&up, document.clone(), Rc::clone(&state), move |army| {
             if index > 0 {
                 army.swap(index, index - 1);
@@ -1121,7 +1427,7 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         })?;
         row.append_child(&up)?;
 
-        let down = small_button(document, "Dn", "Move down")?;
+        let down = small_button(document, "▼", "Move down")?;
         install_piece_action(&down, document.clone(), Rc::clone(&state), move |army| {
             if index + 1 < army.len() {
                 army.swap(index, index + 1);
@@ -1264,7 +1570,7 @@ fn sync_settings(
     let previous_settings = state.borrow().settings.clone();
     let custom_army = previous_settings.custom_army.clone();
     apply_board_defaults(document, &state.borrow(), &previous_settings)?;
-    let settings = read_settings(document, custom_army)?;
+    let settings = read_settings(document, custom_army, &previous_settings)?;
     update_outputs(document, &settings)?;
     let action = resolve_sync_action(action, &previous_settings, &settings);
 
@@ -1272,7 +1578,7 @@ fn sync_settings(
         let mut state = state.borrow_mut();
         state.settings = settings.clone();
         remember_shape_preference(&mut state, settings.board, settings.shape);
-        state.renderer.set_settings(settings.clone())?;
+        update_renderer_snapshot(&mut state)?;
     }
     render_army_list(document, Rc::clone(&state))?;
 
@@ -1287,6 +1593,7 @@ fn sync_settings(
                     document,
                     Rc::clone(&state),
                     settings,
+                    false,
                     false,
                     "Visual Progress restored | Paused; restart to run visually",
                 )?;
@@ -1323,22 +1630,15 @@ fn sync_settings(
             state.worker_settings = worker_settings;
         }
         SyncAction::ResetWorker => {
-            let should_recreate = {
-                let state = state.borrow();
-                state.running || !state.worker_ready || !state.worker_initialized
-            };
-            if should_recreate {
-                recreate_worker_with_settings(
-                    document,
-                    Rc::clone(&state),
-                    settings,
-                    false,
-                    "Reset",
-                )?;
-            } else {
-                let mut state = state.borrow_mut();
-                reset_worker_with_settings(&mut state, document, settings, false)?;
-            }
+            let clear_visible = previous_settings == settings;
+            recreate_worker_with_settings(
+                document,
+                Rc::clone(&state),
+                settings,
+                false,
+                clear_visible,
+                "Reset",
+            )?;
         }
     }
 
@@ -1369,8 +1669,7 @@ fn schedule_radius_commit(document: Document, state: Rc<RefCell<AppState>>) -> R
 
         if should_commit {
             let mut state = state.borrow_mut();
-            let was_running = state.running;
-            if let Err(error) = commit_pending_radius_change(&mut state, &document, was_running) {
+            if let Err(error) = commit_pending_radius_change(&mut state, &document, false, false) {
                 log_error(&error);
             }
         }
@@ -1390,13 +1689,60 @@ fn commit_pending_radius_change(
     state: &mut AppState,
     document: &Document,
     restart_after_reset: bool,
+    clear_visible: bool,
 ) -> Result<(), JsValue> {
     if !state.radius_commit_pending {
         return Ok(());
     }
 
     let settings = state.settings.clone();
-    reset_worker_with_settings(state, document, settings, restart_after_reset)
+    if radius_increase_can_update_worker(&state.worker_settings, &settings) {
+        state.radius_commit_pending = false;
+        state.radius_commit_generation = state.radius_commit_generation.wrapping_add(1);
+        state.worker_settings = settings.clone();
+        state.generation_staged = false;
+        state.preserve_next_empty_worker_reset = false;
+        update_renderer_snapshot(state)?;
+
+        if state.worker_ready {
+            ensure_worker_initialized(state)?;
+            send_to_worker(
+                &state.worker,
+                &AppToWorker::UpdateSettings {
+                    settings: settings.clone(),
+                },
+            )?;
+            if restart_after_reset && !state.running {
+                state.running = true;
+                update_run_buttons(document, state.running)?;
+                send_to_worker(&state.worker, &AppToWorker::Start)?;
+                send_to_worker(&state.worker, &AppToWorker::RunTick)?;
+            }
+        }
+        return Ok(());
+    }
+
+    reset_worker_with_settings(
+        state,
+        document,
+        settings,
+        restart_after_reset,
+        clear_visible,
+    )
+}
+
+fn radius_increase_can_update_worker(current: &EngineSettings, next: &EngineSettings) -> bool {
+    next.radius > current.radius
+        && current.board == next.board
+        && current.placement_search == PlacementSearchMode::SpiralPath
+        && next.placement_search == PlacementSearchMode::SpiralPath
+        && continuous_piece_radius_matches(current, next)
+        && current.proactive_attacking == next.proactive_attacking
+        && current.enemy_mode == next.enemy_mode
+        && current.army_preset == next.army_preset
+        && current.custom_army == next.custom_army
+        && current.continuous_offset == next.continuous_offset
+        && current.prime_modulo_divisor == next.prime_modulo_divisor
 }
 
 fn reset_worker_with_settings(
@@ -1404,20 +1750,38 @@ fn reset_worker_with_settings(
     document: &Document,
     settings: EngineSettings,
     restart_after_reset: bool,
+    clear_visible: bool,
 ) -> Result<(), JsValue> {
     state.radius_commit_pending = false;
     state.radius_commit_generation = state.radius_commit_generation.wrapping_add(1);
     state.step_after_worker_ready = None;
     state.running = restart_after_reset;
-    state.has_run = restart_after_reset;
-    state.last_stats = EngineStats::default();
+    state.has_run = restart_after_reset || state.has_run;
     state.last_ui_refresh_ms = 0.0;
     state.render_scheduled = false;
     state.worker_settings = settings.clone();
-    state.worker_initialized = true;
+    let can_reset_now = state.worker_ready;
+    state.worker_initialized = can_reset_now;
     update_run_buttons(document, state.running)?;
-    state.renderer.clear_placements()?;
-    reset_placement_log(state)?;
+    if clear_visible {
+        state.last_stats = EngineStats::default();
+        state.visible_settings = settings.clone();
+        state.snapshot_stale = false;
+        state.generation_staged = false;
+        state.preserve_next_empty_worker_reset = false;
+        state.renderer.set_settings(settings.clone())?;
+        state.renderer.set_color_saturation(1.0)?;
+        state.renderer.clear_placements()?;
+        reset_placement_log(state)?;
+    } else {
+        state.generation_staged = true;
+        state.preserve_next_empty_worker_reset = true;
+        update_renderer_snapshot(state)?;
+    }
+    if !can_reset_now {
+        return Ok(());
+    }
+
     send_to_worker(&state.worker, &AppToWorker::Reset { settings })?;
     if restart_after_reset {
         send_to_worker(&state.worker, &AppToWorker::Start)?;
@@ -1439,27 +1803,10 @@ fn apply_board_defaults(
     };
 
     if previous.board != next_board {
-        let piece_radius = if next_board == BoardKind::ContinuousArchimedean {
-            "0.50"
-        } else {
-            "0.50"
-        };
-        input(document, "piece-radius-slider")?.set_value(piece_radius);
+        input(document, "piece-radius-slider")?.set_value("0.50");
 
         if next_board == BoardKind::ContinuousArchimedean {
             set_select_value(document, "shape-select", "Circle")?;
-        } else if next_board == BoardKind::LatticeTriangle {
-            set_select_value(
-                document,
-                "shape-select",
-                shape_value(preferred_shape_for_board(state, next_board)),
-            )?;
-        } else if next_board == BoardKind::LatticeHex {
-            set_select_value(
-                document,
-                "shape-select",
-                shape_value(preferred_shape_for_board(state, next_board)),
-            )?;
         } else {
             set_select_value(
                 document,
@@ -1541,6 +1888,7 @@ fn resolve_sync_action(
 fn read_settings(
     document: &Document,
     custom_army: Vec<CustomPiece>,
+    fallback: &EngineSettings,
 ) -> Result<EngineSettings, JsValue> {
     let board = match select_value(document, "board-select")?.as_str() {
         "LatticeHex" => BoardKind::LatticeHex,
@@ -1593,37 +1941,39 @@ fn read_settings(
 
     let enemy_mode = match select_value(document, "enemy-mode-select")?.as_str() {
         "Color" => EnemyMode::Color,
-        _ => EnemyMode::MoveSet,
+        "ColorAttackSet" => EnemyMode::ColorAttackSet,
+        _ => EnemyMode::AttackSet,
     };
+
+    let placement_search = match select_value(document, "placement-search-select")?.as_str() {
+        "CenterDistance" => PlacementSearchMode::CenterDistance,
+        _ => PlacementSearchMode::SpiralPath,
+    };
+
+    let continuous_offset = read_continuous_offset(document, fallback.continuous_offset)?;
 
     Ok(EngineSettings {
         board,
         shape,
-        radius: input_value(document, "radius-input")?
-            .parse::<f64>()
-            .unwrap_or(100.0)
-            .max(1.0),
-        piece_radius: input_value(document, "piece-radius-slider")?
-            .parse::<f64>()
-            .unwrap_or(0.5)
+        radius: parse_finite_f64(&input_value(document, "radius-input")?, 100.0).max(1.0),
+        piece_radius: parse_finite_f64(&input_value(document, "piece-radius-slider")?, 0.5)
             .clamp(0.05, 0.5),
         visual_progress: input_checked(document, "visual-progress-toggle")?,
         speed,
         display_mode,
-        zoom: input_value(document, "zoom-slider")?.parse().unwrap_or(4),
-        track_opacity: input_value(document, "track-opacity-slider")?
-            .parse::<f32>()
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0)
+        zoom: input_value(document, "zoom-slider")?
+            .parse::<u8>()
+            .unwrap_or(4)
+            .clamp(1, 32),
+        track_opacity: parse_finite_f64(&input_value(document, "track-opacity-slider")?, 0.0)
+            .clamp(0.0, 100.0) as f32
             / 100.0,
         proactive_attacking: input_checked(document, "attacking-toggle")?,
         enemy_mode,
+        placement_search,
         army_preset,
         custom_army: normalize_custom_army(custom_army),
-        continuous_offset: input_value(document, "continuous-offset-input")?
-            .parse::<f64>()
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0),
+        continuous_offset,
         prime_modulo_divisor: input_value(document, "prime-divisor-input")?
             .parse::<u32>()
             .unwrap_or(12)
@@ -1631,6 +1981,13 @@ fn read_settings(
         anchor_color_a: input_value(document, "anchor-a-input")?,
         anchor_color_b: input_value(document, "anchor-b-input")?,
     })
+}
+
+fn parse_finite_f64(raw: &str, fallback: f64) -> f64 {
+    match raw.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => value,
+        _ => fallback,
+    }
 }
 
 fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), JsValue> {
@@ -1667,6 +2024,7 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     set_option_disabled(document, "shape-option-hex", triangle)?;
     set_option_disabled(document, "shape-option-triangle", !triangle)?;
     input(document, "continuous-offset-input")?.set_disabled(!continuous);
+    set_disabled_class(document, "continuous-offset-group", !continuous)?;
     select(document, "enemy-mode-select")?.set_disabled(false);
 
     let zoom_row = html_element(document, "zoom-row")?;
@@ -1710,10 +2068,131 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     Ok(())
 }
 
+fn read_continuous_offset(document: &Document, fallback: f64) -> Result<f64, JsValue> {
+    let input = input(document, "continuous-offset-input")?;
+    let raw = input.value();
+    let (valid, invalid_chars) = validate_continuous_offset_text(&raw);
+    input
+        .class_list()
+        .toggle_with_force("invalid-input", !valid)?;
+    html_element(document, "continuous-offset-input-wrap")?
+        .class_list()
+        .toggle_with_force("invalid-offset", !valid)?;
+    html_element(document, "continuous-offset-highlight")?
+        .set_inner_html(&continuous_offset_highlight_html(&raw, &invalid_chars));
+    if valid {
+        Ok(raw.parse::<f64>().unwrap_or(0.0))
+    } else {
+        Ok(fallback)
+    }
+}
+
+fn validate_continuous_offset_text(raw: &str) -> (bool, Vec<bool>) {
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut invalid_chars = vec![false; chars.len()];
+    if raw.is_empty() {
+        return (false, invalid_chars);
+    }
+
+    let mut saw_dot = false;
+    let mut saw_digit = false;
+    let mut fraction_digits = 0_usize;
+    let mut structurally_valid = true;
+    for (index, ch) in chars.iter().enumerate() {
+        if ch.is_ascii_digit() {
+            saw_digit = true;
+            if saw_dot {
+                fraction_digits += 1;
+                if fraction_digits > 12 {
+                    invalid_chars[index] = true;
+                    structurally_valid = false;
+                }
+            }
+        } else if *ch == '.' && !saw_dot {
+            saw_dot = true;
+        } else {
+            invalid_chars[index] = true;
+            structurally_valid = false;
+        }
+    }
+
+    if !saw_digit {
+        invalid_chars.fill(true);
+        structurally_valid = false;
+    }
+
+    let in_range = if structurally_valid {
+        raw.parse::<f64>()
+            .map(|value| (0.0..=1.0).contains(&value))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    if structurally_valid && !in_range {
+        invalid_chars.fill(true);
+    }
+
+    (structurally_valid && in_range, invalid_chars)
+}
+
+fn continuous_offset_highlight_html(raw: &str, invalid_chars: &[bool]) -> String {
+    raw.chars()
+        .enumerate()
+        .map(|(index, ch)| {
+            let class = if invalid_chars.get(index).copied().unwrap_or(false) {
+                "invalid-char"
+            } else {
+                "valid-char"
+            };
+            format!("<span class=\"{class}\">{}</span>", html_escape_char(ch))
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn continuous_offset_value_text(value: f64) -> String {
+    let text = format!("{:.12}", value.clamp(0.0, 1.0));
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn html_escape_char(ch: char) -> String {
+    match ch {
+        '&' => "&amp;".to_string(),
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        '"' => "&quot;".to_string(),
+        '\'' => "&#39;".to_string(),
+        _ => ch.to_string(),
+    }
+}
+
 fn update_run_buttons(document: &Document, running: bool) -> Result<(), JsValue> {
     button(document, "start-button")?.set_disabled(running);
     button(document, "pause-button")?.set_disabled(!running);
     button(document, "step-button")?.set_disabled(running);
+    Ok(())
+}
+
+fn prepare_new_generation_if_staged(
+    state: &mut AppState,
+    document: &Document,
+) -> Result<(), JsValue> {
+    let staged_settings = state.last_stats.placements > 0
+        && !simulation_settings_match(&state.visible_settings, &state.settings);
+    if state.snapshot_stale
+        || staged_settings
+        || state.generation_staged
+        || state.preserve_next_empty_worker_reset
+        || !simulation_settings_match(&state.worker_settings, &state.settings)
+    {
+        let settings = state.settings.clone();
+        reset_worker_with_settings(state, document, settings, false, true)?;
+    }
     Ok(())
 }
 
