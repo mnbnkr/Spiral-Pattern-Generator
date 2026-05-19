@@ -25,6 +25,7 @@ struct WorkerRuntime {
     engine: SimulationEngine,
     placements: Vec<Placement>,
     running: bool,
+    epoch: u64,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -38,15 +39,17 @@ pub fn start() -> Result<(), JsValue> {
         engine: SimulationEngine::new(EngineSettings::default()),
         placements: Vec::new(),
         running: false,
+        epoch: 0,
     }));
 
     let handler_runtime = Rc::clone(&runtime);
     let closure = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
         if let Err(error) = handle_message(&handler_runtime, event) {
-            let scope = handler_runtime.borrow().scope.clone();
+            let runtime = handler_runtime.borrow();
             post_worker_message(
-                &scope,
+                &runtime.scope,
                 &WorkerToApp::Error {
+                    epoch: runtime.epoch,
                     message: format!("{error:?}"),
                 },
             );
@@ -66,15 +69,19 @@ fn handle_message(
 ) -> Result<(), JsValue> {
     let msg = decode_app_message(event)?;
     match msg {
-        AppToWorker::Initialize { settings } | AppToWorker::Reset { settings } => {
+        AppToWorker::Initialize { epoch, settings } | AppToWorker::Reset { epoch, settings } => {
             let mut runtime = runtime.borrow_mut();
+            runtime.epoch = epoch;
             runtime.running = false;
             runtime.engine.reset(settings);
             runtime.placements.clear();
             post_stats_with_vertex_update(&runtime, VertexBufferUpdate::Replace(Vec::new()));
         }
-        AppToWorker::UpdateSettings { settings } => {
+        AppToWorker::UpdateSettings { epoch, settings } => {
             let mut runtime = runtime.borrow_mut();
+            if epoch != runtime.epoch {
+                return Ok(());
+            }
             let old_settings = runtime.engine.settings().clone();
             let anchor_colors_changed = old_settings.anchor_color_a != settings.anchor_color_a
                 || old_settings.anchor_color_b != settings.anchor_color_b;
@@ -93,16 +100,25 @@ fn handle_message(
                 post_stats(&runtime);
             }
         }
-        AppToWorker::Start => {
-            runtime.borrow_mut().running = true;
-        }
-        AppToWorker::Pause => {
+        AppToWorker::Start { epoch } => {
             let mut runtime = runtime.borrow_mut();
+            if epoch == runtime.epoch {
+                runtime.running = true;
+            }
+        }
+        AppToWorker::Pause { epoch } => {
+            let mut runtime = runtime.borrow_mut();
+            if epoch != runtime.epoch {
+                return Ok(());
+            }
             runtime.running = false;
             post_stats(&runtime);
         }
-        AppToWorker::RunTick => {
+        AppToWorker::RunTick { epoch } => {
             let mut runtime = runtime.borrow_mut();
+            if epoch != runtime.epoch {
+                return Ok(());
+            }
             if runtime.running {
                 if runtime.engine.settings().visual_progress {
                     let (batch_size, work_budget) = batch_parameters(runtime.engine.settings());
@@ -114,8 +130,11 @@ fn handle_message(
                 post_stats(&runtime);
             }
         }
-        AppToWorker::StepBatch { max_steps } => {
+        AppToWorker::StepBatch { epoch, max_steps } => {
             let mut runtime = runtime.borrow_mut();
+            if epoch != runtime.epoch {
+                return Ok(());
+            }
             post_step_result(&mut runtime, max_steps, 2_000_000);
         }
     }
@@ -170,6 +189,7 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
         post_worker_message(
             &runtime.scope,
             &WorkerToApp::Batch {
+                epoch: runtime.epoch,
                 log_placements,
                 vertex_update: VertexBufferUpdate::Replace(vertices),
                 stats,
@@ -180,6 +200,7 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
         post_worker_message(
             &runtime.scope,
             &WorkerToApp::Stats {
+                epoch: runtime.epoch,
                 stats,
                 color_state,
                 vertex_update: VertexBufferUpdate::None,
@@ -200,6 +221,7 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
         post_worker_message(
             &runtime.scope,
             &WorkerToApp::Stats {
+                epoch: runtime.epoch,
                 stats,
                 color_state,
                 vertex_update: VertexBufferUpdate::None,
@@ -224,6 +246,7 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
         post_worker_message(
             &runtime.scope,
             &WorkerToApp::Batch {
+                epoch: runtime.epoch,
                 log_placements,
                 vertex_update,
                 stats,
@@ -243,6 +266,7 @@ fn post_stats_with_vertex_update(runtime: &WorkerRuntime, vertex_update: VertexB
     post_worker_message(
         &runtime.scope,
         &WorkerToApp::Stats {
+            epoch: runtime.epoch,
             stats: runtime.engine.stats(),
             color_state: runtime.engine.color_state(),
             vertex_update,

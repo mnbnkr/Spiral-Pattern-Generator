@@ -21,6 +21,7 @@ const RADIUS_COMMIT_DELAY_MS: i32 = 2_000;
 struct AppState {
     worker: Worker,
     worker_generation: u64,
+    worker_epoch: u64,
     worker_ready: bool,
     worker_initialized: bool,
     start_after_worker_ready: bool,
@@ -78,6 +79,7 @@ pub fn boot_app() -> Result<(), JsValue> {
     let state = Rc::new(RefCell::new(AppState {
         worker,
         worker_generation: 0,
+        worker_epoch: 0,
         worker_ready: false,
         worker_initialized: false,
         start_after_worker_ready: false,
@@ -150,6 +152,7 @@ fn install_worker_handler_on(
                 if let Ok(document) = current_document() {
                     let (
                         worker,
+                        epoch,
                         settings,
                         needs_initialize,
                         start_after_ready,
@@ -165,6 +168,7 @@ fn install_worker_handler_on(
                         state.start_after_worker_ready = false;
                         (
                             state.worker.clone(),
+                            state.worker_epoch,
                             state.worker_settings.clone(),
                             needs_initialize,
                             start_after_ready,
@@ -179,16 +183,17 @@ fn install_worker_handler_on(
 
                     if needs_initialize
                         && let Err(error) =
-                            send_to_worker(&worker, &AppToWorker::Initialize { settings })
+                            send_to_worker(&worker, &AppToWorker::Initialize { epoch, settings })
                     {
                         log_error(&error);
                     }
 
                     if start_after_ready {
-                        if let Err(error) = send_to_worker(&worker, &AppToWorker::Start) {
+                        if let Err(error) = send_to_worker(&worker, &AppToWorker::Start { epoch }) {
                             log_error(&error);
                         }
-                        if let Err(error) = send_to_worker(&worker, &AppToWorker::RunTick) {
+                        if let Err(error) = send_to_worker(&worker, &AppToWorker::RunTick { epoch })
+                        {
                             log_error(&error);
                         }
                         if let Err(error) =
@@ -198,7 +203,7 @@ fn install_worker_handler_on(
                         }
                     } else if let Some(max_steps) = step_after_ready {
                         if let Err(error) =
-                            send_to_worker(&worker, &AppToWorker::StepBatch { max_steps })
+                            send_to_worker(&worker, &AppToWorker::StepBatch { epoch, max_steps })
                         {
                             log_error(&error);
                         }
@@ -222,14 +227,19 @@ fn install_worker_handler_on(
                 }
             }
             Ok(WorkerToApp::Batch {
+                epoch,
                 log_placements,
                 vertex_update,
                 stats,
                 color_state,
             }) => {
+                if callback_state.borrow().worker_epoch != epoch {
+                    return;
+                }
                 let exhausted = stats.exhausted;
-                let status = {
+                let (status, deferred_actions) = {
                     let mut state = callback_state.borrow_mut();
+                    let deferred_actions = mark_worker_ready_from_current_response(&mut state);
                     if state.generation_staged
                         || state.preserve_next_empty_worker_reset
                         || state.snapshot_stale
@@ -262,13 +272,23 @@ fn install_worker_handler_on(
                         if let Err(error) = refresh_placement_log(&state) {
                             log_error(&error);
                         }
-                        Some(status_text(&state, stats))
+                        (Some(status_text(&state, stats)), deferred_actions)
                     } else {
-                        None
+                        (None, deferred_actions)
                     }
                 };
                 if let Some(status) = status
                     && let Err(error) = set_status(&status)
+                {
+                    log_error(&error);
+                }
+                if let Some((worker, epoch, start_after_ready, step_after_ready)) = deferred_actions
+                    && let Err(error) = dispatch_deferred_worker_actions(
+                        worker,
+                        epoch,
+                        start_after_ready,
+                        step_after_ready,
+                    )
                 {
                     log_error(&error);
                 }
@@ -289,10 +309,18 @@ fn install_worker_handler_on(
                 }
             }
             Ok(WorkerToApp::Stats {
+                epoch,
                 stats,
                 color_state,
                 vertex_update,
             }) => {
+                if callback_state.borrow().worker_epoch != epoch {
+                    return;
+                }
+                let deferred_actions = {
+                    let mut state = callback_state.borrow_mut();
+                    mark_worker_ready_from_current_response(&mut state)
+                };
                 let preserve_empty_reset = {
                     let state = callback_state.borrow();
                     state.preserve_next_empty_worker_reset
@@ -314,6 +342,17 @@ fn install_worker_handler_on(
                         }
                     }
                     if let Err(error) = set_status(&status) {
+                        log_error(&error);
+                    }
+                    if let Some((worker, epoch, start_after_ready, step_after_ready)) =
+                        deferred_actions
+                        && let Err(error) = dispatch_deferred_worker_actions(
+                            worker,
+                            epoch,
+                            start_after_ready,
+                            step_after_ready,
+                        )
+                    {
                         log_error(&error);
                     }
                     return;
@@ -354,6 +393,16 @@ fn install_worker_handler_on(
                 if let Err(error) = set_status(&status) {
                     log_error(&error);
                 }
+                if let Some((worker, epoch, start_after_ready, step_after_ready)) = deferred_actions
+                    && let Err(error) = dispatch_deferred_worker_actions(
+                        worker,
+                        epoch,
+                        start_after_ready,
+                        step_after_ready,
+                    )
+                {
+                    log_error(&error);
+                }
                 if needs_render && let Err(error) = schedule_render(Rc::clone(&callback_state)) {
                     log_error(&error);
                 }
@@ -370,7 +419,10 @@ fn install_worker_handler_on(
                     log_error(&error);
                 }
             }
-            Ok(WorkerToApp::Error { message }) => {
+            Ok(WorkerToApp::Error { epoch, message }) => {
+                if callback_state.borrow().worker_epoch != epoch {
+                    return;
+                }
                 if let Ok(document) = current_document() {
                     let mut state = callback_state.borrow_mut();
                     state.running = false;
@@ -440,19 +492,27 @@ fn clear_placement_log_state(state: &mut AppState) {
 fn update_renderer_snapshot(state: &mut AppState) -> Result<(), JsValue> {
     state.snapshot_stale = state.last_stats.placements > 0
         && !simulation_settings_match(&state.visible_settings, &state.settings);
+    let render_settings = render_settings_for_snapshot(state);
+    state.renderer.set_settings(render_settings)?;
+    state
+        .renderer
+        .set_color_saturation(if state.snapshot_stale { 0.5 } else { 1.0 })
+}
+
+fn render_settings_for_snapshot(state: &AppState) -> EngineSettings {
     let mut render_settings = if state.snapshot_stale {
         state.visible_settings.clone()
     } else {
         state.settings.clone()
     };
+    render_settings.board = state.settings.board;
+    render_settings.shape = state.settings.shape;
     render_settings.radius = state.settings.radius;
     render_settings.display_mode = state.settings.display_mode;
     render_settings.zoom = state.settings.zoom;
     render_settings.track_opacity = state.settings.track_opacity;
-    state.renderer.set_settings(render_settings)?;
-    state
-        .renderer
-        .set_color_saturation(if state.snapshot_stale { 0.5 } else { 1.0 })
+    render_settings.continuous_offset = state.settings.continuous_offset;
+    render_settings
 }
 
 fn simulation_settings_match(visible: &EngineSettings, current: &EngineSettings) -> bool {
@@ -643,7 +703,12 @@ fn schedule_next_run_tick(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
         let state = state.borrow();
         if state.running
             && state.worker_ready
-            && let Err(error) = send_to_worker(&state.worker, &AppToWorker::RunTick)
+            && let Err(error) = send_to_worker(
+                &state.worker,
+                &AppToWorker::RunTick {
+                    epoch: state.worker_epoch,
+                },
+            )
         {
             log_error(&error);
         }
@@ -659,9 +724,15 @@ fn schedule_next_run_tick(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
     Ok(())
 }
 
-fn schedule_step_batch(worker: Worker) -> Result<(), JsValue> {
+fn schedule_step_batch(worker: Worker, epoch: u64) -> Result<(), JsValue> {
     let closure = Closure::<dyn FnMut()>::new(move || {
-        if let Err(error) = send_to_worker(&worker, &AppToWorker::StepBatch { max_steps: 1 }) {
+        if let Err(error) = send_to_worker(
+            &worker,
+            &AppToWorker::StepBatch {
+                epoch,
+                max_steps: 1,
+            },
+        ) {
             log_error(&error);
         }
     });
@@ -879,6 +950,7 @@ fn install_control_handlers(
     install_add_piece_handler(document, Rc::clone(&state))?;
     install_button(document, "start-button", Rc::clone(&state), |state| {
         let document = current_document()?;
+        sync_state_from_controls(&document, state)?;
         commit_pending_radius_change(state, &document, false, true)?;
         if state.running {
             return Ok(());
@@ -894,11 +966,13 @@ fn install_control_handlers(
             return Ok(());
         }
         ensure_worker_initialized(state)?;
-        send_to_worker(&state.worker, &AppToWorker::Start)?;
-        send_to_worker(&state.worker, &AppToWorker::RunTick)
+        let epoch = state.worker_epoch;
+        send_to_worker(&state.worker, &AppToWorker::Start { epoch })?;
+        send_to_worker(&state.worker, &AppToWorker::RunTick { epoch })
     })?;
     install_button(document, "pause-button", Rc::clone(&state), |state| {
         let document = current_document()?;
+        sync_state_from_controls(&document, state)?;
         commit_pending_radius_change(state, &document, false, false)?;
         if !state.running {
             return Ok(());
@@ -907,10 +981,16 @@ fn install_control_handlers(
         state.has_run = true;
         update_run_buttons(&document, state.running)?;
         set_status("Paused")?;
-        send_to_worker(&state.worker, &AppToWorker::Pause)
+        send_to_worker(
+            &state.worker,
+            &AppToWorker::Pause {
+                epoch: state.worker_epoch,
+            },
+        )
     })?;
     install_button(document, "step-button", Rc::clone(&state), |state| {
         let document = current_document()?;
+        sync_state_from_controls(&document, state)?;
         commit_pending_radius_change(state, &document, false, true)?;
         if state.running {
             return Ok(());
@@ -927,10 +1007,16 @@ fn install_control_handlers(
             let settings = state.settings.clone();
             reset_worker_with_settings(state, &document, settings, false, true)?;
             set_status("Stepping")?;
-            return schedule_step_batch(state.worker.clone());
+            return schedule_step_batch(state.worker.clone(), state.worker_epoch);
         }
         set_status("Stepping")?;
-        send_to_worker(&state.worker, &AppToWorker::StepBatch { max_steps: 1 })
+        send_to_worker(
+            &state.worker,
+            &AppToWorker::StepBatch {
+                epoch: state.worker_epoch,
+                max_steps: 1,
+            },
+        )
     })?;
     install_refresh_handler(document, Rc::clone(&state))?;
     install_button(
@@ -939,13 +1025,10 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let document = current_document()?;
-            commit_pending_radius_change(state, &document, false, false)?;
-            let filename = download_filename(
-                &state.visible_settings,
-                state.last_stats,
-                "image-full",
-                "png",
-            );
+            sync_state_from_controls(&document, state)?;
+            let download_settings = render_settings_for_download(state);
+            let filename =
+                download_filename(&download_settings, state.last_stats, "image-full", "png");
             match state
                 .renderer
                 .download_image("image/png", &filename, ExportKind::FullPng, None)
@@ -964,9 +1047,9 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let document = current_document()?;
-            commit_pending_radius_change(state, &document, false, false)?;
-            let filename =
-                download_filename(&state.visible_settings, state.last_stats, "image", "png");
+            sync_state_from_controls(&document, state)?;
+            let download_settings = render_settings_for_download(state);
+            let filename = download_filename(&download_settings, state.last_stats, "image", "png");
             match state
                 .renderer
                 .download_image("image/png", &filename, ExportKind::Png, None)
@@ -985,13 +1068,10 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let document = current_document()?;
-            commit_pending_radius_change(state, &document, false, false)?;
-            let filename = download_filename(
-                &state.visible_settings,
-                state.last_stats,
-                "image-half",
-                "jpg",
-            );
+            sync_state_from_controls(&document, state)?;
+            let download_settings = render_settings_for_download(state);
+            let filename =
+                download_filename(&download_settings, state.last_stats, "image-half", "jpg");
             match state.renderer.download_image(
                 "image/jpeg",
                 &filename,
@@ -1110,7 +1190,11 @@ fn install_same_board_refresh_handler(
     let blur_document = document.clone();
     let blur_state = Rc::clone(&state);
     let blur_select = board_select.clone();
-    let blur = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+    let blur = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+        let related_target =
+            js_sys::Reflect::get(event.as_ref(), &JsValue::from_str("relatedTarget"))
+                .unwrap_or(JsValue::NULL);
+        let moved_to_another_control = is_form_control_blur_target(&related_target);
         let timeout_document = blur_document.clone();
         let timeout_state = Rc::clone(&blur_state);
         let timeout_select = blur_select.clone();
@@ -1118,13 +1202,26 @@ fn install_same_board_refresh_handler(
             let should_refresh = {
                 let mut state = timeout_state.borrow_mut();
                 let previous = state.board_select_pointer_value.take();
-                previous.as_deref() == Some(timeout_select.value().as_str())
+                let active_control = timeout_document.active_element().is_some_and(|element| {
+                    element.get_attribute("id").as_deref() != Some("board-select")
+                        && is_form_control_element(&element)
+                });
+                !moved_to_another_control
+                    && !active_control
+                    && previous.as_deref() == Some(timeout_select.value().as_str())
             };
             if !should_refresh {
                 return;
             }
 
-            let settings = timeout_state.borrow().settings.clone();
+            let settings = {
+                let mut state = timeout_state.borrow_mut();
+                if let Err(error) = sync_state_from_controls(&timeout_document, &mut state) {
+                    log_error(&error);
+                    return;
+                }
+                state.settings.clone()
+            };
             if let Err(error) = recreate_worker_with_settings(
                 &timeout_document,
                 Rc::clone(&timeout_state),
@@ -1156,6 +1253,21 @@ fn install_same_board_refresh_handler(
     blur.forget();
 
     Ok(())
+}
+
+fn is_form_control_blur_target(value: &JsValue) -> bool {
+    let Some(element) = value.dyn_ref::<Element>() else {
+        return false;
+    };
+
+    is_form_control_element(element)
+}
+
+fn is_form_control_element(element: &Element) -> bool {
+    matches!(
+        element.tag_name().as_str(),
+        "BUTTON" | "INPUT" | "SELECT" | "TEXTAREA"
+    )
 }
 
 fn install_add_piece_handler(
@@ -1227,7 +1339,14 @@ fn install_refresh_handler(
         .ok_or_else(|| JsValue::from_str("missing button #refresh-button"))?
         .dyn_into::<HtmlButtonElement>()?;
     let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-        let settings = state.borrow().settings.clone();
+        let settings = {
+            let mut state = state.borrow_mut();
+            if let Err(error) = sync_state_from_controls(&document, &mut state) {
+                log_error(&error);
+                return;
+            }
+            state.settings.clone()
+        };
         if let Err(error) = recreate_worker_with_settings(
             &document,
             Rc::clone(&state),
@@ -1245,19 +1364,23 @@ fn install_refresh_handler(
     Ok(())
 }
 
-fn ensure_worker_initialized(state: &mut AppState) -> Result<(), JsValue> {
+fn ensure_worker_initialized(state: &mut AppState) -> Result<bool, JsValue> {
     if state.worker_initialized {
-        return Ok(());
+        return Ok(true);
+    }
+    if !state.worker_ready {
+        return Ok(false);
     }
 
     send_to_worker(
         &state.worker,
         &AppToWorker::Initialize {
+            epoch: state.worker_epoch,
             settings: state.worker_settings.clone(),
         },
     )?;
     state.worker_initialized = true;
-    Ok(())
+    Ok(true)
 }
 
 fn recreate_worker_with_settings(
@@ -1274,6 +1397,7 @@ fn recreate_worker_with_settings(
         state.worker.set_onmessage(None);
         state.worker.terminate();
         state.worker_generation = state.worker_generation.wrapping_add(1);
+        state.worker_epoch = state.worker_epoch.wrapping_add(1);
         state.worker = replacement.clone();
         state.worker_generation
     };
@@ -1327,8 +1451,8 @@ fn schedule_worker_bootstrap_fallback(
     generation: u64,
 ) -> Result<(), JsValue> {
     let closure = Closure::<dyn FnMut()>::new(move || {
-        let (worker, settings, start_after_ready, step_after_ready) = {
-            let mut state = state.borrow_mut();
+        let (worker, epoch, settings) = {
+            let state = state.borrow();
             if state.worker_generation != generation {
                 return;
             }
@@ -1336,35 +1460,14 @@ fn schedule_worker_bootstrap_fallback(
                 return;
             }
 
-            state.worker_ready = true;
-            state.worker_initialized = true;
-            let start_after_ready = state.start_after_worker_ready;
-            let step_after_ready = state.step_after_worker_ready.take();
-            state.start_after_worker_ready = false;
             (
                 state.worker.clone(),
+                state.worker_epoch,
                 state.worker_settings.clone(),
-                start_after_ready,
-                step_after_ready,
             )
         };
 
-        if let Err(error) = send_to_worker(&worker, &AppToWorker::Initialize { settings }) {
-            log_error(&error);
-            return;
-        }
-
-        if start_after_ready {
-            if let Err(error) = send_to_worker(&worker, &AppToWorker::Start) {
-                log_error(&error);
-                return;
-            }
-            if let Err(error) = send_to_worker(&worker, &AppToWorker::RunTick) {
-                log_error(&error);
-            }
-        } else if let Some(max_steps) = step_after_ready
-            && let Err(error) = send_to_worker(&worker, &AppToWorker::StepBatch { max_steps })
-        {
+        if let Err(error) = send_to_worker(&worker, &AppToWorker::Initialize { epoch, settings }) {
             log_error(&error);
         }
     });
@@ -1376,6 +1479,42 @@ fn schedule_worker_bootstrap_fallback(
             50,
         )?;
     closure.forget();
+    Ok(())
+}
+
+fn mark_worker_ready_from_current_response(
+    state: &mut AppState,
+) -> Option<(Worker, u64, bool, Option<u32>)> {
+    if state.worker_ready && state.worker_initialized {
+        return None;
+    }
+
+    state.worker_ready = true;
+    state.worker_initialized = true;
+    let start_after_ready = state.start_after_worker_ready;
+    let step_after_ready = state.step_after_worker_ready.take();
+    state.start_after_worker_ready = false;
+
+    Some((
+        state.worker.clone(),
+        state.worker_epoch,
+        start_after_ready,
+        step_after_ready,
+    ))
+}
+
+fn dispatch_deferred_worker_actions(
+    worker: Worker,
+    epoch: u64,
+    start_after_ready: bool,
+    step_after_ready: Option<u32>,
+) -> Result<(), JsValue> {
+    if start_after_ready {
+        send_to_worker(&worker, &AppToWorker::Start { epoch })?;
+        send_to_worker(&worker, &AppToWorker::RunTick { epoch })?;
+    } else if let Some(max_steps) = step_after_ready {
+        send_to_worker(&worker, &AppToWorker::StepBatch { epoch, max_steps })?;
+    }
     Ok(())
 }
 
@@ -1567,19 +1706,12 @@ fn sync_settings(
     state: Rc<RefCell<AppState>>,
     action: SyncAction,
 ) -> Result<(), JsValue> {
-    let previous_settings = state.borrow().settings.clone();
-    let custom_army = previous_settings.custom_army.clone();
-    apply_board_defaults(document, &state.borrow(), &previous_settings)?;
-    let settings = read_settings(document, custom_army, &previous_settings)?;
-    update_outputs(document, &settings)?;
+    let (previous_settings, settings) = {
+        let mut state = state.borrow_mut();
+        sync_state_from_controls(document, &mut state)?
+    };
     let action = resolve_sync_action(action, &previous_settings, &settings);
 
-    {
-        let mut state = state.borrow_mut();
-        state.settings = settings.clone();
-        remember_shape_preference(&mut state, settings.board, settings.shape);
-        update_renderer_snapshot(&mut state)?;
-    }
     render_army_list(document, Rc::clone(&state))?;
 
     match action {
@@ -1600,14 +1732,16 @@ fn sync_settings(
             } else {
                 let mut state = state.borrow_mut();
                 let worker_settings = worker_visible_settings(&state);
-                ensure_worker_initialized(&mut state)?;
-                send_to_worker(
-                    &state.worker,
-                    &AppToWorker::UpdateSettings {
-                        settings: worker_settings.clone(),
-                    },
-                )?;
                 state.worker_settings = worker_settings;
+                if ensure_worker_initialized(&mut state)? {
+                    send_to_worker(
+                        &state.worker,
+                        &AppToWorker::UpdateSettings {
+                            epoch: state.worker_epoch,
+                            settings: state.worker_settings.clone(),
+                        },
+                    )?;
+                }
                 if state.running && !state.settings.visual_progress {
                     set_status(&running_status_text(&state.settings))?;
                 }
@@ -1620,14 +1754,16 @@ fn sync_settings(
         SyncAction::UpdateWorker => {
             let mut state = state.borrow_mut();
             let worker_settings = worker_visible_settings(&state);
-            ensure_worker_initialized(&mut state)?;
-            send_to_worker(
-                &state.worker,
-                &AppToWorker::UpdateSettings {
-                    settings: worker_settings.clone(),
-                },
-            )?;
             state.worker_settings = worker_settings;
+            if ensure_worker_initialized(&mut state)? {
+                send_to_worker(
+                    &state.worker,
+                    &AppToWorker::UpdateSettings {
+                        epoch: state.worker_epoch,
+                        settings: state.worker_settings.clone(),
+                    },
+                )?;
+            }
         }
         SyncAction::ResetWorker => {
             let clear_visible = previous_settings == settings;
@@ -1643,6 +1779,25 @@ fn sync_settings(
     }
 
     Ok(())
+}
+
+fn sync_state_from_controls(
+    document: &Document,
+    state: &mut AppState,
+) -> Result<(EngineSettings, EngineSettings), JsValue> {
+    let previous_settings = state.settings.clone();
+    let custom_army = previous_settings.custom_army.clone();
+    apply_board_defaults(document, state, &previous_settings)?;
+    let settings = read_settings(document, custom_army, &previous_settings)?;
+    update_outputs(document, &settings)?;
+    state.settings = settings.clone();
+    remember_shape_preference(state, settings.board, settings.shape);
+    update_renderer_snapshot(state)?;
+    Ok((previous_settings, settings))
+}
+
+fn render_settings_for_download(state: &AppState) -> EngineSettings {
+    render_settings_for_snapshot(state)
 }
 
 fn worker_visible_settings(state: &AppState) -> EngineSettings {
@@ -1705,18 +1860,21 @@ fn commit_pending_radius_change(
         update_renderer_snapshot(state)?;
 
         if state.worker_ready {
-            ensure_worker_initialized(state)?;
-            send_to_worker(
-                &state.worker,
-                &AppToWorker::UpdateSettings {
-                    settings: settings.clone(),
-                },
-            )?;
+            if ensure_worker_initialized(state)? {
+                send_to_worker(
+                    &state.worker,
+                    &AppToWorker::UpdateSettings {
+                        epoch: state.worker_epoch,
+                        settings: settings.clone(),
+                    },
+                )?;
+            }
             if restart_after_reset && !state.running {
                 state.running = true;
                 update_run_buttons(document, state.running)?;
-                send_to_worker(&state.worker, &AppToWorker::Start)?;
-                send_to_worker(&state.worker, &AppToWorker::RunTick)?;
+                let epoch = state.worker_epoch;
+                send_to_worker(&state.worker, &AppToWorker::Start { epoch })?;
+                send_to_worker(&state.worker, &AppToWorker::RunTick { epoch })?;
             }
         }
         return Ok(());
@@ -1759,6 +1917,8 @@ fn reset_worker_with_settings(
     state.has_run = restart_after_reset || state.has_run;
     state.last_ui_refresh_ms = 0.0;
     state.render_scheduled = false;
+    state.worker_epoch = state.worker_epoch.wrapping_add(1);
+    let epoch = state.worker_epoch;
     state.worker_settings = settings.clone();
     let can_reset_now = state.worker_ready;
     state.worker_initialized = can_reset_now;
@@ -1782,10 +1942,10 @@ fn reset_worker_with_settings(
         return Ok(());
     }
 
-    send_to_worker(&state.worker, &AppToWorker::Reset { settings })?;
+    send_to_worker(&state.worker, &AppToWorker::Reset { epoch, settings })?;
     if restart_after_reset {
-        send_to_worker(&state.worker, &AppToWorker::Start)?;
-        send_to_worker(&state.worker, &AppToWorker::RunTick)?;
+        send_to_worker(&state.worker, &AppToWorker::Start { epoch })?;
+        send_to_worker(&state.worker, &AppToWorker::RunTick { epoch })?;
     }
     Ok(())
 }
@@ -1795,12 +1955,7 @@ fn apply_board_defaults(
     state: &AppState,
     previous: &EngineSettings,
 ) -> Result<(), JsValue> {
-    let next_board = match select_value(document, "board-select")?.as_str() {
-        "LatticeHex" => BoardKind::LatticeHex,
-        "LatticeTriangle" => BoardKind::LatticeTriangle,
-        "ContinuousArchimedean" => BoardKind::ContinuousArchimedean,
-        _ => BoardKind::LatticeSquare,
-    };
+    let next_board = parse_board_kind(&select_value(document, "board-select")?, previous.board);
 
     if previous.board != next_board {
         input(document, "piece-radius-slider")?.set_value("0.50");
@@ -1890,12 +2045,7 @@ fn read_settings(
     custom_army: Vec<CustomPiece>,
     fallback: &EngineSettings,
 ) -> Result<EngineSettings, JsValue> {
-    let board = match select_value(document, "board-select")?.as_str() {
-        "LatticeHex" => BoardKind::LatticeHex,
-        "LatticeTriangle" => BoardKind::LatticeTriangle,
-        "ContinuousArchimedean" => BoardKind::ContinuousArchimedean,
-        _ => BoardKind::LatticeSquare,
-    };
+    let board = parse_board_kind(&select_value(document, "board-select")?, fallback.board);
 
     let shape = match board {
         BoardKind::ContinuousArchimedean => {
@@ -1981,6 +2131,16 @@ fn read_settings(
         anchor_color_a: input_value(document, "anchor-a-input")?,
         anchor_color_b: input_value(document, "anchor-b-input")?,
     })
+}
+
+fn parse_board_kind(value: &str, fallback: BoardKind) -> BoardKind {
+    match value {
+        "LatticeSquare" => BoardKind::LatticeSquare,
+        "LatticeHex" => BoardKind::LatticeHex,
+        "LatticeTriangle" => BoardKind::LatticeTriangle,
+        "ContinuousArchimedean" => BoardKind::ContinuousArchimedean,
+        _ => fallback,
+    }
 }
 
 fn parse_finite_f64(raw: &str, fallback: f64) -> f64 {
@@ -2214,8 +2374,9 @@ fn maybe_auto_start_default(
     state.has_run = true;
     update_run_buttons(document, state.running)?;
     set_status(&running_status_text(&state.settings))?;
-    send_to_worker(&state.worker, &AppToWorker::Start)?;
-    send_to_worker(&state.worker, &AppToWorker::RunTick)
+    let epoch = state.worker_epoch;
+    send_to_worker(&state.worker, &AppToWorker::Start { epoch })?;
+    send_to_worker(&state.worker, &AppToWorker::RunTick { epoch })
 }
 
 fn running_status_text(settings: &EngineSettings) -> String {

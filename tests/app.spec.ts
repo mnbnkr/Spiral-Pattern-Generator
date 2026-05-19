@@ -17,10 +17,12 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function pauseIfRunning(page) {
-  const pause = page.locator("#pause-button");
-  if (await pause.isEnabled()) {
-    await pause.click();
-  }
+  await page.locator("#pause-button").evaluate((button) => {
+    const pauseButton = button as HTMLButtonElement;
+    if (!pauseButton.disabled) {
+      pauseButton.click();
+    }
+  });
 }
 
 test("default simulation auto-runs", async ({ page }) => {
@@ -168,7 +170,7 @@ test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async 
   await page.selectOption("#board-select", "LatticeTriangle");
   await expect(page.locator("#shape-select")).toHaveValue("Triangle");
   await expect(page.locator("#placement-search-select")).toHaveValue("SpiralPath");
-  await expect(page.locator("#placement-log")).toContainText("No placements yet.");
+  await expect(page.locator("#placement-log")).toContainText("board=LatticeSquare");
   await expect(page.locator("#shape-option-square")).toHaveAttribute(
     "disabled",
     "disabled",
@@ -181,6 +183,7 @@ test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async 
   await page.click("#step-button");
   await expect(page.locator("#placement-log")).toContainText("triangle(");
   await expect(page.locator("#placement-log")).toContainText("coord=triangle(0,0)");
+  await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
 
   await page.fill("#radius-input", "12");
   await page.click("#refresh-button");
@@ -266,6 +269,46 @@ test("refresh then immediate start uses the selected board worker", async ({
   await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
 });
 
+test("track-on board switch under load refreshes the selected board worker", async ({
+  page,
+}) => {
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "70";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("#track-opacity-output")).toHaveText("70%");
+  await expect(page.locator("#status-line")).toContainText("placements", {
+    timeout: 15_000,
+  });
+
+  await page.selectOption("#board-select", "ContinuousArchimedean");
+  await page.fill("#radius-input", "1000");
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+
+  await expect(page.locator("#board-select")).toHaveValue(
+    "ContinuousArchimedean",
+  );
+  await expect(page.locator("#radius-input")).toHaveValue("1000");
+  await expect(page.locator("#track-opacity-output")).toHaveText("70%");
+  await expect(page.locator("#placement-log")).toContainText(
+    "board=ContinuousArchimedean",
+    { timeout: 15_000 },
+  );
+  await expect(page.locator("#placement-log")).toContainText("radius=1000.00");
+  await expect(page.locator("#placement-log")).toContainText(
+    "coord=continuous(",
+  );
+  await expect(page.locator("#placement-log")).not.toContainText(
+    "coord=square(",
+  );
+  await pauseIfRunning(page);
+});
+
 test("starting a staged board switch clears stale square data", async ({
   page,
 }) => {
@@ -303,6 +346,117 @@ test("reselecting the current board refreshes without changing board", async ({
   await expect(page.locator("#board-select")).toHaveValue("LatticeSquare");
   await expect(page.locator("#status-line")).toContainText("Paused");
   await expect(page.locator("#placement-log")).toContainText("No placements yet.");
+});
+
+test("board-select blur into another control does not refresh the board", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.selectOption("#board-select", "LatticeTriangle");
+  await page.click("#step-button");
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(", {
+    timeout: 15_000,
+  });
+
+  await page.locator("#board-select").evaluate((element) => {
+    const relatedTarget = document.querySelector("#enemy-mode-select");
+    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    element.dispatchEvent(
+      new FocusEvent("blur", { bubbles: false, relatedTarget }),
+    );
+  });
+  await page.waitForTimeout(100);
+
+  await expect(page.locator("#board-select")).toHaveValue("LatticeTriangle");
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(");
+  await expect(page.locator("#placement-log")).not.toContainText(
+    "No placements yet.",
+  );
+
+  await page.locator("#board-select").evaluate((element) => {
+    const enemy = document.querySelector<HTMLElement>("#enemy-mode-select");
+    if (!enemy) throw new Error("missing enemy-mode-select");
+    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    enemy.focus();
+    element.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
+  });
+  await page.waitForTimeout(100);
+
+  await expect(page.locator("#board-select")).toHaveValue("LatticeTriangle");
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(");
+  await expect(page.locator("#placement-log")).not.toContainText(
+    "No placements yet.",
+  );
+});
+
+test("refresh then start uses visible board and radius controls for every board", async ({
+  page,
+}) => {
+  for (const scenario of [
+    {
+      board: "LatticeHex",
+      radius: "60",
+      shape: "Hex",
+      coord: "coord=hex(",
+    },
+    {
+      board: "LatticeTriangle",
+      radius: "60",
+      shape: "Triangle",
+      coord: "coord=triangle(",
+    },
+    {
+      board: "ContinuousArchimedean",
+      radius: "1000",
+      shape: "Circle",
+      coord: "coord=continuous(",
+    },
+  ]) {
+    await page.reload();
+    await expect(page.locator("#status-line")).toContainText("placements", {
+      timeout: 15_000,
+    });
+    await pauseIfRunning(page);
+
+    await page.evaluate(({ board, radius }) => {
+      const boardSelect =
+        document.querySelector<HTMLSelectElement>("#board-select");
+      const radiusInput =
+        document.querySelector<HTMLInputElement>("#radius-input");
+      const trackSlider = document.querySelector<HTMLInputElement>(
+        "#track-opacity-slider",
+      );
+      if (!boardSelect || !radiusInput || !trackSlider) {
+        throw new Error("missing controls");
+      }
+      boardSelect.value = board;
+      radiusInput.value = radius;
+      trackSlider.value = "65";
+    }, scenario);
+
+    await page.click("#refresh-button");
+    await expect(page.locator("#board-select")).toHaveValue(scenario.board);
+    await expect(page.locator("#radius-input")).toHaveValue(scenario.radius);
+    await expect(page.locator("#shape-select")).toHaveValue(scenario.shape);
+    await expect(page.locator("#track-opacity-output")).toHaveText("65%");
+    await expect(page.locator("#status-line")).toContainText("Paused");
+
+    await page.click("#start-button");
+    await expect(page.locator("#placement-log")).toContainText(
+      `board=${scenario.board}`,
+      { timeout: 15_000 },
+    );
+    await expect(page.locator("#placement-log")).toContainText(
+      `radius=${Number(scenario.radius).toFixed(2)}`,
+    );
+    await expect(page.locator("#placement-log")).toContainText(scenario.coord);
+    if (scenario.board !== "LatticeSquare") {
+      await expect(page.locator("#placement-log")).not.toContainText(
+        "coord=square(",
+      );
+    }
+    await pauseIfRunning(page);
+  }
 });
 
 test("placement search and continuous offset validation stay wired", async ({
@@ -347,6 +501,23 @@ test("placement search and continuous offset validation stay wired", async ({
   await expect(page.locator("#continuous-offset-input")).not.toHaveClass(
     /invalid-input/,
   );
+});
+
+test("high-radius center distance starts without a full-radius prebuild", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "1500");
+  await page.selectOption("#placement-search-select", "CenterDistance");
+  await page.click("#step-button");
+
+  await expect(page.locator("#status-line")).toContainText("1 placements", {
+    timeout: 10_000,
+  });
+  await expect(page.locator("#placement-log")).toContainText(
+    "search=CenterDistance",
+  );
+  await expect(page.locator("#placement-log")).toContainText("coord=square(0,0)");
 });
 
 test("higher radius commits without clearing the visible generation", async ({

@@ -418,30 +418,51 @@ impl Default for ColorState {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AppToWorker {
-    Initialize { settings: EngineSettings },
-    Reset { settings: EngineSettings },
-    UpdateSettings { settings: EngineSettings },
-    Start,
-    Pause,
-    RunTick,
-    StepBatch { max_steps: u32 },
+    Initialize {
+        epoch: u64,
+        settings: EngineSettings,
+    },
+    Reset {
+        epoch: u64,
+        settings: EngineSettings,
+    },
+    UpdateSettings {
+        epoch: u64,
+        settings: EngineSettings,
+    },
+    Start {
+        epoch: u64,
+    },
+    Pause {
+        epoch: u64,
+    },
+    RunTick {
+        epoch: u64,
+    },
+    StepBatch {
+        epoch: u64,
+        max_steps: u32,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerToApp {
     Ready,
     Batch {
+        epoch: u64,
         log_placements: Vec<Placement>,
         vertex_update: VertexBufferUpdate,
         stats: EngineStats,
         color_state: ColorState,
     },
     Stats {
+        epoch: u64,
         stats: EngineStats,
         color_state: ColorState,
         vertex_update: VertexBufferUpdate,
     },
     Error {
+        epoch: u64,
         message: String,
     },
 }
@@ -460,6 +481,7 @@ mod tests {
     #[test]
     fn messages_serialize_through_binary_transport() {
         let msg = AppToWorker::Initialize {
+            epoch: 7,
             settings: EngineSettings::default(),
         };
         let value = bincode::serialize(&msg).unwrap();

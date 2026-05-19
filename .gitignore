@@ -2,6 +2,7 @@
 /dist/
 /.trunk/
 current_prompt.md
+AGENTS.md
 
 # Playwright
 node_modules/

@@ -29,7 +29,7 @@ Do not introduce React, Yew, npm build tooling, or a heavy UI framework. Playwri
 
 The mathematical engine must run in the worker. The main thread owns UI, worker control, rendering, and downloads.
 
-Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Placement batches include only sampled log placements plus packed render vertices. The main thread appends vertex ranges and uploads them with `bufferSubData`; full vertex replacements are reserved for recoloring or reset events.
+Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices. The main thread appends vertex ranges and uploads them with `bufferSubData`; full vertex replacements are reserved for recoloring or reset events.
 
 The visual run loop is a bounded pull loop: the main thread asks for one worker batch, handles the reply, coalesces drawing onto `requestAnimationFrame`, and only then requests more work. Do not reintroduce an unbounded worker-push loop.
 
@@ -154,6 +154,8 @@ In default `SpiralPath`, each army entry has its own forward scan cursor. On tha
 
 In `CenterDistance`, each army entry has its own cursor through spots ordered by Euclidean distance from origin, using spiral index as a tie-breaker. This is intentionally a different search order.
 
+For lattice boards, `CenterDistance` streams spots from the requested board bound in Euclidean center-distance order with spiral index as the tie-breaker. It must not prebuild and sort the entire radius before emitting the first placement; high-radius runs still progress through bounded worker batches. Square, hex, and triangle corners are valid outer-bound spots, but they appear late in live generation because they are farther from the origin than most interior spots. For the continuous Archimedean board, center distance is monotonic with spiral theta, so `CenterDistance` and `SpiralPath` visit continuous spots in the same order by design without prebuilding the full radius.
+
 Empty custom armies are valid editing states and produce no placements until a piece is added.
 
 ### Prime Knight
@@ -219,7 +221,7 @@ Render shapes:
 
 Shape changes and lattice Piece Radius changes are render-only and must not reset the worker. Continuous Piece Radius changes reset because they affect collision and attack validity.
 
-Spiral Track is render-only. Lattice track geometry draws every adjacent spiral segment through normal high radii such as `150`; only extreme lattice radii are segment-sampled across the full requested bound to avoid stopping early at the cap. Continuous track geometry is capped by step size and point count.
+Spiral Track is render-only. Lattice track geometry is a connected WebGL line strip through every lattice spiral point inside the requested radius, so Square, Hex, and Triangle previews stay continuous instead of becoming dashed at higher radii. Continuous track geometry is sampled by step size and point count while still including the requested end radius. When a board change stages a new generation while the old placement snapshot remains dimmed, the track and view bounds still follow the currently selected board and radius.
 
 Board view/export bounds are board-specific:
 
@@ -227,11 +229,11 @@ Board view/export bounds are board-specific:
 - Hex uses its wider axial x extent and y extent, so side corners are visible and pannable.
 - Triangle uses its asymmetric shell bounds, so Fit Screen and exports do not leave excessive empty space below.
 
-In `1:1 Pixel`, mouse wheel changes Zoom around the cursor. The zoom scale uses a small base multiplier so `x1` is slightly more zoomed in than raw one-world-unit-per-pixel and `x32` reaches proportionally farther in. Left mouse drag pans only in `1:1 Pixel`; panning bounds include extra side room.
+In `1:1 Pixel`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning.
 
 ## Image And Log Export
 
-Image export never copies the visible viewport canvas. It renders deterministic offscreen pixels from placement/vertex data.
+Image export never copies the visible viewport canvas. It renders deterministic offscreen pixels from placement/vertex data. Export buttons re-read the visible controls for render bounds and filenames, but they do not force a pending Radius commit into the worker.
 
 - Full PNG preserves strict deterministic scale.
 - PNG keeps square/cell exports at one cell per pixel and caps non-square piece diameter to practical size.
@@ -283,7 +285,7 @@ The untouched default simulation auto-starts so first load is nonblank.
 
 Switching to Continuous defaults Piece Radius to `0.50` and forces Circle. Lattice boards also default Piece Radius to `0.50`. Hex defaults to Hex shape the first time it is selected in a session, then remembers user-overridden shape choices per lattice board.
 
-Refresh terminates active worker work, recreates worker/render state, clears stale in-flight messages, pauses, and preserves current settings and custom pieces. Simulation-affecting setting changes also move to a fresh worker while preserving the stale visible snapshot until the new generation starts. Reselecting the current Board Type should refresh in the same way without changing the selected board.
+Refresh terminates active worker work, recreates worker/render state, clears stale in-flight messages, pauses, and preserves current settings and custom pieces. Refresh, Start, Step, and Pause re-read the visible controls before acting, so a worker restart cannot fall back to the default Square settings while another Board Type or Radius is visibly selected. Worker bootstrap fallback may send initialization as a recovery path, but only a `Ready` message or current-epoch worker response can mark a worker ready, preventing Start from talking to an uninitialized replacement. Simulation-affecting setting changes also move to a fresh worker while preserving the stale visible snapshot until the new generation starts. Reselecting the current Board Type should refresh in the same way without changing the selected board. Moving focus from Board Type directly into another control must not trigger that same-board refresh, and transient/unknown board-select values preserve the previous board instead of falling back to Square.
 
 `Visual Progress` off makes the worker suppress live vertices/logs and send final render/log data only on completion or after a long silent work slice yields. Re-enabling Visual Progress during a silent run cancels and pauses that run cleanly so future visual runs are not corrupted.
 

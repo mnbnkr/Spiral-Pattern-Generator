@@ -30,7 +30,7 @@ The mathematical engine must run in the Web Worker. The main thread owns UI and 
 
 The run loop is a bounded main-thread pull loop: the main thread requests the next worker batch only after receiving the previous one, and canvas drawing is coalesced onto `requestAnimationFrame`. Do not revert to an unbounded worker-push loop, because that can make visuals and controls lag behind queued worker messages.
 
-Worker transport uses `bincode` over transferable `Uint8Array`, not JSON strings. The worker owns hot-path render-data packing and sends `[x, y, r, g, b]` `Vec<f32>` vertex updates with each placement batch. The main thread should append those vertices, upload appended ranges with `bufferSubData`, redraw the full uploaded point buffer through rAF, and replace the full buffer only for recoloring events; it should not rebuild and recolor the full placement list every redraw.
+Worker transport uses `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so stale same-worker reset messages cannot mutate a newer board/radius run. The worker owns hot-path render-data packing and sends `[x, y, r, g, b]` `Vec<f32>` vertex updates with each placement batch. The main thread should append those vertices, upload appended ranges with `bufferSubData`, redraw the full uploaded point buffer through rAF, and replace the full buffer only for recoloring events; it should not rebuild and recolor the full placement list every redraw.
 
 ## Agent Navigation
 

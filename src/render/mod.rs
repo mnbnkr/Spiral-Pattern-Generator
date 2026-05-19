@@ -14,7 +14,6 @@ const FLOATS_PER_VERTEX: usize = 5;
 const BYTES_PER_FLOAT: usize = std::mem::size_of::<f32>();
 const INITIAL_VERTEX_CAPACITY: usize = 16_384;
 const MAX_TRACK_POINTS: usize = 160_000;
-const MAX_TRACK_SEGMENTS: usize = 250_000;
 const MAX_EXPORT_PIXELS: usize = 64_000_000;
 const MAX_EXPORT_DIMENSION: u32 = 32_767;
 
@@ -400,13 +399,8 @@ impl CanvasRenderer {
             self.settings.track_opacity.clamp(0.0, 1.0),
         );
         self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
-        let primitive = if self.settings.board == BoardKind::ContinuousArchimedean {
-            Gl::LINE_STRIP
-        } else {
-            Gl::LINES
-        };
         self.gl.draw_arrays(
-            primitive,
+            Gl::LINE_STRIP,
             0,
             (self.track_vertices.len() / FLOATS_PER_VERTEX) as i32,
         );
@@ -626,13 +620,7 @@ impl CanvasRenderer {
     }
 
     fn world_scale(&self, width: f64, height: f64) -> f64 {
-        match self.settings.display_mode {
-            DisplayMode::FitScreen => {
-                let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
-                (width / (bounds.width() + 4.0)).min(height / (bounds.height() + 4.0))
-            }
-            DisplayMode::PixelOneToOne => self.settings.zoom.clamp(1, 32) as f64 * 1.25,
-        }
+        world_scale_for_settings(&self.settings, width, height)
     }
 
     fn view_bounds(&self, margin: f64) -> WorldBounds {
@@ -786,9 +774,8 @@ enum ExportShape {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TrackKey {
     board: BoardKind,
-    radius_floor: i64,
+    radius_key: u64,
     continuous_offset_bits: u64,
-    enabled: bool,
 }
 
 impl TrackKey {
@@ -800,9 +787,11 @@ impl TrackKey {
 
         Some(Self {
             board: settings.board,
-            radius_floor: settings.radius.max(0.0).floor() as i64,
+            radius_key: match settings.board {
+                BoardKind::ContinuousArchimedean => settings.radius.max(0.0).to_bits(),
+                _ => settings.radius.max(0.0).floor().to_bits(),
+            },
             continuous_offset_bits: settings.continuous_offset.to_bits(),
-            enabled,
         })
     }
 }
@@ -885,6 +874,22 @@ fn board_world_bounds(settings: &EngineSettings, margin: f64) -> WorldBounds {
     }
 }
 
+fn world_scale_for_settings(settings: &EngineSettings, width: f64, height: f64) -> f64 {
+    let fit_scale = fit_screen_scale(
+        width,
+        height,
+        board_world_bounds(settings, rendered_piece_radius(settings)),
+    );
+    match settings.display_mode {
+        DisplayMode::FitScreen => fit_scale,
+        DisplayMode::PixelOneToOne => fit_scale * settings.zoom.clamp(1, 32) as f64,
+    }
+}
+
+fn fit_screen_scale(width: f64, height: f64, bounds: WorldBounds) -> f64 {
+    (width / (bounds.width() + 4.0)).min(height / (bounds.height() + 4.0))
+}
+
 fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     if settings.track_opacity <= f32::EPSILON {
         return Vec::new();
@@ -896,7 +901,7 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
             let bound = settings.radius.max(0.0).floor() as u64;
             let side = bound.saturating_mul(2).saturating_add(1);
             let total_points = side.saturating_mul(side);
-            push_sampled_track_segments(&mut vertices, total_points, |index| {
+            push_lattice_track_points(&mut vertices, total_points, |index| {
                 let point = SquareSpiral::coord_at_index(index).to_point();
                 (point.x, point.y)
             });
@@ -908,7 +913,7 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
                     .saturating_mul(bound)
                     .saturating_mul(bound.saturating_add(1)),
             );
-            push_sampled_track_segments(&mut vertices, total_points, |index| {
+            push_lattice_track_points(&mut vertices, total_points, |index| {
                 let point = HexSpiral::coord_at_index(index).to_point();
                 (point.x, point.y)
             });
@@ -916,7 +921,7 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
         BoardKind::LatticeTriangle => {
             let bound = settings.radius.max(0.0).floor() as u64;
             let total_points = triangular_number(bound.saturating_mul(3)).saturating_add(1);
-            push_sampled_track_segments(&mut vertices, total_points, |index| {
+            push_lattice_track_points(&mut vertices, total_points, |index| {
                 let point = TriangleSpiral::coord_at_index(index).to_point();
                 (point.x, point.y)
             });
@@ -929,10 +934,16 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
             let end_theta = radius * std::f64::consts::TAU;
             let step = ((end_theta - start_theta).max(0.0) / MAX_TRACK_POINTS as f64).max(0.05);
             let mut theta = start_theta.min(end_theta);
+            let mut last_theta = None;
             while theta <= end_theta {
                 let point = ArchimedeanSpiral::position(theta);
                 push_track_vertex(&mut vertices, point.x, point.y);
+                last_theta = Some(theta);
                 theta += step;
+            }
+            if last_theta.is_none_or(|theta| theta < end_theta) {
+                let point = ArchimedeanSpiral::position(end_theta);
+                push_track_vertex(&mut vertices, point.x, point.y);
             }
         }
     }
@@ -940,42 +951,21 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     vertices
 }
 
-fn push_sampled_track_segments<F>(vertices: &mut Vec<f32>, total_points: u64, mut point_at: F)
+fn push_lattice_track_points<F>(vertices: &mut Vec<f32>, total_points: u64, mut point_at: F)
 where
     F: FnMut(u64) -> (f64, f64),
 {
-    if total_points < 2 {
+    if total_points == 0 {
         return;
     }
 
-    let total_segments = total_points - 1;
-    let stride = total_segments.div_ceil(MAX_TRACK_SEGMENTS as u64).max(1);
-    let mut segment = 0_u64;
-    let mut last_pushed = None;
-
-    while segment < total_segments {
-        push_track_segment(vertices, segment, &mut point_at);
-        last_pushed = Some(segment);
-        segment = segment.saturating_add(stride);
-        if segment == u64::MAX {
-            break;
-        }
+    if let Ok(points) = usize::try_from(total_points) {
+        vertices.reserve(points.saturating_mul(FLOATS_PER_VERTEX));
     }
-
-    let final_segment = total_segments - 1;
-    if last_pushed != Some(final_segment) {
-        push_track_segment(vertices, final_segment, &mut point_at);
+    for index in 0..total_points {
+        let point = point_at(index);
+        push_track_vertex(vertices, point.0, point.1);
     }
-}
-
-fn push_track_segment<F>(vertices: &mut Vec<f32>, start_index: u64, point_at: &mut F)
-where
-    F: FnMut(u64) -> (f64, f64),
-{
-    let start = point_at(start_index);
-    let end = point_at(start_index + 1);
-    push_track_vertex(vertices, start.0, start.1);
-    push_track_vertex(vertices, end.0, end.1);
 }
 
 #[must_use]
@@ -1219,15 +1209,6 @@ fn uniform_location(
 }
 
 #[allow(dead_code)]
-fn _board_name(board: BoardKind) -> &'static str {
-    match board {
-        BoardKind::LatticeSquare => "LatticeSquare",
-        BoardKind::LatticeHex => "LatticeHex",
-        BoardKind::LatticeTriangle => "LatticeTriangle",
-        BoardKind::ContinuousArchimedean => "ContinuousArchimedean",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1274,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn lattice_track_sampling_reaches_requested_radius() {
+    fn lattice_track_line_strip_reaches_requested_radius() {
         for board in [
             BoardKind::LatticeSquare,
             BoardKind::LatticeHex,
@@ -1282,7 +1263,7 @@ mod tests {
         ] {
             let settings = EngineSettings {
                 board,
-                radius: 1_000.0,
+                radius: 300.0,
                 track_opacity: 0.5,
                 ..EngineSettings::default()
             };
@@ -1296,8 +1277,7 @@ mod tests {
                 BoardKind::ContinuousArchimedean => unreachable!(),
             };
 
-            assert!(vertices.len() / FLOATS_PER_VERTEX <= (MAX_TRACK_SEGMENTS + 1) * 2);
-            assert!(distance > 900.0, "board={board:?}, distance={distance}");
+            assert!(distance > 280.0, "board={board:?}, distance={distance}");
         }
     }
 
@@ -1327,14 +1307,14 @@ mod tests {
 
             assert_eq!(
                 vertices.len() / FLOATS_PER_VERTEX,
-                (expected_points as usize - 1) * 2,
+                expected_points as usize,
                 "board={board:?}"
             );
         }
     }
 
     #[test]
-    fn sampled_lattice_track_segments_do_not_connect_distant_spiral_points() {
+    fn lattice_track_radius_300_draws_connected_adjacent_path() {
         for board in [
             BoardKind::LatticeSquare,
             BoardKind::LatticeHex,
@@ -1342,27 +1322,63 @@ mod tests {
         ] {
             let settings = EngineSettings {
                 board,
-                radius: 1_000.0,
+                radius: 300.0,
                 track_opacity: 0.5,
                 ..EngineSettings::default()
             };
             let vertices = build_track_vertices(&settings);
-            let max_segment = vertices
-                .chunks_exact(FLOATS_PER_VERTEX * 2)
-                .map(|segment| {
-                    let x0 = segment[0] as f64;
-                    let y0 = segment[1] as f64;
-                    let x1 = segment[FLOATS_PER_VERTEX] as f64;
-                    let y1 = segment[FLOATS_PER_VERTEX + 1] as f64;
-                    (x1 - x0).hypot(y1 - y0)
-                })
-                .fold(0.0_f64, f64::max);
+            let point_count = vertices.len() / FLOATS_PER_VERTEX;
+            assert!(
+                point_count > 250_000,
+                "board={board:?}, points={point_count}"
+            );
+
+            let mut previous: Option<(f64, f64)> = None;
+            let mut max_segment = 0.0_f64;
+            for point in vertices.chunks_exact(FLOATS_PER_VERTEX) {
+                let current = (point[0] as f64, point[1] as f64);
+                if let Some((x0, y0)) = previous {
+                    max_segment = max_segment.max((current.0 - x0).hypot(current.1 - y0));
+                }
+                previous = Some(current);
+            }
 
             assert!(
                 max_segment <= 2.0,
                 "board={board:?}, max segment length={max_segment}"
             );
         }
+    }
+
+    #[test]
+    fn continuous_track_cache_key_uses_exact_radius() {
+        let small = EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            radius: 240.1,
+            track_opacity: 0.5,
+            ..EngineSettings::default()
+        };
+        let mut large = small.clone();
+        large.radius = 240.9;
+
+        let small_key = TrackKey::from_settings(&small);
+        let large_key = TrackKey::from_settings(&large);
+        assert_ne!(small_key, large_key);
+    }
+
+    #[test]
+    fn continuous_track_reaches_fractional_requested_radius() {
+        let settings = EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            radius: 240.75,
+            track_opacity: 0.5,
+            ..EngineSettings::default()
+        };
+        let vertices = build_track_vertices(&settings);
+        let last = &vertices[vertices.len() - FLOATS_PER_VERTEX..];
+        let distance = (last[0] as f64).hypot(last[1] as f64);
+
+        assert!((distance - settings.radius).abs() < 1.0e-3);
     }
 
     #[test]
@@ -1377,5 +1393,49 @@ mod tests {
         assert!(bounds.center_y() > 0.0);
         assert!(bounds.min_y > -3.0_f64.sqrt() * 10.0);
         assert_eq!(bounds.max_x, 14.5);
+    }
+
+    #[test]
+    fn pixel_one_to_one_zoom_one_fits_requested_board_bounds() {
+        let fit_settings = EngineSettings {
+            board: BoardKind::LatticeTriangle,
+            radius: 850.0,
+            display_mode: DisplayMode::FitScreen,
+            zoom: 1,
+            ..EngineSettings::default()
+        };
+        let pixel_settings = EngineSettings {
+            display_mode: DisplayMode::PixelOneToOne,
+            ..fit_settings.clone()
+        };
+
+        let width = 1280.0;
+        let height = 720.0;
+        let fit_scale = world_scale_for_settings(&fit_settings, width, height);
+        let pixel_scale = world_scale_for_settings(&pixel_settings, width, height);
+
+        assert!((pixel_scale - fit_scale).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn pixel_one_to_one_zoom_levels_scale_from_fit_bounds() {
+        let settings = EngineSettings {
+            board: BoardKind::LatticeSquare,
+            radius: 100.0,
+            display_mode: DisplayMode::PixelOneToOne,
+            zoom: 4,
+            ..EngineSettings::default()
+        };
+        let base = world_scale_for_settings(
+            &EngineSettings {
+                zoom: 1,
+                ..settings.clone()
+            },
+            1200.0,
+            800.0,
+        );
+        let zoomed = world_scale_for_settings(&settings, 1200.0, 800.0);
+
+        assert!((zoomed - base * 4.0).abs() <= f64::EPSILON * 4.0);
     }
 }

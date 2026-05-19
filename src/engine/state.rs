@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::spatial::{ContinuousSpatialHash, LatticeSpatialIndex};
@@ -92,6 +95,37 @@ enum BoardSpot {
     },
 }
 
+#[derive(Clone, Debug)]
+struct CenterQueueEntry {
+    distance_squared: f64,
+    spot_index: u64,
+    spot: BoardSpot,
+}
+
+impl PartialEq for CenterQueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance_squared.total_cmp(&other.distance_squared) == Ordering::Equal
+            && self.spot_index == other.spot_index
+    }
+}
+
+impl Eq for CenterQueueEntry {}
+
+impl PartialOrd for CenterQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CenterQueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .distance_squared
+            .total_cmp(&self.distance_squared)
+            .then_with(|| other.spot_index.cmp(&self.spot_index))
+    }
+}
+
 impl BoardSpot {
     #[must_use]
     fn index(&self) -> u64 {
@@ -180,7 +214,10 @@ pub struct SimulationEngine {
     spots: Vec<BoardSpot>,
     spots_exhausted: bool,
     first_out_of_radius_spot: Option<BoardSpot>,
-    center_ordered_spot_indices: Option<Vec<u64>>,
+    center_ordered_spots: Vec<BoardSpot>,
+    center_queue: BinaryHeap<CenterQueueEntry>,
+    center_next_shell: u64,
+    center_shells_exhausted: bool,
     square_spiral: SquareSpiral,
     hex_spiral: HexSpiral,
     triangle_spiral: TriangleSpiral,
@@ -214,7 +251,10 @@ impl SimulationEngine {
             spots: Vec::new(),
             spots_exhausted: false,
             first_out_of_radius_spot: None,
-            center_ordered_spot_indices: None,
+            center_ordered_spots: Vec::new(),
+            center_queue: BinaryHeap::new(),
+            center_next_shell: 0,
+            center_shells_exhausted: false,
             square_spiral: SquareSpiral::new(),
             hex_spiral: HexSpiral::new(),
             triangle_spiral: TriangleSpiral::new(),
@@ -954,47 +994,86 @@ impl SimulationEngine {
     fn spot_at_search_order(&mut self, order_index: u64) -> Option<BoardSpot> {
         match self.settings.placement_search {
             PlacementSearchMode::SpiralPath => self.spot_at(index_from_u64(order_index)?),
-            PlacementSearchMode::CenterDistance => {
-                let spot_index = self.center_ordered_spot_index(order_index)?;
-                self.spot_at(index_from_u64(spot_index)?)
+            PlacementSearchMode::CenterDistance => self.center_ordered_spot(order_index),
+        }
+    }
+
+    fn center_ordered_spot(&mut self, order_index: u64) -> Option<BoardSpot> {
+        if self.settings.board == BoardKind::ContinuousArchimedean {
+            return self.spot_at(index_from_u64(order_index)?);
+        }
+
+        let order_index = index_from_u64(order_index)?;
+        while self.center_ordered_spots.len() <= order_index {
+            if !self.advance_center_order() {
+                return None;
+            }
+        }
+
+        self.center_ordered_spots.get(order_index).cloned()
+    }
+
+    fn advance_center_order(&mut self) -> bool {
+        loop {
+            if self.center_queue.is_empty() {
+                if !self.push_next_center_shell() {
+                    return false;
+                }
+                continue;
+            }
+
+            while !self.center_shells_exhausted {
+                let Some(peek) = self.center_queue.peek() else {
+                    break;
+                };
+                let next_min = min_center_distance_squared_for_shell(
+                    self.settings.board,
+                    self.center_next_shell,
+                );
+                if next_min > peek.distance_squared {
+                    break;
+                }
+                if !self.push_next_center_shell() {
+                    break;
+                }
+            }
+
+            if let Some(entry) = self.center_queue.pop() {
+                self.center_ordered_spots.push(entry.spot);
+                return true;
             }
         }
     }
 
-    fn center_ordered_spot_index(&mut self, order_index: u64) -> Option<u64> {
-        self.ensure_center_ordered_spot_indices();
-        self.center_ordered_spot_indices
-            .as_ref()?
-            .get(index_from_u64(order_index)?)
-            .copied()
-    }
-
-    fn ensure_center_ordered_spot_indices(&mut self) {
-        if self.center_ordered_spot_indices.is_some() {
-            return;
+    fn push_next_center_shell(&mut self) -> bool {
+        if self.center_shells_exhausted {
+            return false;
         }
 
-        while !self.spots_exhausted {
-            let next_index = self.spots.len() as u64;
-            let Some(next_index) = index_from_u64(next_index) else {
-                self.spots_exhausted = true;
-                break;
-            };
-            if self.spot_at(next_index).is_none() {
-                break;
-            }
+        let bound = self.settings.radius.max(0.0).floor() as u64;
+        if self.center_next_shell > bound {
+            self.center_shells_exhausted = true;
+            self.stats.current_radius =
+                self.stats.current_radius.max(self.settings.radius.max(0.0));
+            return false;
         }
 
-        let mut indices: Vec<u64> = (0..self.spots.len() as u64).collect();
-        indices.sort_by(|left, right| {
-            let left_spot = &self.spots[*left as usize];
-            let right_spot = &self.spots[*right as usize];
-            left_spot
-                .center_distance_squared()
-                .total_cmp(&right_spot.center_distance_squared())
-                .then_with(|| left_spot.index().cmp(&right_spot.index()))
-        });
-        self.center_ordered_spot_indices = Some(indices);
+        let shell = self.center_next_shell;
+        self.center_next_shell += 1;
+        for spot in center_shell_spots(self.settings.board, shell) {
+            self.center_queue.push(CenterQueueEntry {
+                distance_squared: spot.center_distance_squared(),
+                spot_index: spot.index(),
+                spot,
+            });
+        }
+        self.stats.current_radius = self.stats.current_radius.max(shell as f64);
+        if shell == bound {
+            self.center_shells_exhausted = true;
+            self.stats.current_radius =
+                self.stats.current_radius.max(self.settings.radius.max(0.0));
+        }
+        true
     }
 
     fn spot_at(&mut self, index: usize) -> Option<BoardSpot> {
@@ -1143,6 +1222,108 @@ fn lattice_attack_targets(
             .collect(),
         BoardKind::ContinuousArchimedean => Vec::new(),
     }
+}
+
+fn center_shell_spots(board: BoardKind, shell: u64) -> Vec<BoardSpot> {
+    match board {
+        BoardKind::LatticeSquare => center_square_shell_spots(shell),
+        BoardKind::LatticeHex => center_hex_shell_spots(shell),
+        BoardKind::LatticeTriangle => center_triangle_shell_spots(shell),
+        BoardKind::ContinuousArchimedean => Vec::new(),
+    }
+}
+
+fn center_square_shell_spots(shell: u64) -> Vec<BoardSpot> {
+    if shell == 0 {
+        return vec![BoardSpot::Square {
+            index: 0,
+            coord: SquareCoord::new(0, 0),
+        }];
+    }
+
+    let start = shell.saturating_mul(2).saturating_sub(1).saturating_pow(2);
+    let end = shell
+        .saturating_mul(2)
+        .saturating_add(1)
+        .saturating_pow(2)
+        .saturating_sub(1);
+    (start..=end)
+        .map(|index| BoardSpot::Square {
+            index,
+            coord: SquareSpiral::coord_at_index(index),
+        })
+        .collect()
+}
+
+fn center_hex_shell_spots(shell: u64) -> Vec<BoardSpot> {
+    if shell == 0 {
+        return vec![BoardSpot::Hex {
+            index: 0,
+            coord: AxialCoord::new(0, 0),
+        }];
+    }
+
+    let start = hex_ring_max_index(shell - 1).saturating_add(1);
+    let end = hex_ring_max_index(shell);
+    (start..=end)
+        .map(|index| BoardSpot::Hex {
+            index,
+            coord: HexSpiral::coord_at_index(index),
+        })
+        .collect()
+}
+
+fn center_triangle_shell_spots(shell: u64) -> Vec<BoardSpot> {
+    if shell == 0 {
+        return vec![BoardSpot::Triangle {
+            index: 0,
+            coord: TriangleCoord::new(0, 0),
+            spiral_radius: 0,
+        }];
+    }
+
+    let start = triangular_number(3_u64.saturating_mul(shell - 1)).saturating_add(1);
+    let end = triangular_number(3_u64.saturating_mul(shell));
+    (start..=end)
+        .map(|index| BoardSpot::Triangle {
+            index,
+            coord: TriangleSpiral::coord_at_index(index),
+            spiral_radius: shell,
+        })
+        .collect()
+}
+
+fn min_center_distance_squared_for_shell(board: BoardKind, shell: u64) -> f64 {
+    match board {
+        BoardKind::LatticeSquare => (shell as f64).powi(2),
+        BoardKind::LatticeHex => 3.0 * (shell as f64).powi(2),
+        BoardKind::LatticeTriangle => min_triangle_center_distance_squared_for_shell(shell),
+        BoardKind::ContinuousArchimedean => 0.0,
+    }
+}
+
+fn min_triangle_center_distance_squared_for_shell(shell: u64) -> f64 {
+    if shell == 0 {
+        return 0.0;
+    }
+    if shell == 1 {
+        return 1.0;
+    }
+
+    let n = shell - 1;
+    let u = (n / 2) as f64;
+    let v = -(n as f64);
+    u.mul_add(u, u * v + v * v)
+}
+
+fn triangular_number(n: u64) -> u64 {
+    n.saturating_mul(n.saturating_add(1)) / 2
+}
+
+fn hex_ring_max_index(radius: u64) -> u64 {
+    3_u64
+        .saturating_mul(radius)
+        .saturating_mul(radius.saturating_add(1))
 }
 
 fn square_attack_offsets(piece: PieceSignature) -> Vec<(i64, i64)> {
@@ -1852,6 +2033,183 @@ mod tests {
     }
 
     #[test]
+    fn center_distance_lattice_order_matches_bruteforce_sort() {
+        let radius = 5_u64;
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+        ] {
+            let expected = brute_force_center_distance_order(board, radius);
+            let mut engine = SimulationEngine::new(EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else {
+                    ShapeKind::Square
+                },
+                radius: radius as f64,
+                placement_search: PlacementSearchMode::CenterDistance,
+                custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+                ..EngineSettings::default()
+            });
+            let batch = engine.step_budget(expected.len() as u32, 1_000_000);
+            let got = batch
+                .iter()
+                .map(|placement| placement.spot_index)
+                .collect::<Vec<_>>();
+
+            assert_eq!(got, expected, "board={board:?}");
+        }
+    }
+
+    #[test]
+    fn center_distance_high_radius_first_step_does_not_prebuild_full_lattice() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+        ] {
+            let mut engine = SimulationEngine::new(EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else {
+                    ShapeKind::Square
+                },
+                radius: 1_500.0,
+                placement_search: PlacementSearchMode::CenterDistance,
+                custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+                ..EngineSettings::default()
+            });
+            let batch = engine.step_budget(1, 1);
+
+            assert_eq!(batch.len(), 1, "board={board:?}");
+            assert_eq!(batch[0].spot_index, 0, "board={board:?}");
+            assert!(
+                engine.stats().current_radius < 10.0,
+                "board={board:?} prebuilt too much radius: {}",
+                engine.stats().current_radius
+            );
+            assert!(!engine.stats().exhausted, "board={board:?}");
+        }
+    }
+
+    #[test]
+    fn continuous_center_distance_high_radius_starts_without_prebuilding_full_radius() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            shape: ShapeKind::Circle,
+            radius: 1_500.0,
+            piece_radius: 0.50,
+            placement_search: PlacementSearchMode::CenterDistance,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(1, 1);
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].spot_index, 0);
+        assert!(engine.stats().current_radius < 10.0);
+        assert!(!engine.stats().exhausted);
+    }
+
+    #[test]
+    fn triangle_center_shell_minimum_matches_shell_scan() {
+        for shell in 0..128 {
+            let scanned = center_triangle_shell_spots(shell)
+                .iter()
+                .map(BoardSpot::center_distance_squared)
+                .min_by(f64::total_cmp)
+                .unwrap();
+            let formula = min_triangle_center_distance_squared_for_shell(shell);
+
+            assert!(
+                (scanned - formula).abs() <= 1.0e-9,
+                "shell={shell}, scanned={scanned}, formula={formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn center_distance_lattice_modes_exhaust_full_radius_bounds() {
+        let radius = 16_u64;
+        let triangle_last = (3 * radius) * (3 * radius + 1) / 2;
+        for (board, expected_count, last_spiral_index) in [
+            (
+                BoardKind::LatticeSquare,
+                (2 * radius + 1).pow(2),
+                (2 * radius + 1).pow(2) - 1,
+            ),
+            (
+                BoardKind::LatticeHex,
+                1 + 3 * radius * (radius + 1),
+                3 * radius * (radius + 1),
+            ),
+            (BoardKind::LatticeTriangle, triangle_last + 1, triangle_last),
+        ] {
+            let mut engine = SimulationEngine::new(EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else {
+                    ShapeKind::Square
+                },
+                radius: radius as f64,
+                placement_search: PlacementSearchMode::CenterDistance,
+                custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+                ..EngineSettings::default()
+            });
+            let batch = engine.step_budget(expected_count as u32 + 1, 10_000_000);
+            let indices = batch
+                .iter()
+                .map(|placement| placement.spot_index)
+                .collect::<FxHashSet<_>>();
+
+            assert_eq!(batch.len(), expected_count as usize, "board={board:?}");
+            assert!(engine.stats().exhausted, "board={board:?}");
+            assert!(
+                indices.contains(&last_spiral_index),
+                "board={board:?} did not include the outer boundary's final spiral spot"
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_center_distance_matches_spiral_order_because_radius_is_monotonic() {
+        let settings = EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            shape: ShapeKind::Circle,
+            radius: 6.0,
+            piece_radius: 0.50,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        };
+        let mut spiral_path = SimulationEngine::new(EngineSettings {
+            placement_search: PlacementSearchMode::SpiralPath,
+            ..settings.clone()
+        });
+        let mut center_distance = SimulationEngine::new(EngineSettings {
+            placement_search: PlacementSearchMode::CenterDistance,
+            ..settings
+        });
+
+        let spiral_batch = spiral_path.step_budget(128, 1_000_000);
+        let center_batch = center_distance.step_budget(128, 1_000_000);
+        let spiral_indices = spiral_batch
+            .iter()
+            .map(|placement| placement.spot_index)
+            .collect::<Vec<_>>();
+        let center_indices = center_batch
+            .iter()
+            .map(|placement| placement.spot_index)
+            .collect::<Vec<_>>();
+
+        assert_eq!(center_indices, spiral_indices);
+        assert!(center_distance.stats().exhausted);
+    }
+
+    #[test]
     fn piece_seeking_prime_knights_fill_every_spot() {
         let settings = EngineSettings {
             army_preset: ArmyPreset::PrimeKnight,
@@ -1987,6 +2345,18 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    fn brute_force_center_distance_order(board: BoardKind, radius: u64) -> Vec<u64> {
+        let mut spots = (0..=radius)
+            .flat_map(|shell| center_shell_spots(board, shell))
+            .collect::<Vec<_>>();
+        spots.sort_by(|left, right| {
+            left.center_distance_squared()
+                .total_cmp(&right.center_distance_squared())
+                .then_with(|| left.index().cmp(&right.index()))
+        });
+        spots.into_iter().map(|spot| spot.index()).collect()
     }
 
     fn placements_are_enemies(
