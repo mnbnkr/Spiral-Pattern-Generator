@@ -6,13 +6,16 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::engine::spatial::{ContinuousSpatialHash, LatticeSpatialIndex};
 use crate::math::{
     ArchimedeanSpiral, ArchimedeanSpots, AxialCoord, HexSpiral, Point2, SquareCoord, SquareSpiral,
-    TriangleCoord, TriangleSpiral, attack_circle_hits_body,
-    attack_circle_hits_body_distance_squared, attack_radius_from_move, bodies_overlap,
+    TriangleCoord, TriangleSpiral, attack_circle_hits_body_distance_squared,
+    attack_radius_from_move, bodies_overlap,
 };
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
     EngineStats, PieceColor, PieceSignature, Placement, PlacementSearchMode, ShapeKind, SpotCoord,
+    normalize_prime_modulo_divisor,
 };
+
+const CONTINUOUS_CENTER_STREAMS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimulationMode {
@@ -54,25 +57,6 @@ struct PlacedPiece {
     attack_radius: f64,
 }
 
-#[derive(Clone, Debug, Default)]
-struct PassiveAttackSummary {
-    blocked: bool,
-    color_groups: FxHashSet<u64>,
-    move_groups: FxHashSet<(i32, i32)>,
-}
-
-impl PassiveAttackSummary {
-    fn add_attacker(&mut self, attacker: &PlacedPiece) {
-        self.color_groups.insert(attacker.color_group);
-        self.move_groups.insert(attacker.move_group);
-    }
-
-    #[must_use]
-    fn has_attacks(&self) -> bool {
-        !self.color_groups.is_empty() || !self.move_groups.is_empty()
-    }
-}
-
 #[derive(Clone, Debug)]
 enum BoardSpot {
     Square {
@@ -99,6 +83,7 @@ enum BoardSpot {
 struct CenterQueueEntry {
     distance_squared: f64,
     spot_index: u64,
+    continuous_stream: Option<usize>,
     spot: BoardSpot,
 }
 
@@ -207,10 +192,10 @@ pub struct SimulationEngine {
     stats: EngineStats,
     next_id: u64,
     next_army_index: u64,
-    custom_spiral_path_scan_order_indices: Vec<u64>,
-    custom_center_distance_scan_order_indices: Vec<u64>,
-    next_piece_spot_order_index: u64,
-    piece_seek_candidate_index: Option<usize>,
+    custom_spot_order_indices: Vec<u64>,
+    next_prime_candidate_index: usize,
+    shared_prime_spot_order_index: u64,
+    prime_color_spot_order_indices: FxHashMap<u64, u64>,
     spots: Vec<BoardSpot>,
     spots_exhausted: bool,
     first_out_of_radius_spot: Option<BoardSpot>,
@@ -222,13 +207,14 @@ pub struct SimulationEngine {
     hex_spiral: HexSpiral,
     triangle_spiral: TriangleSpiral,
     continuous_spiral: ArchimedeanSpots,
+    continuous_center_spirals: Vec<ArchimedeanSpots>,
+    continuous_center_streams_exhausted: Vec<bool>,
     occupied_spots: FxHashMap<u64, u64>,
     lattice_index: LatticeSpatialIndex,
     continuous_index: ContinuousSpatialHash,
     max_continuous_attack_radius: f64,
     placed: Vec<PlacedPiece>,
     prime_cache: Vec<u32>,
-    prime_used: Vec<bool>,
     min_gap_seen: Option<f64>,
     max_gap_seen: Option<f64>,
 }
@@ -237,17 +223,20 @@ impl SimulationEngine {
     #[must_use]
     pub fn new(settings: EngineSettings) -> Self {
         let mode = SimulationMode::from_preset(settings.army_preset);
+        let custom_army_len = settings.custom_army.len();
         let continuous_spiral = ArchimedeanSpiral::spots(settings.continuous_offset);
+        let continuous_center_spirals = continuous_center_spirals(&settings);
+        let continuous_center_streams_exhausted = vec![false; continuous_center_spirals.len()];
         Self {
             settings,
             mode,
             stats: EngineStats::default(),
             next_id: 0,
             next_army_index: 0,
-            custom_spiral_path_scan_order_indices: Vec::new(),
-            custom_center_distance_scan_order_indices: Vec::new(),
-            next_piece_spot_order_index: 0,
-            piece_seek_candidate_index: None,
+            custom_spot_order_indices: vec![0; custom_army_len],
+            next_prime_candidate_index: 0,
+            shared_prime_spot_order_index: 0,
+            prime_color_spot_order_indices: FxHashMap::default(),
             spots: Vec::new(),
             spots_exhausted: false,
             first_out_of_radius_spot: None,
@@ -259,13 +248,14 @@ impl SimulationEngine {
             hex_spiral: HexSpiral::new(),
             triangle_spiral: TriangleSpiral::new(),
             continuous_spiral,
+            continuous_center_spirals,
+            continuous_center_streams_exhausted,
             occupied_spots: FxHashMap::default(),
             lattice_index: LatticeSpatialIndex::new(),
             continuous_index: ContinuousSpatialHash::new(2.0),
             max_continuous_attack_radius: 0.0,
             placed: Vec::new(),
             prime_cache: Vec::new(),
-            prime_used: Vec::new(),
             min_gap_seen: None,
             max_gap_seen: None,
         }
@@ -350,54 +340,23 @@ impl SimulationEngine {
             return None;
         }
 
+        self.ensure_custom_spot_cursor_capacity(army_len);
         let army_index = (self.next_army_index as usize) % army_len;
-        match self.settings.placement_search {
-            PlacementSearchMode::SpiralPath => {
-                self.next_spiral_path_spot_seeking_placement(remaining_work, army_len, army_index)
-            }
-            PlacementSearchMode::CenterDistance => self
-                .next_center_distance_spot_seeking_placement(remaining_work, army_len, army_index),
-        }
-    }
-
-    fn next_spiral_path_spot_seeking_placement(
-        &mut self,
-        remaining_work: &mut u64,
-        army_len: usize,
-        army_index: usize,
-    ) -> Option<Placement> {
-        self.ensure_custom_scan_cursors(army_len);
-        let mut scan_index = self.custom_spiral_path_scan_order_indices[army_index];
         let piece = self.custom_candidate(army_index);
+        let mut spot_order_index = self.custom_spot_order_indices[army_index];
 
         while *remaining_work > 0 {
-            let Some(spot) = self.spot_at_search_order(scan_index) else {
+            let Some(spot) = self.spot_at_search_order(spot_order_index) else {
+                self.custom_spot_order_indices[army_index] = spot_order_index;
                 self.stats.exhausted = true;
                 return None;
             };
-            scan_index += 1;
+            spot_order_index += 1;
+            self.custom_spot_order_indices[army_index] = spot_order_index;
             *remaining_work -= 1;
 
-            if self.occupied_spots.contains_key(&spot.index()) {
-                continue;
-            }
-
             self.stats.spots_tested += 1;
-
-            let summary = self.passive_attack_summary(&spot);
-            if summary.blocked || self.passive_summary_impossible_for_custom_candidates(&summary) {
-                self.stats.skipped_spots += 1;
-                continue;
-            }
-
-            if self.passive_summary_rejects_candidate(&summary, &piece) {
-                self.stats.passive_rejections += 1;
-                self.stats.skipped_spots += 1;
-                continue;
-            }
-
             if self.is_valid_candidate(&spot, &piece) {
-                self.custom_spiral_path_scan_order_indices[army_index] = scan_index;
                 self.next_army_index += 1;
                 return Some(self.place_piece(spot, piece));
             }
@@ -405,247 +364,34 @@ impl SimulationEngine {
             self.stats.skipped_spots += 1;
         }
 
-        self.custom_spiral_path_scan_order_indices[army_index] = scan_index;
-        None
-    }
-
-    fn next_center_distance_spot_seeking_placement(
-        &mut self,
-        remaining_work: &mut u64,
-        army_len: usize,
-        army_index: usize,
-    ) -> Option<Placement> {
-        self.ensure_custom_scan_cursors(army_len);
-        let mut order_index = self.custom_center_distance_scan_order_indices[army_index];
-        let piece = self.custom_candidate(army_index);
-
-        while *remaining_work > 0 {
-            let Some(spot) = self.spot_at_search_order(order_index) else {
-                self.stats.exhausted = true;
-                return None;
-            };
-            order_index += 1;
-            *remaining_work -= 1;
-
-            if self.occupied_spots.contains_key(&spot.index()) {
-                continue;
-            }
-
-            self.stats.spots_tested += 1;
-
-            let summary = self.passive_attack_summary(&spot);
-            if summary.blocked || self.passive_summary_impossible_for_custom_candidates(&summary) {
-                self.stats.skipped_spots += 1;
-                continue;
-            }
-
-            if self.passive_summary_rejects_candidate(&summary, &piece) {
-                self.stats.passive_rejections += 1;
-                self.stats.skipped_spots += 1;
-                continue;
-            }
-
-            if self.is_valid_candidate(&spot, &piece) {
-                self.custom_center_distance_scan_order_indices[army_index] = order_index;
-                self.next_army_index += 1;
-                return Some(self.place_piece(spot, piece));
-            }
-
-            self.stats.skipped_spots += 1;
-        }
-
-        self.custom_center_distance_scan_order_indices[army_index] = order_index;
         None
     }
 
     fn next_piece_seeking_placement(&mut self, remaining_work: &mut u64) -> Option<Placement> {
+        let piece = self.prime_candidate(self.next_prime_candidate_index);
+        let mut spot_order_index = self.prime_spot_order_index(&piece);
+
         while *remaining_work > 0 {
-            let Some(spot) = self.spot_at_search_order(self.next_piece_spot_order_index) else {
+            let Some(spot) = self.spot_at_search_order(spot_order_index) else {
+                self.set_prime_spot_order_index(&piece, spot_order_index);
                 self.stats.exhausted = true;
                 return None;
             };
-            if !self.should_skip_piece_seeking_spot(&spot) {
-                break;
-            }
-
-            self.next_piece_spot_order_index += 1;
-            self.piece_seek_candidate_index = None;
-            self.stats.spots_tested += 1;
-            self.stats.skipped_spots += 1;
-            *remaining_work -= 1;
-        }
-
-        if *remaining_work == 0 {
-            return None;
-        }
-
-        let Some(spot) = self.spot_at_search_order(self.next_piece_spot_order_index) else {
-            self.stats.exhausted = true;
-            return None;
-        };
-        let summary = self.passive_attack_summary(&spot);
-        let mut candidate_index = self
-            .piece_seek_candidate_index
-            .unwrap_or_else(|| self.lowest_unused_prime_index());
-
-        while *remaining_work > 0 {
-            self.ensure_prime_used_capacity(candidate_index);
-            if self.prime_used[candidate_index] {
-                candidate_index += 1;
-                continue;
-            }
-
-            let piece = self.prime_candidate(candidate_index);
+            spot_order_index += 1;
+            self.set_prime_spot_order_index(&piece, spot_order_index);
             self.stats.piece_candidates_tested += 1;
+            self.stats.spots_tested += 1;
             *remaining_work -= 1;
-
-            if self.passive_summary_rejects_candidate(&summary, &piece) {
-                self.stats.passive_rejections += 1;
-                candidate_index += 1;
-                continue;
-            }
 
             if self.is_valid_candidate(&spot, &piece) {
-                self.prime_used[candidate_index] = true;
-                self.next_piece_spot_order_index += 1;
-                self.piece_seek_candidate_index = None;
+                self.next_prime_candidate_index += 1;
                 return Some(self.place_piece(spot, piece));
             }
 
-            candidate_index += 1;
+            self.stats.skipped_spots += 1;
         }
 
-        self.piece_seek_candidate_index = Some(candidate_index);
         None
-    }
-
-    fn should_skip_piece_seeking_spot(&self, spot: &BoardSpot) -> bool {
-        let summary = self.passive_attack_summary(spot);
-        summary.blocked || self.passive_summary_impossible_for_prime_candidates(&summary)
-    }
-
-    fn passive_attack_summary(&self, spot: &BoardSpot) -> PassiveAttackSummary {
-        let mut summary = PassiveAttackSummary::default();
-
-        match self.settings.board {
-            BoardKind::LatticeSquare | BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
-                let Some(coord) = spot.lattice_coord() else {
-                    summary.blocked = true;
-                    return summary;
-                };
-
-                if self.lattice_index.contains(coord) {
-                    summary.blocked = true;
-                    return summary;
-                }
-
-                for attacker_id in self.lattice_index.attackers_at(coord) {
-                    if let Some(attacker) = self.placed.get(*attacker_id as usize) {
-                        summary.add_attacker(attacker);
-                    }
-                }
-            }
-            BoardKind::ContinuousArchimedean => {
-                let center = spot.center();
-                let body_radius = self.settings.piece_radius;
-
-                for id in self.continuous_body_probe_ids(center, body_radius) {
-                    let Some(existing) = self.placed.get(id as usize) else {
-                        continue;
-                    };
-
-                    if bodies_overlap(center, existing.center, body_radius) {
-                        summary.blocked = true;
-                        return summary;
-                    }
-                }
-
-                for id in self.continuous_passive_probe_ids(center, body_radius) {
-                    let Some(existing) = self.placed.get(id as usize) else {
-                        continue;
-                    };
-
-                    if attack_circle_hits_body(
-                        existing.center,
-                        center,
-                        existing.attack_radius,
-                        body_radius,
-                    ) {
-                        summary.add_attacker(existing);
-                    }
-                }
-            }
-        }
-
-        summary
-    }
-
-    fn passive_summary_impossible_for_prime_candidates(
-        &self,
-        summary: &PassiveAttackSummary,
-    ) -> bool {
-        if self.enemy_mode_uses_color() {
-            if summary.color_groups.len() > 1 {
-                return true;
-            }
-
-            if self.required_color_group_is_unavailable(&summary.color_groups) {
-                return true;
-            }
-        }
-
-        if self.enemy_mode_uses_attack_set() && summary.has_attacks() {
-            return true;
-        }
-
-        false
-    }
-
-    fn passive_summary_impossible_for_custom_candidates(
-        &self,
-        summary: &PassiveAttackSummary,
-    ) -> bool {
-        (self.enemy_mode_uses_color() && summary.color_groups.len() > 1)
-            || (self.enemy_mode_uses_attack_set() && summary.move_groups.len() > 1)
-    }
-
-    fn passive_summary_rejects_candidate(
-        &self,
-        summary: &PassiveAttackSummary,
-        candidate: &CandidatePiece,
-    ) -> bool {
-        if self.enemy_mode_uses_color()
-            && summary
-                .color_groups
-                .iter()
-                .any(|group| *group != candidate.color_group)
-        {
-            return true;
-        }
-
-        self.enemy_mode_uses_attack_set()
-            && summary
-                .move_groups
-                .iter()
-                .any(|group| *group != candidate.move_group)
-    }
-
-    fn required_color_group_is_unavailable(&self, passive_groups: &FxHashSet<u64>) -> bool {
-        if passive_groups.len() > 1 {
-            return true;
-        }
-
-        let Some(&required_group) = passive_groups.iter().next() else {
-            return false;
-        };
-
-        match self.settings.army_preset {
-            ArmyPreset::PrimeKnight => false,
-            ArmyPreset::PrimeGap => {
-                required_group == 1 && self.prime_used.first().copied().unwrap_or(false)
-            }
-            ArmyPreset::CustomFinite => false,
-        }
     }
 
     fn place_piece(&mut self, spot: BoardSpot, piece: CandidatePiece) -> Placement {
@@ -813,11 +559,6 @@ impl SimulationEngine {
         true
     }
 
-    fn continuous_body_probe_ids(&self, center: Point2, body_radius: f64) -> Vec<u64> {
-        self.continuous_index
-            .nearby_ids(center, 2.0 * body_radius.max(0.0))
-    }
-
     fn continuous_passive_probe_ids(&self, center: Point2, body_radius: f64) -> Vec<u64> {
         if self.max_continuous_attack_radius <= 0.0 {
             return Vec::new();
@@ -874,19 +615,40 @@ impl SimulationEngine {
         )
     }
 
-    fn ensure_custom_scan_cursors(&mut self, army_len: usize) {
-        if self.custom_spiral_path_scan_order_indices.len() != army_len {
-            self.custom_spiral_path_scan_order_indices
-                .resize(army_len, 0);
-        }
-        if self.custom_center_distance_scan_order_indices.len() != army_len {
-            self.custom_center_distance_scan_order_indices
-                .resize(army_len, 0);
+    fn custom_army_len(&self) -> usize {
+        self.settings.custom_army.len()
+    }
+
+    fn ensure_custom_spot_cursor_capacity(&mut self, army_len: usize) {
+        match self.custom_spot_order_indices.len().cmp(&army_len) {
+            Ordering::Less => self.custom_spot_order_indices.resize(army_len, 0),
+            Ordering::Greater => self.custom_spot_order_indices.truncate(army_len),
+            Ordering::Equal => {}
         }
     }
 
-    fn custom_army_len(&self) -> usize {
-        self.settings.custom_army.len()
+    fn prime_spot_order_index(&self, candidate: &CandidatePiece) -> u64 {
+        if self.prime_uses_color_group_cursors() {
+            self.prime_color_spot_order_indices
+                .get(&candidate.color_group)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            self.shared_prime_spot_order_index
+        }
+    }
+
+    fn set_prime_spot_order_index(&mut self, candidate: &CandidatePiece, spot_order_index: u64) {
+        if self.prime_uses_color_group_cursors() {
+            self.prime_color_spot_order_indices
+                .insert(candidate.color_group, spot_order_index);
+        } else {
+            self.shared_prime_spot_order_index = spot_order_index;
+        }
+    }
+
+    fn prime_uses_color_group_cursors(&self) -> bool {
+        self.settings.enemy_mode == EnemyMode::Color
     }
 
     fn requires_reset_for_settings(&self, next: &EngineSettings) -> bool {
@@ -1000,7 +762,7 @@ impl SimulationEngine {
 
     fn center_ordered_spot(&mut self, order_index: u64) -> Option<BoardSpot> {
         if self.settings.board == BoardKind::ContinuousArchimedean {
-            return self.spot_at(index_from_u64(order_index)?);
+            return self.continuous_center_ordered_spot(order_index);
         }
 
         let order_index = index_from_u64(order_index)?;
@@ -1011,6 +773,100 @@ impl SimulationEngine {
         }
 
         self.center_ordered_spots.get(order_index).cloned()
+    }
+
+    fn continuous_center_ordered_spot(&mut self, order_index: u64) -> Option<BoardSpot> {
+        let order_index = index_from_u64(order_index)?;
+        while self.center_ordered_spots.len() <= order_index {
+            if !self.advance_continuous_center_order() {
+                return None;
+            }
+        }
+
+        self.center_ordered_spots.get(order_index).cloned()
+    }
+
+    fn advance_continuous_center_order(&mut self) -> bool {
+        loop {
+            if self.center_queue.is_empty() && !self.seed_continuous_center_frontier() {
+                return false;
+            }
+
+            if let Some(entry) = self.center_queue.pop() {
+                if let Some(stream_index) = entry.continuous_stream {
+                    self.push_next_continuous_center_stream_spot(stream_index);
+                }
+                self.center_ordered_spots.push(entry.spot);
+                return true;
+            }
+        }
+    }
+
+    fn seed_continuous_center_frontier(&mut self) -> bool {
+        if self.center_shells_exhausted {
+            return false;
+        }
+
+        for stream_index in 0..self.continuous_center_spirals.len() {
+            self.push_next_continuous_center_stream_spot(stream_index);
+        }
+
+        !self.center_queue.is_empty()
+    }
+
+    fn push_next_continuous_center_stream_spot(&mut self, stream_index: usize) -> bool {
+        if self
+            .continuous_center_streams_exhausted
+            .get(stream_index)
+            .copied()
+            .unwrap_or(true)
+        {
+            return false;
+        }
+
+        let Some(raw_spot) = self.continuous_center_spirals[stream_index].next() else {
+            self.mark_continuous_center_stream_exhausted(stream_index);
+            return false;
+        };
+        let spot_index = continuous_center_spot_index(stream_index, raw_spot.index);
+        let spot = BoardSpot::Continuous {
+            index: spot_index,
+            theta: raw_spot.theta,
+            center: raw_spot.center,
+        };
+
+        if !self.spot_within_generation_radius(&spot) {
+            self.mark_continuous_center_stream_exhausted(stream_index);
+            return false;
+        }
+
+        self.stats.current_radius = self.stats.current_radius.max(spot.generation_radius());
+        self.center_queue.push(CenterQueueEntry {
+            distance_squared: spot.center_distance_squared(),
+            spot_index,
+            continuous_stream: Some(stream_index),
+            spot,
+        });
+        true
+    }
+
+    fn mark_continuous_center_stream_exhausted(&mut self, stream_index: usize) {
+        if let Some(exhausted) = self
+            .continuous_center_streams_exhausted
+            .get_mut(stream_index)
+        {
+            *exhausted = true;
+        }
+
+        if self
+            .continuous_center_streams_exhausted
+            .iter()
+            .all(|exhausted| *exhausted)
+        {
+            self.center_shells_exhausted = true;
+            self.stats.current_radius =
+                self.stats.current_radius.max(self.settings.radius.max(0.0));
+        }
     }
 
     fn advance_center_order(&mut self) -> bool {
@@ -1064,6 +920,7 @@ impl SimulationEngine {
             self.center_queue.push(CenterQueueEntry {
                 distance_squared: spot.center_distance_squared(),
                 spot_index: spot.index(),
+                continuous_stream: None,
                 spot,
             });
         }
@@ -1167,23 +1024,6 @@ impl SimulationEngine {
         }
     }
 
-    fn ensure_prime_used_capacity(&mut self, index: usize) {
-        if self.prime_used.len() <= index {
-            self.prime_used.resize(index + 1, false);
-        }
-    }
-
-    fn lowest_unused_prime_index(&mut self) -> usize {
-        let mut index = 0;
-        loop {
-            self.ensure_prime_used_capacity(index);
-            if !self.prime_used[index] {
-                return index;
-            }
-            index += 1;
-        }
-    }
-
     fn prime(&mut self, index: usize) -> u32 {
         let mut candidate = if let Some(last) = self.prime_cache.last() {
             last + if *last == 2 { 1 } else { 2 }
@@ -1231,6 +1071,32 @@ fn center_shell_spots(board: BoardKind, shell: u64) -> Vec<BoardSpot> {
         BoardKind::LatticeTriangle => center_triangle_shell_spots(shell),
         BoardKind::ContinuousArchimedean => Vec::new(),
     }
+}
+
+fn continuous_center_spirals(settings: &EngineSettings) -> Vec<ArchimedeanSpots> {
+    (0..CONTINUOUS_CENTER_STREAMS)
+        .map(|stream_index| {
+            ArchimedeanSpiral::spots(continuous_center_stream_offset(
+                settings.continuous_offset,
+                stream_index,
+            ))
+        })
+        .collect()
+}
+
+fn continuous_center_stream_offset(base_offset: f64, stream_index: usize) -> f64 {
+    let base_offset = base_offset.clamp(0.0, 1.0);
+    if stream_index == 0 {
+        return base_offset;
+    }
+
+    (base_offset + stream_index as f64 / CONTINUOUS_CENTER_STREAMS as f64).rem_euclid(1.0)
+}
+
+fn continuous_center_spot_index(stream_index: usize, local_index: u64) -> u64 {
+    local_index
+        .saturating_mul(CONTINUOUS_CENTER_STREAMS as u64)
+        .saturating_add(stream_index as u64)
 }
 
 fn center_square_shell_spots(shell: u64) -> Vec<BoardSpot> {
@@ -1447,7 +1313,7 @@ fn continuous_piece_radius_changes_simulation(
 }
 
 fn prime_knight_color_bucket(value: u32, divisor: u32) -> (u32, f64) {
-    let divisor = divisor.max(2);
+    let divisor = normalize_prime_modulo_divisor(divisor);
     let half = (divisor / 2).max(1);
     let rem = value % divisor;
     let bucket = rem.min(divisor - rem);
@@ -1494,6 +1360,7 @@ fn is_prime_with_cache(n: u32, primes: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::attack_circle_hits_body;
 
     #[test]
     fn engine_emits_square_batch() {
@@ -1650,6 +1517,75 @@ mod tests {
     }
 
     #[test]
+    fn generation_bounds_exhaust_across_boards_presets_enemy_modes_and_search_modes() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+            BoardKind::ContinuousArchimedean,
+        ] {
+            for placement_search in [
+                PlacementSearchMode::SpiralPath,
+                PlacementSearchMode::CenterDistance,
+            ] {
+                for army_preset in [
+                    ArmyPreset::CustomFinite,
+                    ArmyPreset::PrimeKnight,
+                    ArmyPreset::PrimeGap,
+                ] {
+                    for enemy_mode in [
+                        EnemyMode::AttackSet,
+                        EnemyMode::Color,
+                        EnemyMode::ColorAttackSet,
+                    ] {
+                        let radius = if board == BoardKind::ContinuousArchimedean {
+                            1.5
+                        } else {
+                            1.0
+                        };
+                        let mut engine = SimulationEngine::new(EngineSettings {
+                            board,
+                            shape: if board == BoardKind::LatticeTriangle {
+                                ShapeKind::Triangle
+                            } else if board == BoardKind::ContinuousArchimedean {
+                                ShapeKind::Circle
+                            } else {
+                                ShapeKind::Square
+                            },
+                            radius,
+                            piece_radius: 0.50,
+                            placement_search,
+                            army_preset,
+                            enemy_mode,
+                            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+                            ..EngineSettings::default()
+                        });
+                        let mut placements = Vec::new();
+                        for _ in 0..128 {
+                            let batch = engine.step_budget(128, 2_000_000);
+                            placements.extend(batch);
+                            if engine.stats().exhausted {
+                                break;
+                            }
+                        }
+
+                        assert!(
+                            engine.stats().exhausted,
+                            "board={board:?}, search={placement_search:?}, preset={army_preset:?}, enemy={enemy_mode:?}"
+                        );
+                        assert!(
+                            placements
+                                .iter()
+                                .all(|placement| placement_within_radius(placement, board, radius)),
+                            "board={board:?}, search={placement_search:?}, preset={army_preset:?}, enemy={enemy_mode:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn custom_colors_are_order_based_not_gap_based() {
         let settings = EngineSettings {
             custom_army: vec![
@@ -1717,7 +1653,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_two_color_square_knights_match_spiral_readback_sequences() {
+    fn custom_two_color_square_knights_keep_per_row_forward_cursors() {
         let mut engine = SimulationEngine::new(EngineSettings {
             board: BoardKind::LatticeSquare,
             placement_search: PlacementSearchMode::SpiralPath,
@@ -1731,30 +1667,28 @@ mod tests {
         let batch = engine.step_budget(96, 2_000_000);
         assert_eq!(batch.len(), 96);
 
-        let first_knight = [
-            0, 2, 5, 9, 11, 15, 20, 21, 30, 31, 36, 40, 42, 47, 48, 50, 56, 61, 65, 67, 69,
-        ];
-        let second_knight = [
-            1, 3, 4, 6, 10, 12, 24, 25, 34, 35, 37, 41, 44, 49, 55, 57, 58, 63, 64, 66, 68,
-        ];
-
-        let mut readback = batch.clone();
-        readback.sort_by_key(|placement| placement.spot_index);
-        let first_actual: Vec<_> = readback
+        let chronological = batch
             .iter()
-            .filter(|placement| placement.color.key.group == 0)
-            .take(first_knight.len())
             .map(|placement| placement.spot_index)
-            .collect();
-        let second_actual: Vec<_> = readback
-            .iter()
-            .filter(|placement| placement.color.key.group == 1)
-            .take(second_knight.len())
-            .map(|placement| placement.spot_index)
-            .collect();
+            .collect::<Vec<_>>();
 
-        assert_eq!(first_actual, first_knight);
-        assert_eq!(second_actual, second_knight);
+        assert_eq!(&chronological[..8], &[0, 1, 2, 3, 5, 4, 9, 6]);
+        assert!(
+            chronological.windows(2).any(|pair| pair[1] < pair[0]),
+            "per-row cursors should allow later rows to place behind the previous row"
+        );
+        for color_group in [0, 1] {
+            let row_indices = batch
+                .iter()
+                .filter(|placement| placement.color.key.group == color_group)
+                .map(|placement| placement.spot_index)
+                .collect::<Vec<_>>();
+            assert!(
+                row_indices.windows(2).all(|pair| pair[1] > pair[0]),
+                "color_group={color_group}, row_indices={row_indices:?}"
+            );
+        }
+        assert!(engine.stats().passive_rejections > 0);
     }
 
     #[test]
@@ -1826,7 +1760,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_spiral_path_keeps_independent_turn_cursors() {
+    fn custom_spiral_path_alternates_rows_while_each_row_searches_forward() {
         let mut engine = SimulationEngine::new(EngineSettings {
             board: BoardKind::LatticeSquare,
             placement_search: PlacementSearchMode::SpiralPath,
@@ -1840,7 +1774,23 @@ mod tests {
         let batch = engine.step_budget(8, 1_000_000);
 
         let indices: Vec<_> = batch.iter().map(|placement| placement.spot_index).collect();
+        let color_groups: Vec<_> = batch
+            .iter()
+            .map(|placement| placement.color.key.group)
+            .collect();
         assert_eq!(indices, vec![0, 1, 2, 3, 5, 4, 9, 6]);
+        assert_eq!(color_groups, vec![0, 1, 0, 1, 0, 1, 0, 1]);
+        for color_group in [0, 1] {
+            let row_indices = batch
+                .iter()
+                .filter(|placement| placement.color.key.group == color_group)
+                .map(|placement| placement.spot_index)
+                .collect::<Vec<_>>();
+            assert!(
+                row_indices.windows(2).all(|pair| pair[1] > pair[0]),
+                "color_group={color_group}, row_indices={row_indices:?}"
+            );
+        }
     }
 
     #[test]
@@ -2022,7 +1972,7 @@ mod tests {
             placement_search: PlacementSearchMode::CenterDistance,
             army_preset: ArmyPreset::PrimeKnight,
             enemy_mode: EnemyMode::Color,
-            prime_modulo_divisor: 2,
+            prime_modulo_divisor: 6,
             radius: 2.0,
             ..EngineSettings::default()
         });
@@ -2030,6 +1980,39 @@ mod tests {
         let indices: Vec<_> = batch.iter().map(|placement| placement.spot_index).collect();
 
         assert_eq!(indices, vec![0, 1, 3, 5, 7]);
+    }
+
+    #[test]
+    fn prime_modes_place_strict_prime_sequence() {
+        for placement_search in [
+            PlacementSearchMode::SpiralPath,
+            PlacementSearchMode::CenterDistance,
+        ] {
+            for (army_preset, expected) in [
+                (ArmyPreset::PrimeKnight, first_prime_knight_signatures(24)),
+                (ArmyPreset::PrimeGap, first_prime_gap_signatures(24)),
+            ] {
+                let mut engine = SimulationEngine::new(EngineSettings {
+                    board: BoardKind::LatticeHex,
+                    shape: ShapeKind::Hex,
+                    radius: 20.0,
+                    placement_search,
+                    army_preset,
+                    enemy_mode: EnemyMode::AttackSet,
+                    ..EngineSettings::default()
+                });
+                let batch = engine.step_budget(expected.len() as u32, 20_000_000);
+                let pieces = batch
+                    .iter()
+                    .map(|placement| placement.piece)
+                    .collect::<Vec<_>>();
+
+                assert_eq!(
+                    pieces, expected,
+                    "search={placement_search:?}, army={army_preset:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2115,6 +2098,13 @@ mod tests {
     }
 
     #[test]
+    fn continuous_center_distance_preserves_exact_primary_offset() {
+        assert_eq!(continuous_center_stream_offset(1.0, 0), 1.0);
+        assert_eq!(continuous_center_stream_offset(0.0, 0), 0.0);
+        assert!((continuous_center_stream_offset(0.9, 1) - 0.025).abs() < 1.0e-12);
+    }
+
+    #[test]
     fn triangle_center_shell_minimum_matches_shell_scan() {
         for shell in 0..128 {
             let scanned = center_triangle_shell_spots(shell)
@@ -2176,7 +2166,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_center_distance_matches_spiral_order_because_radius_is_monotonic() {
+    fn continuous_center_distance_uses_distinct_center_frontier() {
         let settings = EngineSettings {
             board: BoardKind::ContinuousArchimedean,
             shape: ShapeKind::Circle,
@@ -2205,22 +2195,94 @@ mod tests {
             .map(|placement| placement.spot_index)
             .collect::<Vec<_>>();
 
-        assert_eq!(center_indices, spiral_indices);
+        assert_ne!(center_indices, spiral_indices);
+        assert_eq!(spiral_indices[0], 0);
+        assert_eq!(center_indices[0], 0);
+        assert!(
+            center_indices.windows(2).any(|pair| pair[1] < pair[0]),
+            "center-distance search should not be hidden behind visual spiral-index sorting"
+        );
         assert!(center_distance.stats().exhausted);
     }
 
     #[test]
-    fn piece_seeking_prime_knights_fill_every_spot() {
+    fn prime_knight_color_mode_keeps_strict_prime_order_and_group_cursors() {
         let settings = EngineSettings {
             army_preset: ArmyPreset::PrimeKnight,
             enemy_mode: EnemyMode::Color,
-            prime_modulo_divisor: 2,
+            prime_modulo_divisor: 6,
             ..EngineSettings::default()
         };
         let mut engine = SimulationEngine::new(settings);
-        let batch = engine.step_batch(16);
-        let indices: Vec<_> = batch.iter().map(|p| p.spot_index).collect();
-        assert_eq!(indices, (0..16).collect::<Vec<_>>());
+        let batch = engine.step_budget(16, 5_000_000);
+        let pieces: Vec<_> = batch.iter().map(|p| p.piece).collect();
+
+        assert_eq!(batch.len(), 16);
+        assert_eq!(
+            &pieces[..6],
+            &[
+                PieceSignature::new(1, 2),
+                PieceSignature::new(1, 3),
+                PieceSignature::new(1, 5),
+                PieceSignature::new(1, 7),
+                PieceSignature::new(1, 11),
+                PieceSignature::new(1, 13),
+            ]
+        );
+        for color_group in [0, 1, 2] {
+            let indices = batch
+                .iter()
+                .filter(|placement| placement.color.key.group == color_group)
+                .map(|placement| placement.spot_index)
+                .collect::<Vec<_>>();
+            assert!(
+                indices.windows(2).all(|pair| pair[1] > pair[0]),
+                "color_group={color_group}, indices={indices:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prime_gap_color_mode_keeps_strict_gap_order_and_gap_group_cursors() {
+        let settings = EngineSettings {
+            army_preset: ArmyPreset::PrimeGap,
+            enemy_mode: EnemyMode::Color,
+            ..EngineSettings::default()
+        };
+        let mut engine = SimulationEngine::new(settings);
+        let batch = engine.step_budget(24, 5_000_000);
+        let pieces: Vec<_> = batch.iter().map(|p| p.piece).collect();
+
+        assert_eq!(batch.len(), 24);
+        assert_eq!(
+            &pieces[..6],
+            &[
+                PieceSignature::new(2, 3),
+                PieceSignature::new(3, 5),
+                PieceSignature::new(5, 7),
+                PieceSignature::new(7, 11),
+                PieceSignature::new(11, 13),
+                PieceSignature::new(13, 17),
+            ]
+        );
+
+        let mut groups: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
+        for placement in &batch {
+            groups
+                .entry(placement.color.key.group)
+                .or_default()
+                .push(placement.spot_index);
+        }
+        assert!(
+            groups.values().any(|indices| indices.len() > 1),
+            "test should include at least one repeated gap group"
+        );
+        for (color_group, indices) in groups {
+            assert!(
+                indices.windows(2).all(|pair| pair[1] > pair[0]),
+                "gap_group={color_group}, indices={indices:?}"
+            );
+        }
     }
 
     #[test]
@@ -2344,6 +2406,51 @@ mod tests {
                 )
             }
             _ => false,
+        }
+    }
+
+    fn first_prime_knight_signatures(count: usize) -> Vec<PieceSignature> {
+        first_primes(count)
+            .into_iter()
+            .map(|prime| PieceSignature::new(1, prime as i32))
+            .collect()
+    }
+
+    fn first_prime_gap_signatures(count: usize) -> Vec<PieceSignature> {
+        let primes = first_primes(count + 1);
+        primes
+            .windows(2)
+            .take(count)
+            .map(|pair| PieceSignature::new(pair[0] as i32, pair[1] as i32))
+            .collect()
+    }
+
+    fn first_primes(count: usize) -> Vec<u32> {
+        let mut primes = Vec::with_capacity(count);
+        let mut candidate = 2;
+        while primes.len() < count {
+            if is_prime_with_cache(candidate, &primes) {
+                primes.push(candidate);
+            }
+            candidate += if candidate == 2 { 1 } else { 2 };
+        }
+        primes
+    }
+
+    fn placement_within_radius(placement: &Placement, board: BoardKind, radius: f64) -> bool {
+        match placement.coord {
+            SpotCoord::Square { x, y } => x.abs().max(y.abs()) <= radius.floor() as i64,
+            SpotCoord::Hex { q, r } => {
+                let (x, y, z) = AxialCoord::new(q, r).cube();
+                x.abs().max(y.abs()).max(z.abs()) <= radius.floor() as i64
+            }
+            SpotCoord::Triangle { .. } => {
+                placement.spot_index <= triangular_number(3 * radius.floor() as u64)
+            }
+            SpotCoord::Continuous { x, y, .. } => {
+                board == BoardKind::ContinuousArchimedean
+                    && Point2::new(x, y).radius() <= radius + 1.0e-9
+            }
         }
     }
 

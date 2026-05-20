@@ -5,14 +5,14 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
     Blob, BlobPropertyBag, Document, DragEvent, Element, Event, HtmlAnchorElement,
-    HtmlButtonElement, HtmlElement, HtmlInputElement, HtmlSelectElement, MessageEvent, MouseEvent,
-    Url, WheelEvent, Worker,
+    HtmlButtonElement, HtmlElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent,
+    MessageEvent, MouseEvent, Url, WheelEvent, Worker,
 };
 
 use crate::protocol::{
     AppToWorker, ArmyPreset, BoardKind, CustomPiece, DisplayMode, EnemyMode, EngineSettings,
     EngineStats, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
-    VertexBufferUpdate, WorkerToApp, rainbow_color,
+    VertexBufferUpdate, WorkerToApp, normalize_prime_modulo_divisor, rainbow_color,
 };
 use crate::render::{CanvasRenderer, ExportKind};
 
@@ -67,13 +67,14 @@ pub fn boot_app() -> Result<(), JsValue> {
     console_error_panic_hook::set_once();
 
     let document = current_document()?;
-    let worker = Worker::new("./spg_worker_loader.js")?;
+    let worker = Worker::new(&worker_script_url(&document)?)?;
     let renderer = CanvasRenderer::new("sim-canvas")?;
     let default_settings = EngineSettings::default();
     let settings = read_settings(
         &document,
         default_settings.custom_army.clone(),
         &default_settings,
+        true,
     )?;
 
     let state = Rc::new(RefCell::new(AppState {
@@ -496,7 +497,24 @@ fn update_renderer_snapshot(state: &mut AppState) -> Result<(), JsValue> {
     state.renderer.set_settings(render_settings)?;
     state
         .renderer
-        .set_color_saturation(if state.snapshot_stale { 0.5 } else { 1.0 })
+        .set_color_saturation(if state.snapshot_stale { 0.5 } else { 1.0 })?;
+    sync_generation_border_visibility(state)
+}
+
+fn sync_generation_border_visibility(state: &mut AppState) -> Result<(), JsValue> {
+    state
+        .renderer
+        .set_generation_border_visible(!should_hide_generation_border(state))
+}
+
+fn should_hide_generation_border(state: &AppState) -> bool {
+    state.last_stats.exhausted
+        && !state.running
+        && !state.snapshot_stale
+        && !state.generation_staged
+        && !state.preserve_next_empty_worker_reset
+        && simulation_settings_match(&state.visible_settings, &state.settings)
+        && state.last_stats.current_radius + 1.0e-9 >= state.settings.radius.max(0.0)
 }
 
 fn render_settings_for_snapshot(state: &AppState) -> EngineSettings {
@@ -806,8 +824,11 @@ fn install_canvas_interaction_handlers(
         if event.button() != 0 {
             return;
         }
-        event.prevent_default();
         let mut state = down_state.borrow_mut();
+        if !canvas_pan_enabled(&state.settings) {
+            return;
+        }
+        event.prevent_default();
         state.canvas_dragging = true;
         state.canvas_last_x = event.client_x() as f64;
         state.canvas_last_y = event.client_y() as f64;
@@ -913,7 +934,6 @@ fn install_control_handlers(
         "enemy-mode-select",
         "placement-search-select",
         "army-preset-select",
-        "prime-divisor-input",
     ] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::ResetWorker)?;
     }
@@ -946,11 +966,12 @@ fn install_control_handlers(
     }
     install_same_board_refresh_handler(document, Rc::clone(&state))?;
     install_continuous_offset_blur_handler(document, Rc::clone(&state))?;
+    install_prime_divisor_commit_handlers(document, Rc::clone(&state))?;
 
     install_add_piece_handler(document, Rc::clone(&state))?;
     install_button(document, "start-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        sync_state_from_controls(&document, state)?;
+        sync_state_from_controls(&document, state, true)?;
         commit_pending_radius_change(state, &document, false, true)?;
         if state.running {
             return Ok(());
@@ -972,7 +993,7 @@ fn install_control_handlers(
     })?;
     install_button(document, "pause-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        sync_state_from_controls(&document, state)?;
+        sync_state_from_controls(&document, state, true)?;
         commit_pending_radius_change(state, &document, false, false)?;
         if !state.running {
             return Ok(());
@@ -990,7 +1011,7 @@ fn install_control_handlers(
     })?;
     install_button(document, "step-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        sync_state_from_controls(&document, state)?;
+        sync_state_from_controls(&document, state, true)?;
         commit_pending_radius_change(state, &document, false, true)?;
         if state.running {
             return Ok(());
@@ -1025,7 +1046,7 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let document = current_document()?;
-            sync_state_from_controls(&document, state)?;
+            sync_state_from_controls(&document, state, false)?;
             let download_settings = render_settings_for_download(state);
             let filename =
                 download_filename(&download_settings, state.last_stats, "image-full", "png");
@@ -1047,7 +1068,7 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let document = current_document()?;
-            sync_state_from_controls(&document, state)?;
+            sync_state_from_controls(&document, state, false)?;
             let download_settings = render_settings_for_download(state);
             let filename = download_filename(&download_settings, state.last_stats, "image", "png");
             match state
@@ -1068,7 +1089,7 @@ fn install_control_handlers(
         Rc::clone(&state),
         |state| {
             let document = current_document()?;
-            sync_state_from_controls(&document, state)?;
+            sync_state_from_controls(&document, state, false)?;
             let download_settings = render_settings_for_download(state);
             let filename =
                 download_filename(&download_settings, state.last_stats, "image-half", "jpg");
@@ -1104,7 +1125,7 @@ fn install_settings_handler(
         .get_element_by_id(id)
         .ok_or_else(|| JsValue::from_str(&format!("missing control #{id}")))?;
     let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-        if let Err(error) = sync_settings(&document, Rc::clone(&state), action.clone()) {
+        if let Err(error) = sync_settings(&document, Rc::clone(&state), action.clone(), false) {
             log_error(&error);
         }
     });
@@ -1155,7 +1176,9 @@ fn install_continuous_offset_blur_handler(
             }
         }
 
-        if let Err(error) = sync_settings(&document, Rc::clone(&state), SyncAction::ResetWorker) {
+        if let Err(error) =
+            sync_settings(&document, Rc::clone(&state), SyncAction::ResetWorker, false)
+        {
             log_error(&error);
         }
     });
@@ -1163,6 +1186,60 @@ fn install_continuous_offset_blur_handler(
     offset_input.add_event_listener_with_callback("blur", closure.as_ref().unchecked_ref())?;
     closure.forget();
     Ok(())
+}
+
+fn install_prime_divisor_commit_handlers(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let divisor_input = input(document, "prime-divisor-input")?;
+
+    let blur_document = document.clone();
+    let blur_state = Rc::clone(&state);
+    let blur = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        if let Err(error) = commit_prime_modulo_divisor(&blur_document, Rc::clone(&blur_state)) {
+            log_error(&error);
+        }
+    });
+    divisor_input.add_event_listener_with_callback("blur", blur.as_ref().unchecked_ref())?;
+    divisor_input.add_event_listener_with_callback("change", blur.as_ref().unchecked_ref())?;
+    blur.forget();
+
+    let key_document = document.clone();
+    let key_state = state;
+    let keydown = Closure::<dyn FnMut(KeyboardEvent)>::new(move |event: KeyboardEvent| {
+        if event.key() != "Enter" {
+            return;
+        }
+        event.prevent_default();
+        if let Err(error) = commit_prime_modulo_divisor(&key_document, Rc::clone(&key_state)) {
+            log_error(&error);
+        }
+    });
+    divisor_input.add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref())?;
+    keydown.forget();
+    Ok(())
+}
+
+fn commit_prime_modulo_divisor(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let current = state.borrow().settings.prime_modulo_divisor;
+    let raw = input_value(document, "prime-divisor-input")?;
+    let normalized = raw
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .map(normalize_prime_modulo_divisor)
+        .unwrap_or(current);
+    input(document, "prime-divisor-input")?.set_value(&normalized.to_string());
+
+    if normalized == current {
+        return Ok(());
+    }
+
+    sync_settings(document, state, SyncAction::ResetWorker, true)
 }
 
 fn install_same_board_refresh_handler(
@@ -1216,7 +1293,7 @@ fn install_same_board_refresh_handler(
 
             let settings = {
                 let mut state = timeout_state.borrow_mut();
-                if let Err(error) = sync_state_from_controls(&timeout_document, &mut state) {
+                if let Err(error) = sync_state_from_controls(&timeout_document, &mut state, true) {
                     log_error(&error);
                     return;
                 }
@@ -1290,12 +1367,20 @@ fn install_add_piece_handler(
             .unwrap_or(1);
         let piece = CustomPiece::with_auto_color(a, b);
 
-        state.borrow_mut().settings.custom_army.push(piece);
+        let previous_settings = {
+            let mut state = state.borrow_mut();
+            let previous_settings = state.settings.clone();
+            state.settings.custom_army.push(piece);
+            previous_settings
+        };
 
-        if let Err(error) = render_army_list(&document, Rc::clone(&state)) {
-            log_error(&error);
-        }
-        if let Err(error) = sync_settings(&document, Rc::clone(&state), SyncAction::ResetWorker) {
+        if let Err(error) = sync_settings_with_previous(
+            &document,
+            Rc::clone(&state),
+            SyncAction::ResetWorker,
+            previous_settings,
+            false,
+        ) {
             log_error(&error);
         }
     });
@@ -1341,7 +1426,7 @@ fn install_refresh_handler(
     let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
         let settings = {
             let mut state = state.borrow_mut();
-            if let Err(error) = sync_state_from_controls(&document, &mut state) {
+            if let Err(error) = sync_state_from_controls(&document, &mut state, true) {
                 log_error(&error);
                 return;
             }
@@ -1391,7 +1476,7 @@ fn recreate_worker_with_settings(
     clear_visible: bool,
     status: &str,
 ) -> Result<(), JsValue> {
-    let replacement = Worker::new("./spg_worker_loader.js")?;
+    let replacement = Worker::new(&worker_script_url(document)?)?;
     let generation = {
         let mut state = state.borrow_mut();
         state.worker.set_onmessage(None);
@@ -1429,6 +1514,7 @@ fn recreate_worker_with_settings(
             let renderer_settings = state.settings.clone();
             state.renderer.set_settings(renderer_settings)?;
             state.renderer.set_color_saturation(1.0)?;
+            state.renderer.set_generation_border_visible(true)?;
             state.renderer.clear_placements()?;
             reset_placement_log(&mut state)?;
         } else {
@@ -1618,25 +1704,28 @@ fn install_piece_drag_handlers(
     let drop_state = Rc::clone(&state);
     let drop = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
         event.prevent_default();
-        let moved = {
+        let (moved, previous_settings) = {
             let mut state = drop_state.borrow_mut();
             let Some(from) = state.dragging_army_index.take() else {
                 return;
             };
-            move_custom_piece(&mut state.settings.custom_army, from, index)
+            let previous_settings = state.settings.clone();
+            (
+                move_custom_piece(&mut state.settings.custom_army, from, index),
+                previous_settings,
+            )
         };
 
-        if moved {
-            if let Err(error) = render_army_list(&drop_document, Rc::clone(&drop_state)) {
-                log_error(&error);
-            }
-            if let Err(error) = sync_settings(
+        if moved
+            && let Err(error) = sync_settings_with_previous(
                 &drop_document,
                 Rc::clone(&drop_state),
                 SyncAction::ResetWorker,
-            ) {
-                log_error(&error);
-            }
+                previous_settings,
+                false,
+            )
+        {
+            log_error(&error);
         }
     });
     row.add_event_listener_with_callback("drop", drop.as_ref().unchecked_ref())?;
@@ -1673,11 +1762,24 @@ where
     F: Fn(&mut Vec<CustomPiece>) + 'static,
 {
     let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-        action(&mut state.borrow_mut().settings.custom_army);
-        if let Err(error) = render_army_list(&document, Rc::clone(&state)) {
-            log_error(&error);
-        }
-        if let Err(error) = sync_settings(&document, Rc::clone(&state), SyncAction::ResetWorker) {
+        let previous_settings = {
+            let mut state = state.borrow_mut();
+            let previous_settings = state.settings.clone();
+            let before = state.settings.custom_army.clone();
+            action(&mut state.settings.custom_army);
+            if before == state.settings.custom_army {
+                return;
+            }
+            previous_settings
+        };
+
+        if let Err(error) = sync_settings_with_previous(
+            &document,
+            Rc::clone(&state),
+            SyncAction::ResetWorker,
+            previous_settings,
+            false,
+        ) {
             log_error(&error);
         }
     });
@@ -1705,11 +1807,41 @@ fn sync_settings(
     document: &Document,
     state: Rc<RefCell<AppState>>,
     action: SyncAction,
+    commit_prime_divisor: bool,
 ) -> Result<(), JsValue> {
     let (previous_settings, settings) = {
         let mut state = state.borrow_mut();
-        sync_state_from_controls(document, &mut state)?
+        sync_state_from_controls(document, &mut state, commit_prime_divisor)?
     };
+    apply_synced_settings(document, state, action, previous_settings, settings)
+}
+
+fn sync_settings_with_previous(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+    action: SyncAction,
+    previous_settings: EngineSettings,
+    commit_prime_divisor: bool,
+) -> Result<(), JsValue> {
+    let (previous_settings, settings) = {
+        let mut state = state.borrow_mut();
+        sync_state_from_controls_with_previous(
+            document,
+            &mut state,
+            previous_settings,
+            commit_prime_divisor,
+        )?
+    };
+    apply_synced_settings(document, state, action, previous_settings, settings)
+}
+
+fn apply_synced_settings(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+    action: SyncAction,
+    previous_settings: EngineSettings,
+    settings: EngineSettings,
+) -> Result<(), JsValue> {
     let action = resolve_sync_action(action, &previous_settings, &settings);
 
     render_army_list(document, Rc::clone(&state))?;
@@ -1784,13 +1916,52 @@ fn sync_settings(
 fn sync_state_from_controls(
     document: &Document,
     state: &mut AppState,
+    commit_prime_divisor: bool,
 ) -> Result<(EngineSettings, EngineSettings), JsValue> {
     let previous_settings = state.settings.clone();
     let custom_army = previous_settings.custom_army.clone();
     apply_board_defaults(document, state, &previous_settings)?;
-    let settings = read_settings(document, custom_army, &previous_settings)?;
+    let settings = read_settings(
+        document,
+        custom_army,
+        &previous_settings,
+        commit_prime_divisor,
+    )?;
     update_outputs(document, &settings)?;
     state.settings = settings.clone();
+    if !canvas_pan_enabled(&settings) {
+        state.canvas_dragging = false;
+        if let Some(canvas) = document.get_element_by_id("sim-canvas") {
+            canvas.class_list().remove_1("dragging")?;
+        }
+    }
+    remember_shape_preference(state, settings.board, settings.shape);
+    update_renderer_snapshot(state)?;
+    Ok((previous_settings, settings))
+}
+
+fn sync_state_from_controls_with_previous(
+    document: &Document,
+    state: &mut AppState,
+    previous_settings: EngineSettings,
+    commit_prime_divisor: bool,
+) -> Result<(EngineSettings, EngineSettings), JsValue> {
+    let custom_army = state.settings.custom_army.clone();
+    apply_board_defaults(document, state, &previous_settings)?;
+    let settings = read_settings(
+        document,
+        custom_army,
+        &previous_settings,
+        commit_prime_divisor,
+    )?;
+    update_outputs(document, &settings)?;
+    state.settings = settings.clone();
+    if !canvas_pan_enabled(&settings) {
+        state.canvas_dragging = false;
+        if let Some(canvas) = document.get_element_by_id("sim-canvas") {
+            canvas.class_list().remove_1("dragging")?;
+        }
+    }
     remember_shape_preference(state, settings.board, settings.shape);
     update_renderer_snapshot(state)?;
     Ok((previous_settings, settings))
@@ -1931,6 +2102,7 @@ fn reset_worker_with_settings(
         state.preserve_next_empty_worker_reset = false;
         state.renderer.set_settings(settings.clone())?;
         state.renderer.set_color_saturation(1.0)?;
+        state.renderer.set_generation_border_visible(true)?;
         state.renderer.clear_placements()?;
         reset_placement_log(state)?;
     } else {
@@ -2044,6 +2216,7 @@ fn read_settings(
     document: &Document,
     custom_army: Vec<CustomPiece>,
     fallback: &EngineSettings,
+    commit_prime_divisor: bool,
 ) -> Result<EngineSettings, JsValue> {
     let board = parse_board_kind(&select_value(document, "board-select")?, fallback.board);
 
@@ -2124,13 +2297,32 @@ fn read_settings(
         army_preset,
         custom_army: normalize_custom_army(custom_army),
         continuous_offset,
-        prime_modulo_divisor: input_value(document, "prime-divisor-input")?
-            .parse::<u32>()
-            .unwrap_or(12)
-            .max(2),
+        prime_modulo_divisor: read_prime_modulo_divisor(document, fallback, commit_prime_divisor)?,
         anchor_color_a: input_value(document, "anchor-a-input")?,
         anchor_color_b: input_value(document, "anchor-b-input")?,
     })
+}
+
+fn read_prime_modulo_divisor(
+    document: &Document,
+    fallback: &EngineSettings,
+    commit: bool,
+) -> Result<u32, JsValue> {
+    let raw = input_value(document, "prime-divisor-input")?;
+    let parsed = raw.trim().parse::<u32>().ok();
+    let divisor = if commit {
+        parsed
+            .map(normalize_prime_modulo_divisor)
+            .unwrap_or(fallback.prime_modulo_divisor)
+    } else {
+        parsed
+            .filter(|value| *value >= 6 && value.is_multiple_of(6))
+            .unwrap_or(fallback.prime_modulo_divisor)
+    };
+    if commit {
+        input(document, "prime-divisor-input")?.set_value(&divisor.to_string());
+    }
+    Ok(divisor)
 }
 
 fn parse_board_kind(value: &str, fallback: BoardKind) -> BoardKind {
@@ -2199,6 +2391,7 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
         "zoom-output",
         &format!("x{}", input_value(document, "zoom-slider")?),
     )?;
+    update_canvas_pan_class(document, settings)?;
 
     let custom_display = if settings.army_preset == ArmyPreset::CustomFinite {
         "grid"
@@ -2226,6 +2419,19 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     input(document, "anchor-b-input")?.set_disabled(false);
 
     Ok(())
+}
+
+fn update_canvas_pan_class(document: &Document, settings: &EngineSettings) -> Result<(), JsValue> {
+    document
+        .get_element_by_id("sim-canvas")
+        .ok_or_else(|| JsValue::from_str("missing canvas"))?
+        .class_list()
+        .toggle_with_force("pan-enabled", canvas_pan_enabled(settings))?;
+    Ok(())
+}
+
+fn canvas_pan_enabled(settings: &EngineSettings) -> bool {
+    settings.display_mode == DisplayMode::PixelOneToOne && settings.zoom > 1
 }
 
 fn read_continuous_offset(document: &Document, fallback: f64) -> Result<f64, JsValue> {
@@ -2416,7 +2622,7 @@ fn stats_text(settings: &EngineSettings, stats: EngineStats) -> String {
             )
         }
         ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap => format!(
-            "{} placements | radius {:.2}/{:.2} | {} prime candidates tested | {} skipped spots",
+            "{} placements | radius {:.2}/{:.2} | {} prime spot checks | {} skipped spots",
             stats.placements,
             stats.current_radius,
             settings.radius,
@@ -2463,6 +2669,14 @@ fn current_document() -> Result<Document, JsValue> {
         .ok_or_else(|| JsValue::from_str("window unavailable"))?
         .document()
         .ok_or_else(|| JsValue::from_str("document unavailable"))
+}
+
+fn worker_script_url(document: &Document) -> Result<String, JsValue> {
+    let base = document
+        .base_uri()?
+        .ok_or_else(|| JsValue::from_str("document base URI unavailable"))?;
+    let url = Url::new_with_base("spg_worker_loader.js", &base)?;
+    Ok(url.href())
 }
 
 fn set_status(text: &str) -> Result<(), JsValue> {

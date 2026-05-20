@@ -286,6 +286,12 @@ fn lerp(a: f64, b: f64, t: f64) -> f64 {
     a + (b - a) * t
 }
 
+#[must_use]
+pub fn normalize_prime_modulo_divisor(value: u32) -> u32 {
+    let rounded = value.saturating_add(3) / 6 * 6;
+    rounded.max(6)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EngineSettings {
     pub board: BoardKind,
@@ -514,5 +520,14 @@ mod tests {
     #[test]
     fn visual_progress_defaults_to_enabled() {
         assert!(EngineSettings::default().visual_progress);
+    }
+
+    #[test]
+    fn prime_modulo_divisor_normalizes_to_multiples_of_six() {
+        assert_eq!(normalize_prime_modulo_divisor(0), 6);
+        assert_eq!(normalize_prime_modulo_divisor(2), 6);
+        assert_eq!(normalize_prime_modulo_divisor(8), 6);
+        assert_eq!(normalize_prime_modulo_divisor(10), 12);
+        assert_eq!(normalize_prime_modulo_divisor(15), 18);
     }
 }

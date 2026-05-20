@@ -5,7 +5,7 @@ use web_sys::{
     WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlUniformLocation,
 };
 
-use crate::math::{ArchimedeanSpiral, HexSpiral, SquareSpiral, TriangleSpiral};
+use crate::math::{ArchimedeanSpiral, AxialCoord, HexSpiral, SquareSpiral, TriangleSpiral};
 use crate::protocol::{
     BoardKind, ColorState, DisplayMode, EngineSettings, ShapeKind, VertexBufferUpdate,
 };
@@ -14,7 +14,8 @@ const FLOATS_PER_VERTEX: usize = 5;
 const BYTES_PER_FLOAT: usize = std::mem::size_of::<f32>();
 const INITIAL_VERTEX_CAPACITY: usize = 16_384;
 const MAX_TRACK_POINTS: usize = 160_000;
-const MAX_EXPORT_PIXELS: usize = 64_000_000;
+const MAX_BORDER_POINTS: usize = 4_096;
+const MAX_EXPORT_PIXELS: usize = 128_000_000;
 const MAX_EXPORT_DIMENSION: u32 = 32_767;
 
 const VERTEX_SHADER: &str = r#"
@@ -100,16 +101,21 @@ pub struct CanvasRenderer {
     saturation_uniform: WebGlUniformLocation,
     vertices: Vec<f32>,
     track_vertices: Vec<f32>,
+    border_vertices: Vec<f32>,
     pending_upload: PendingUpload,
     track_upload_pending: bool,
+    border_upload_pending: bool,
     gpu_capacity_floats: usize,
     track_buffer: WebGlBuffer,
+    border_buffer: WebGlBuffer,
     settings: EngineSettings,
     color_state: ColorState,
     color_saturation: f32,
+    generation_border_visible: bool,
     pan_x: f64,
     pan_y: f64,
     track_key: Option<TrackKey>,
+    border_key: Option<BorderKey>,
 }
 
 impl CanvasRenderer {
@@ -149,6 +155,9 @@ impl CanvasRenderer {
         let track_buffer = gl
             .create_buffer()
             .ok_or_else(|| JsValue::from_str("failed to create WebGL track buffer"))?;
+        let border_buffer = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("failed to create WebGL radius border buffer"))?;
 
         gl.clear_color(0.031, 0.035, 0.039, 1.0);
         gl.disable(Gl::DEPTH_TEST);
@@ -171,17 +180,25 @@ impl CanvasRenderer {
             saturation_uniform,
             vertices: Vec::new(),
             track_vertices: Vec::new(),
+            border_vertices: Vec::new(),
             pending_upload: PendingUpload::Full,
             track_upload_pending: true,
+            border_upload_pending: true,
             gpu_capacity_floats: 0,
             track_buffer,
+            border_buffer,
             settings: EngineSettings::default(),
             color_state: ColorState::default(),
             color_saturation: 1.0,
+            generation_border_visible: true,
             pan_x: 0.0,
             pan_y: 0.0,
             track_key: None,
+            border_key: None,
         };
+        renderer
+            .canvas
+            .set_attribute("data-generation-border", "visible")?;
         renderer.resize_to_viewport()?;
         Ok(renderer)
     }
@@ -192,6 +209,12 @@ impl CanvasRenderer {
             self.track_vertices = build_track_vertices(&settings);
             self.track_upload_pending = true;
             self.track_key = next_track_key;
+        }
+        let next_border_key = BorderKey::from_settings(&settings);
+        if next_border_key != self.border_key {
+            self.border_vertices = build_generation_border_vertices(&settings);
+            self.border_upload_pending = true;
+            self.border_key = next_border_key;
         }
         self.settings = settings;
         self.clamp_pan_to_view();
@@ -205,6 +228,15 @@ impl CanvasRenderer {
 
     pub fn set_color_saturation(&mut self, color_saturation: f32) -> Result<(), JsValue> {
         self.color_saturation = color_saturation.clamp(0.0, 1.0);
+        self.redraw()
+    }
+
+    pub fn set_generation_border_visible(&mut self, visible: bool) -> Result<(), JsValue> {
+        self.generation_border_visible = visible;
+        self.canvas.set_attribute(
+            "data-generation-border",
+            if visible { "visible" } else { "hidden" },
+        )?;
         self.redraw()
     }
 
@@ -348,6 +380,8 @@ impl CanvasRenderer {
 
         if self.settings.track_opacity > f32::EPSILON && !self.track_vertices.is_empty() {
             self.draw_track()?;
+        } else if self.generation_border_visible && !self.border_vertices.is_empty() {
+            self.draw_generation_border()?;
         }
 
         if self.vertices.is_empty() {
@@ -403,6 +437,34 @@ impl CanvasRenderer {
             Gl::LINE_STRIP,
             0,
             (self.track_vertices.len() / FLOATS_PER_VERTEX) as i32,
+        );
+        Ok(())
+    }
+
+    fn draw_generation_border(&mut self) -> Result<(), JsValue> {
+        self.gl
+            .bind_buffer(Gl::ARRAY_BUFFER, Some(&self.border_buffer));
+        if self.border_upload_pending {
+            unsafe {
+                let view = js_sys::Float32Array::view(&self.border_vertices);
+                self.gl.buffer_data_with_array_buffer_view(
+                    Gl::ARRAY_BUFFER,
+                    &view,
+                    Gl::STATIC_DRAW,
+                );
+            }
+            self.border_upload_pending = false;
+        }
+
+        self.configure_vertex_attribs();
+        self.gl.uniform1f(Some(&self.point_size_uniform), 1.0);
+        self.gl.uniform1i(Some(&self.shape_uniform), 0);
+        self.gl.uniform1f(Some(&self.alpha_uniform), 0.55);
+        self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
+        self.gl.draw_arrays(
+            Gl::LINE_STRIP,
+            0,
+            (self.border_vertices.len() / FLOATS_PER_VERTEX) as i32,
         );
         Ok(())
     }
@@ -796,6 +858,31 @@ impl TrackKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BorderKey {
+    board: BoardKind,
+    radius_key: u64,
+    track_hidden: bool,
+}
+
+impl BorderKey {
+    fn from_settings(settings: &EngineSettings) -> Option<Self> {
+        let track_hidden = settings.track_opacity <= f32::EPSILON;
+        if !track_hidden {
+            return None;
+        }
+
+        Some(Self {
+            board: settings.board,
+            radius_key: match settings.board {
+                BoardKind::ContinuousArchimedean => settings.radius.max(0.0).to_bits(),
+                _ => settings.radius.max(0.0).floor().to_bits(),
+            },
+            track_hidden,
+        })
+    }
+}
+
 fn rendered_piece_radius(settings: &EngineSettings) -> f64 {
     if settings.shape == ShapeKind::Hex && settings.board == BoardKind::LatticeHex {
         settings.piece_radius * 2.0
@@ -951,6 +1038,81 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     vertices
 }
 
+fn build_generation_border_vertices(settings: &EngineSettings) -> Vec<f32> {
+    if settings.track_opacity > f32::EPSILON {
+        return Vec::new();
+    }
+
+    let mut vertices = Vec::new();
+    match settings.board {
+        BoardKind::LatticeSquare => {
+            let bound = settings.radius.max(0.0).floor();
+            for (x, y) in [
+                (-bound, -bound),
+                (bound, -bound),
+                (bound, bound),
+                (-bound, bound),
+                (-bound, -bound),
+            ] {
+                push_border_vertex(&mut vertices, x, y);
+            }
+        }
+        BoardKind::LatticeHex => {
+            let bound = settings.radius.max(0.0).floor() as i64;
+            let corners = [
+                AxialCoord::new(bound, 0),
+                AxialCoord::new(0, bound),
+                AxialCoord::new(-bound, bound),
+                AxialCoord::new(-bound, 0),
+                AxialCoord::new(0, -bound),
+                AxialCoord::new(bound, -bound),
+                AxialCoord::new(bound, 0),
+            ];
+            for coord in corners {
+                let point = coord.to_point();
+                push_border_vertex(&mut vertices, point.x, point.y);
+            }
+        }
+        BoardKind::LatticeTriangle => {
+            let bound = settings.radius.max(0.0).floor() as u64;
+            push_sampled_closed_ring(
+                &mut vertices,
+                TriangleSpiral::ring(bound).into_iter().map(|coord| {
+                    let point = coord.to_point();
+                    (point.x, point.y)
+                }),
+            );
+        }
+        BoardKind::ContinuousArchimedean => {
+            let radius = settings.radius.max(0.0);
+            let circumference = std::f64::consts::TAU * radius.max(1.0);
+            let segments = (circumference.ceil() as usize).clamp(64, MAX_BORDER_POINTS);
+            for step in 0..=segments {
+                let theta = std::f64::consts::TAU * step as f64 / segments as f64;
+                push_border_vertex(&mut vertices, radius * theta.cos(), radius * theta.sin());
+            }
+        }
+    }
+
+    vertices
+}
+
+fn push_sampled_closed_ring<I>(vertices: &mut Vec<f32>, points: I)
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    let points = points.into_iter().collect::<Vec<_>>();
+    if points.is_empty() {
+        return;
+    }
+
+    let stride = points.len().div_ceil(MAX_BORDER_POINTS).max(1);
+    for point in points.iter().step_by(stride) {
+        push_border_vertex(vertices, point.0, point.1);
+    }
+    push_border_vertex(vertices, points[0].0, points[0].1);
+}
+
 fn push_lattice_track_points<F>(vertices: &mut Vec<f32>, total_points: u64, mut point_at: F)
 where
     F: FnMut(u64) -> (f64, f64),
@@ -995,6 +1157,10 @@ fn checked_rgba_len(pixel_count: usize) -> Result<usize, JsValue> {
 
 fn push_track_vertex(vertices: &mut Vec<f32>, x: f64, y: f64) {
     vertices.extend_from_slice(&[x as f32, y as f32, 0.70, 0.78, 0.86]);
+}
+
+fn push_border_vertex(vertices: &mut Vec<f32>, x: f64, y: f64) {
+    vertices.extend_from_slice(&[x as f32, y as f32, 0.92, 0.96, 1.0]);
 }
 
 fn fill_background(pixels: &mut [u8]) {
@@ -1252,6 +1418,19 @@ mod tests {
         assert_eq!(export_scale(ExportKind::JpegHalf, true, 0.5), 0.5);
         assert_eq!(export_scale(ExportKind::FullPng, false, 0.5), 4.0);
         assert_eq!(export_scale(ExportKind::Png, false, 0.5), 2.0);
+        assert_eq!(export_scale(ExportKind::JpegHalf, false, 0.5), 2.0);
+    }
+
+    #[test]
+    fn strict_export_cap_allows_reported_8003_case_but_keeps_guard() {
+        let width = export_dimension(8002.0, 1.0);
+        let height = export_dimension(8002.0, 1.0);
+        let reported_count = checked_pixel_count(width, height).unwrap();
+        let too_large_count = checked_pixel_count(12_000, 12_000).unwrap();
+
+        assert_eq!((width, height), (8003, 8003));
+        assert!(reported_count <= MAX_EXPORT_PIXELS);
+        assert!(too_large_count > MAX_EXPORT_PIXELS);
     }
 
     #[test]
@@ -1379,6 +1558,75 @@ mod tests {
         let distance = (last[0] as f64).hypot(last[1] as f64);
 
         assert!((distance - settings.radius).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn generation_radius_border_draws_only_when_track_hidden() {
+        let hidden = EngineSettings {
+            board: BoardKind::LatticeSquare,
+            radius: 12.0,
+            track_opacity: 0.0,
+            ..EngineSettings::default()
+        };
+        let mut visible_track = hidden.clone();
+        visible_track.track_opacity = 0.25;
+
+        assert!(BorderKey::from_settings(&hidden).is_some());
+        assert!(!build_generation_border_vertices(&hidden).is_empty());
+        assert!(BorderKey::from_settings(&visible_track).is_none());
+        assert!(build_generation_border_vertices(&visible_track).is_empty());
+    }
+
+    #[test]
+    fn generation_radius_border_uses_board_specific_geometry() {
+        let square = EngineSettings {
+            board: BoardKind::LatticeSquare,
+            radius: 3.9,
+            track_opacity: 0.0,
+            ..EngineSettings::default()
+        };
+        let square_vertices = build_generation_border_vertices(&square);
+        assert_eq!(square_vertices.len() / FLOATS_PER_VERTEX, 5);
+        assert_eq!(&square_vertices[0..2], &[-3.0, -3.0]);
+
+        let hex = EngineSettings {
+            board: BoardKind::LatticeHex,
+            radius: 3.0,
+            track_opacity: 0.0,
+            ..EngineSettings::default()
+        };
+        let hex_vertices = build_generation_border_vertices(&hex);
+        assert_eq!(hex_vertices.len() / FLOATS_PER_VERTEX, 7);
+        assert_eq!(
+            &hex_vertices[0..FLOATS_PER_VERTEX],
+            &hex_vertices[hex_vertices.len() - FLOATS_PER_VERTEX..]
+        );
+
+        let triangle = EngineSettings {
+            board: BoardKind::LatticeTriangle,
+            radius: 3.0,
+            track_opacity: 0.0,
+            ..EngineSettings::default()
+        };
+        let triangle_vertices = build_generation_border_vertices(&triangle);
+        assert!(triangle_vertices.len() / FLOATS_PER_VERTEX > 6);
+        assert_eq!(
+            &triangle_vertices[0..FLOATS_PER_VERTEX],
+            &triangle_vertices[triangle_vertices.len() - FLOATS_PER_VERTEX..]
+        );
+
+        let continuous = EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            radius: 3.25,
+            track_opacity: 0.0,
+            ..EngineSettings::default()
+        };
+        let continuous_vertices = build_generation_border_vertices(&continuous);
+        let first = &continuous_vertices[0..FLOATS_PER_VERTEX];
+        let last = &continuous_vertices[continuous_vertices.len() - FLOATS_PER_VERTEX..];
+        assert!(((first[0] as f64).hypot(first[1] as f64) - continuous.radius).abs() < 1.0e-6);
+        assert!((first[0] - last[0]).abs() < 1.0e-6);
+        assert!((first[1] - last[1]).abs() < 1.0e-6);
     }
 
     #[test]

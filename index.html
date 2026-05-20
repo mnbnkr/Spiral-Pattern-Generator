@@ -187,7 +187,7 @@
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Fit Screen uses the requested Radius. 1:1 Pixel uses direct board panning plus mouse-wheel zoom around the cursor."
+                data-tip="Fit Screen locks the view to Radius. 1:1 Pixel enables panning only after Zoom is above x1; the wheel zooms around the cursor."
                 >i</span
               ></span
             >
@@ -295,12 +295,12 @@
           ><span class="label-row"
             >Army Preset
             <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="Custom Finite cycles through your ordered rows. Prime presets consume each generated prime piece at most once."
-              >i</span
-            ></span
-          >
+                class="info-icon"
+                tabindex="0"
+                data-tip="Custom Finite cycles rows, and each row remembers its own search cursor. Prime presets keep one current prime piece until it finds a valid spot."
+                >i</span
+              ></span
+            >
           <select id="army-preset-select">
             <option value="CustomFinite">Custom Finite</option>
             <option value="PrimeKnight">Prime Knight</option>
@@ -333,21 +333,21 @@
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Prime Knight colors bounce through modulo buckets between Anchor A and Anchor B."
+                data-tip="Prime Knight colors bounce through modulo buckets between Anchor A and Anchor B. Values commit on Enter or blur, then normalize to the nearest multiple of 6."
                 >i</span
               ></span
             >
             <input
               id="prime-divisor-input"
               type="number"
-              min="2"
-              step="1"
+              min="6"
+              step="6"
               value="12"
             />
           </label>
           <div class="anchor-row">
-            <label for="anchor-a-input"
-              ><span class="label-row"
+            <div class="color-setting">
+              <span id="anchor-a-label" class="label-row"
                 >Start Color
                 <span
                   class="info-icon"
@@ -356,10 +356,15 @@
                   >i</span
                 ></span
               >
-              <input id="anchor-a-input" type="color" value="#ff7800" />
-            </label>
-            <label for="anchor-b-input"
-              ><span class="label-row"
+              <input
+                id="anchor-a-input"
+                type="color"
+                value="#ff7800"
+                aria-labelledby="anchor-a-label"
+              />
+            </div>
+            <div class="color-setting">
+              <span id="anchor-b-label" class="label-row"
                 >End Color
                 <span
                   class="info-icon"
@@ -368,8 +373,13 @@
                   >i</span
                 ></span
               >
-              <input id="anchor-b-input" type="color" value="#ff0006" />
-            </label>
+              <input
+                id="anchor-b-input"
+                type="color"
+                value="#ff0006"
+                aria-labelledby="anchor-b-label"
+              />
+            </div>
           </div>
         </div>
       </section>
@@ -402,6 +412,15 @@
         document.body.appendChild(tooltip);
 
         document.querySelectorAll(".info-icon").forEach((icon) => {
+          icon.addEventListener("mousedown", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          });
+          icon.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          });
+
           const show = () => {
             tooltip.textContent = icon.getAttribute("data-tip");
             tooltip.classList.add("visible");

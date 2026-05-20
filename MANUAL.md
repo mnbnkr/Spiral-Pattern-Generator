@@ -148,27 +148,29 @@ The attack circle is infinitely thin; the target body has radius `piece_radius`.
 
 ### Custom Finite
 
-Custom mode is spot-seeking. The army is an ordered cyclic list of user-defined `(a,b)` pieces.
+Custom mode is current-piece spot search. The army is an ordered cyclic list of user-defined `(a,b)` pieces.
 
-In default `SpiralPath`, each army entry has its own forward scan cursor. On that entry's turn, it places at the smallest unoccupied spiral cell at or after its cursor that is not attacked by an enemy under the selected enemy mode and optional proactive rule. This means chronological placement can fill an earlier spiral cell after another army entry skipped it; the final color or attack-set sequence should be read back by walking the spiral from the start.
+Each custom row has its own search cursor. On that row's turn, the row's current piece scans forward in the selected search order until it finds a valid unoccupied spot under passive and optional proactive rules. After placement, that row's cursor advances past the placed spot and priority moves to the next row. The row does not revisit earlier empty spots on later turns.
 
-In `CenterDistance`, each army entry has its own cursor through spots ordered by Euclidean distance from origin, using spiral index as a tie-breaker. This is intentionally a different search order.
+In `SpiralPath`, each row cursor scans the chronological spiral. In `CenterDistance`, each row cursor scans spots by Euclidean distance from the spiral origin. This is intentionally a different simulation policy.
 
-For lattice boards, `CenterDistance` streams spots from the requested board bound in Euclidean center-distance order with spiral index as the tie-breaker. It must not prebuild and sort the entire radius before emitting the first placement; high-radius runs still progress through bounded worker batches. Square, hex, and triangle corners are valid outer-bound spots, but they appear late in live generation because they are farther from the origin than most interior spots. For the continuous Archimedean board, center distance is monotonic with spiral theta, so `CenterDistance` and `SpiralPath` visit continuous spots in the same order by design without prebuilding the full radius.
+For lattice boards, `CenterDistance` streams spots from the requested board bound in Euclidean center-distance order with spiral index as the tie-breaker. It must not prebuild and sort the entire radius before emitting the first placement; high-radius runs still progress through bounded worker batches. Square, hex, and triangle corners are valid outer-bound spots, but they appear late in live generation because they are farther from the origin than most interior spots.
+
+For the continuous Archimedean board, `SpiralPath` follows the configured unit-chord spiral stream. `CenterDistance` uses a dedicated center-distance frontier made from deterministic unit-chord streams at evenly spaced arc-length offsets, merged by Euclidean distance from the origin. This keeps continuous placement deterministic and bounded while making `CenterDistance` a distinct logical simulation policy instead of a visual-only sort of the same monotonic spiral stream.
 
 Empty custom armies are valid editing states and produce no placements until a piece is added.
 
 ### Prime Knight
 
-Prime Knight is piece-seeking. It visits spots sequentially and tries the lowest unused prime piece until one fits:
+Prime Knight is strict current-prime spot search. The current prime piece scans forward until it finds a valid spot, then the engine advances to the next prime piece:
 
 ```text
 (1,2), (1,3), (1,5), ...
 ```
 
-Every generated prime piece is consumed at most once.
+Every generated prime piece is consumed exactly once and in order; the engine does not try a larger prime piece for the current spot.
 
-Prime Knight colors use the modulo bounce rule. For divisor `12`, buckets are:
+Prime Knight colors use the modulo bounce rule. Divisors commit on Enter, blur, spinner change, or explicit run/refresh actions, then normalize to the nearest multiple of `6` with minimum `6`. While editing, blank and partial values are allowed. For divisor `12`, buckets are:
 
 ```text
 1, 2, 3, 4, 5, 0, 5, 4, 3, 2, 1, 0
@@ -176,7 +178,7 @@ Prime Knight colors use the modulo bounce rule. For divisor `12`, buckets are:
 
 ### Prime Gap Knight
 
-Prime Gap Knight is also piece-seeking:
+Prime Gap Knight is also strict current-prime spot search:
 
 ```text
 (2,3), (3,5), (5,7), ...
@@ -184,14 +186,13 @@ Prime Gap Knight is also piece-seeking:
 
 Colors use dynamic min/max gap bounds. When a new gap minimum or maximum appears, the worker sends a replacement vertex buffer so existing pieces recolor against the new bounds.
 
-### Candidate-Independent Skips
+### Prime Search Cursors
 
-Prime modes can search a long time when a future candidate can solve the current spot. They must skip candidate-independent impossible spots:
+Prime modes search spots for the current prime piece and only move to the next prime after a placement.
 
-- In `Attack-set`, all future prime attack-sets are unique. If the spot is already passively attacked, no later candidate can make that attacked-by fact friendly, so skip the spot.
-- In `Color`, a spot attacked by multiple enemy color groups cannot be solved by one future candidate color, so skip it.
-- In Prime Gap Knight, a spot that requires the already-consumed gap-1 group cannot be solved, so skip it.
-- In `Color-Attack-set`, either color or attack-set can make a spot candidate-independent impossible; color is evaluated first, and any passive attack is enough to skip the spot through the attack-set rule for prime modes.
+- In `Attack-set` and `Color-Attack-set`, all prime pieces share one spot cursor.
+- In `Color`, Prime Knight uses one cursor per modulo-bounce color bucket, and Prime Gap Knight uses one cursor per gap value.
+- If passive or proactive rules reject a spot for the current prime piece, only that piece's active cursor advances. The piece keeps searching until it is placed or the current radius bound is exhausted.
 
 ## Radius And Staged Generations
 
@@ -223,13 +224,15 @@ Shape changes and lattice Piece Radius changes are render-only and must not rese
 
 Spiral Track is render-only. Lattice track geometry is a connected WebGL line strip through every lattice spiral point inside the requested radius, so Square, Hex, and Triangle previews stay continuous instead of becoming dashed at higher radii. Continuous track geometry is sampled by step size and point count while still including the requested end radius. When a board change stages a new generation while the old placement snapshot remains dimmed, the track and view bounds still follow the currently selected board and radius.
 
+When Spiral Track opacity is `off`, the renderer draws a single View / Generation Radius border line for the current board. Square uses the square generation bound, Hex uses the hex cube-radius boundary, Triangle follows the triangular shell boundary, and Continuous uses a circle at the exact requested radius. The border is hidden whenever Spiral Track is visible. It is also hidden after a true `Complete` run when the worker has reached the requested edge, and it returns immediately when settings change or a new run is staged.
+
 Board view/export bounds are board-specific:
 
 - Square and Continuous are centered square bounds.
 - Hex uses its wider axial x extent and y extent, so side corners are visible and pannable.
 - Triangle uses its asymmetric shell bounds, so Fit Screen and exports do not leave excessive empty space below.
 
-In `1:1 Pixel`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning.
+In `1:1 Pixel`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. The canvas shows pan cursors and accepts left-drag panning only while that panning mode is actually available.
 
 ## Image And Log Export
 
@@ -240,7 +243,7 @@ Image export never copies the visible viewport canvas. It renders deterministic 
 - JPEG 1/2 intentionally uses half resolution and lossy compression.
 - LatticeSquare Square exports use nearest-neighbor one-cell pixels.
 - Non-square, Hex, Triangle, and Continuous exports use smoothed supersampled rasterization.
-- Strict full-scale exports that exceed browser canvas or memory limits show a visible status error.
+- Strict full-scale exports that exceed browser canvas or memory limits show a visible status error. The strict pixel guard is `128,000,000` pixels, which permits the reported `8003x8003` full-scale case while still rejecting larger unsafe exports.
 - Filenames include render settings and placement count.
 
 The placement log must stay wired. It records settings, first placements, latest placements, exact coordinates, piece signatures, color groups, and color rules. The log is downloadable.
@@ -291,7 +294,7 @@ Refresh terminates active worker work, recreates worker/render state, clears sta
 
 Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highlighted while editing. On blur, invalid text is restored to the last valid value; an empty invalid field becomes `0`.
 
-Custom rows are draggable/reorderable and also have up/down arrow buttons. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path.
+Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path.
 
 ## Colors
 
@@ -302,7 +305,7 @@ Default anchors:
 - Anchor A: orange-red `#ff7800`
 - Anchor B: red `#ff0006`
 
-Custom finite color group is row index. Prime Knight color group is modulo bucket. Prime Gap Knight color group is gap value.
+Custom finite color group is row index. Prime Knight color group is modulo bucket with a divisor normalized to a multiple of `6` at commit time. Prime Gap Knight color group is gap value.
 
 ## Build, Test, And Deploy
 
@@ -319,7 +322,7 @@ trunk serve --port 8080
 pnpm exec playwright test --project=chromium
 ```
 
-GitHub Pages builds use `.github/workflows/pages.yml`. Playwright CI uses pnpm, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and browser tests, then uploads the HTML report from `playwright-report/`.
+GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install Trunk through Cargo rather than the deprecated Node-based `jetli/trunk-action@v0.5.1`. Playwright CI uses pnpm, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and browser tests, then uploads the HTML report from `target/playwright/report/`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed.
 
 WASM-only files are guarded with `#[cfg(target_arch = "wasm32")]`. `.vscode/settings.json` sets `rust-analyzer.cargo.target = "wasm32-unknown-unknown"` so app, worker, UI, and renderer modules are analyzed as active.
 
@@ -339,20 +342,23 @@ trunk build --release
 For frontend or rendering changes, also run the app with Trunk and verify in a browser:
 
 - WebGL canvas rendering is visible and nonblank.
+- The app loads from a GitHub Pages-style repository subpath, including WASM and worker assets.
 - Start/Pause remain responsive during Fastest mode.
 - Radius-bounded runs complete instead of generating outside the radius.
 - Higher compatible SpiralPath radius commits do not clear the visible generation.
 - Shape changes and lattice Piece Radius changes redraw existing pieces without resetting placement counts.
 - Spiral Track changes redraw without resetting placement counts and reach high lattice radii.
+- The View / Generation Radius border is visible when Spiral Track is off, hidden when Spiral Track is visible, hidden after true edge-reaching completion, and restored immediately after settings change.
 - Hex and Triangle Fit Screen framing and exports use the full board bounds without clipping or excessive empty space.
 - LatticeHex and ContinuousArchimedean custom runs with Attacking enabled show active rejection counts when candidates can hit enemies.
 - LatticeTriangle custom runs render and log exact triangle coordinates.
 - Refresh after a silent ContinuousArchimedean prime run leaves the app responsive without a browser reload.
-- ContinuousArchimedean Prime Knight and Prime Gap Knight with Color progress and skip only candidate-independent impossible spots.
+- ContinuousArchimedean Prime Knight and Prime Gap Knight with Color progress in strict prime order with per-color-group cursors.
 - ContinuousArchimedean Prime Knight with Attacking enabled progresses and logs `attacking=true`.
 - LatticeHex Prime Knight and Prime Gap Knight with Color progress.
-- Attack-set prime modes skip passively attacked spots instead of testing an impossible candidate pool forever.
-- Custom army rows show order colors and remain draggable/reorderable.
+- Attack-set prime modes keep the current prime piece moving forward through rejected spots instead of trying larger prime pieces for the same spot.
+- Custom army rows show order colors, remain draggable/reorderable, and stage changes without clearing the visible snapshot.
+- Prime Knight Modulo Divisor typing allows partial input and normalizes only on Enter, blur, spinner change, Start, Step, or Refresh.
 - Deleting the last custom piece leaves one empty placeholder row.
 - Placement logs include exact coordinates for early and latest pieces.
 - Browser console has no errors.

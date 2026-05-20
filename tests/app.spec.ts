@@ -1,5 +1,7 @@
 import { expect, test } from "@playwright/test";
 
+const appBasePath = process.env.APP_BASE_PATH ?? "/Spiral-Pattern-Generator/";
+
 test.beforeEach(async ({ page }) => {
   page.on("pageerror", (error) => {
     throw error;
@@ -10,7 +12,7 @@ test.beforeEach(async ({ page }) => {
     }
   });
 
-  await page.goto("/");
+  await page.goto("./");
   await expect(page.locator("#status-line")).toContainText("placements", {
     timeout: 15_000,
   });
@@ -25,7 +27,55 @@ async function pauseIfRunning(page) {
   });
 }
 
+async function renderedPixelCount(page) {
+  return page.locator("#sim-canvas").evaluate((canvas) => {
+    const source = canvas as HTMLCanvasElement;
+    const copy = document.createElement("canvas");
+    copy.width = source.width;
+    copy.height = source.height;
+    const context = copy.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("missing 2d context");
+    context.drawImage(source, 0, 0);
+    const data = context.getImageData(0, 0, copy.width, copy.height).data;
+    let pixels = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      if (Math.abs(r - 8) > 3 || Math.abs(g - 9) > 3 || Math.abs(b - 10) > 3) {
+        pixels += 1;
+      }
+    }
+    return pixels;
+  });
+}
+
+async function continuousSpotsForSearch(page, search: string) {
+  await pauseIfRunning(page);
+  await page.selectOption("#board-select", "ContinuousArchimedean");
+  await page.selectOption("#placement-search-select", search);
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+  await page.waitForFunction(
+    () => {
+      const text = document.querySelector("#placement-log")?.textContent ?? "";
+      const match = text.match(/placements logged: (\d+)/);
+      return match && Number(match[1]) >= 48;
+    },
+    null,
+    { timeout: 15_000 },
+  );
+  await pauseIfRunning(page);
+  const log = (await page.locator("#placement-log").textContent()) ?? "";
+  return [...log.matchAll(/spot=(\d+)/g)]
+    .slice(0, 24)
+    .map((match) => Number(match[1]));
+}
+
 test("default simulation auto-runs", async ({ page }) => {
+  expect(
+    await page.evaluate(() => new URL(document.baseURI).pathname),
+  ).toBe(appBasePath);
   await expect(page.locator("#board-select option").first()).toHaveText(
     "Triangle Lattice",
   );
@@ -44,6 +94,45 @@ test("default simulation auto-runs", async ({ page }) => {
     null,
     { timeout: 15_000 },
   );
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+});
+
+test("radius border renders with track off and subpath-loaded app is nonblank", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "12");
+  await page.click("#refresh-button");
+  await expect(page.locator("#track-opacity-output")).toHaveText("Off");
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "50";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("#track-opacity-output")).toHaveText("50%");
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+});
+
+test("continuous center distance produces a distinct logical order", async ({
+  page,
+}) => {
+  const spiralPath = await continuousSpotsForSearch(page, "SpiralPath");
+  const centerDistance = await continuousSpotsForSearch(page, "CenterDistance");
+
+  expect(spiralPath.length).toBeGreaterThan(8);
+  expect(centerDistance.length).toBeGreaterThan(8);
+  expect(centerDistance).not.toEqual(spiralPath);
 });
 
 test("continuous prime presets show early progress in fastest mode", async ({
@@ -126,6 +215,114 @@ test("custom rows use order labels and can be deleted to an empty placeholder", 
   await expect(page.locator(".army-empty-row")).toBeVisible();
 });
 
+test("custom row edits stage without clearing the visible snapshot", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  const beforePixels = await renderedPixelCount(page);
+  expect(beforePixels).toBeGreaterThan(0);
+
+  await page.locator('.army-row button[title="Move down"]').nth(0).click();
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  await expect(page.locator("#placement-log")).not.toContainText("No placements yet.");
+  await expect.poll(() => renderedPixelCount(page)).toBeGreaterThan(0);
+
+  await page.fill("#piece-a-input", "3");
+  await page.fill("#piece-b-input", "1");
+  await page.click("#add-piece-button");
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  await expect(page.locator(".army-row")).toHaveCount(3);
+
+  await page.locator('.army-row button[title="Move up"]').nth(2).click();
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  await expect(page.locator("#placement-log")).not.toContainText("No placements yet.");
+  await expect.poll(() => renderedPixelCount(page)).toBeGreaterThan(0);
+});
+
+test("complete runs hide the radius border until settings change", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "1");
+  await page.click("#refresh-button");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-generation-border",
+    "visible",
+  );
+
+  await page.click("#start-button");
+  await expect(page.locator("#status-line")).toContainText("Complete", {
+    timeout: 15_000,
+  });
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-generation-border",
+    "hidden",
+  );
+
+  await page.fill("#radius-input", "2");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-generation-border",
+    "visible",
+  );
+});
+
+test("canvas cursor only advertises panning when panning is available", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return getComputedStyle(canvas as HTMLCanvasElement).cursor;
+      }),
+    )
+    .not.toBe("grab");
+
+  await page.selectOption("#display-mode-select", "PixelOneToOne");
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return getComputedStyle(canvas as HTMLCanvasElement).cursor;
+      }),
+    )
+    .toBe("grab");
+
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>("#zoom-slider");
+    if (!slider) throw new Error("missing zoom slider");
+    slider.value = "1";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return getComputedStyle(canvas as HTMLCanvasElement).cursor;
+      }),
+    )
+    .not.toBe("grab");
+});
+
+test("color labels do not open broad clickable color targets", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.locator("#anchor-a-label").click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        return document.activeElement?.id ?? "";
+      }),
+    )
+    .not.toBe("anchor-a-input");
+
+  await page.locator("#anchor-a-input").click({ force: true });
+  await expect(page.locator("#anchor-a-input")).toHaveAttribute(
+    "aria-labelledby",
+    "anchor-a-label",
+  );
+});
+
 test("hex shape, spiral track, and compressed export stay wired", async ({
   page,
 }) => {
@@ -154,6 +351,32 @@ test("hex shape, spiral track, and compressed export stay wired", async ({
   const download = page.waitForEvent("download");
   await page.click("#download-jpeg-button");
   expect((await download).suggestedFilename()).toContain("image-half");
+});
+
+test("full png, regular png, and jpeg export buttons produce downloads", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.click("#refresh-button");
+  await expect(page.locator("#status-line")).toContainText("Paused");
+  await page.click("#step-button");
+  await expect(page.locator("#status-line")).toContainText("1 placements", {
+    timeout: 15_000,
+  });
+
+  const fullPng = page.waitForEvent("download");
+  await page.click("#download-full-png-button");
+  expect((await fullPng).suggestedFilename()).toContain("image-full");
+
+  const png = page.waitForEvent("download");
+  await page.click("#download-png-button");
+  const pngName = (await png).suggestedFilename();
+  expect(pngName).toContain("image-");
+  expect(pngName).toMatch(/\.png$/);
+
+  const jpeg = page.waitForEvent("download");
+  await page.click("#download-jpeg-button");
+  expect((await jpeg).suggestedFilename()).toContain("image-half");
 });
 
 test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async ({
@@ -463,6 +686,22 @@ test("placement search and continuous offset validation stay wired", async ({
   page,
 }) => {
   await pauseIfRunning(page);
+  await page.selectOption("#army-preset-select", "PrimeKnight");
+  await page.fill("#prime-divisor-input", "10");
+  await expect(page.locator("#prime-divisor-input")).toHaveValue("10");
+  await page.locator("#prime-divisor-input").blur();
+  await expect(page.locator("#prime-divisor-input")).toHaveValue("12");
+
+  await page.fill("#prime-divisor-input", "1");
+  await expect(page.locator("#prime-divisor-input")).toHaveValue("1");
+  await page.locator("#prime-divisor-input").blur();
+  await expect(page.locator("#prime-divisor-input")).toHaveValue("6");
+
+  await page.fill("#prime-divisor-input", "10");
+  await expect(page.locator("#prime-divisor-input")).toHaveValue("10");
+  await page.press("#prime-divisor-input", "Enter");
+  await expect(page.locator("#prime-divisor-input")).toHaveValue("12");
+
   await page.selectOption("#placement-search-select", "CenterDistance");
   await page.click("#step-button");
   await expect(page.locator("#placement-log")).toContainText(

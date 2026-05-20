@@ -35,10 +35,14 @@ body {
   height: 100vh;
   display: block;
   background: #08090a;
+  cursor: default;
+}
+
+#sim-canvas.pan-enabled {
   cursor: grab;
 }
 
-#sim-canvas.dragging {
+#sim-canvas.pan-enabled.dragging {
   cursor: grabbing;
 }
 
@@ -401,10 +405,15 @@ input[type="color"] {
   align-items: center;
 }
 
-.anchor-row label {
+.color-setting {
+  display: grid;
   grid-template-columns: auto 56px;
   justify-content: start;
   align-items: center;
+  gap: 6px;
+  color: #d9dee5;
+  font-size: 13px;
+  font-weight: 650;
 }
 
 .piece-add-row label {
