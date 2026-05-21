@@ -15,7 +15,10 @@ use crate::protocol::{
     normalize_prime_modulo_divisor,
 };
 
-const CONTINUOUS_CENTER_STREAMS: usize = 8;
+const CONTINUOUS_CENTER_STREAMS: usize = 1;
+const SPECIAL_PRIME_COLOR_GROUP: u64 = 0;
+const SPECIAL_PRIME_COLOR: &str = "#808080";
+const ATTACK_RELEVANCE_RADIUS_MULTIPLIER: f64 = 4.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimulationMode {
@@ -28,7 +31,7 @@ impl SimulationMode {
     pub fn from_preset(preset: ArmyPreset) -> Self {
         match preset {
             ArmyPreset::CustomFinite => Self::SpotSeeking,
-            ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap => Self::PieceSeeking,
+            ArmyPreset::PrimeKnight | ArmyPreset::PrimeGapper => Self::PieceSeeking,
         }
     }
 }
@@ -420,8 +423,10 @@ impl SimulationEngine {
 
         if let Some(coord) = lattice_coord {
             self.lattice_index.insert_occupied(coord, id);
-            for attack in lattice_attack_targets(self.settings.board, coord, piece.signature) {
-                self.lattice_index.add_attack(attack, id);
+            if attack_radius_relevant_to_generation(&self.settings, piece.attack_radius) {
+                for attack in lattice_attack_targets(self.settings.board, coord, piece.signature) {
+                    self.lattice_index.add_attack(attack, id);
+                }
             }
         } else {
             self.continuous_index.insert(id, center);
@@ -429,7 +434,7 @@ impl SimulationEngine {
                 self.max_continuous_attack_radius.max(piece.attack_radius);
         }
 
-        if piece.color.rule == ColorRule::PrimeGapBounds {
+        if piece.color.rule == ColorRule::PrimeGapperBounds {
             let gap = piece.color.key.gradient_value;
             self.min_gap_seen = Some(self.min_gap_seen.map_or(gap, |current| current.min(gap)));
             self.max_gap_seen = Some(self.max_gap_seen.map_or(gap, |current| current.max(gap)));
@@ -482,7 +487,9 @@ impl SimulationEngine {
             }
         }
 
-        if self.settings.proactive_attacking {
+        if self.settings.proactive_attacking
+            && attack_radius_relevant_to_generation(&self.settings, candidate.attack_radius)
+        {
             for target_coord in
                 lattice_attack_targets(self.settings.board, coord, candidate.signature)
             {
@@ -566,7 +573,7 @@ impl SimulationEngine {
 
         let bounded_attack_radius = self
             .max_continuous_attack_radius
-            .min(2.0 * self.settings.radius.max(0.0) + body_radius.max(0.0));
+            .min(max_relevant_attack_radius(&self.settings) + body_radius.max(0.0));
         if bounded_attack_radius <= 0.0 {
             return Vec::new();
         }
@@ -581,6 +588,10 @@ impl SimulationEngine {
         candidate: &CandidatePiece,
         body_radius: f64,
     ) -> Vec<u64> {
+        if !attack_radius_relevant_to_generation(&self.settings, candidate.attack_radius) {
+            return Vec::new();
+        }
+
         let max_possible_distance =
             center.radius() + self.settings.radius.max(0.0) + body_radius.max(0.0);
         if candidate.attack_radius > max_possible_distance {
@@ -708,10 +719,28 @@ impl SimulationEngine {
             ArmyPreset::PrimeKnight => {
                 let p = self.prime(candidate_index) as i32;
                 let signature = PieceSignature::new(1, p);
+                if candidate_index == 0 {
+                    return CandidatePiece {
+                        signature,
+                        color: PieceColor {
+                            rule: ColorRule::Fixed,
+                            fixed_css: SPECIAL_PRIME_COLOR.to_string(),
+                            key: ColorKey {
+                                group: SPECIAL_PRIME_COLOR_GROUP,
+                                gradient_value: 0.0,
+                            },
+                        },
+                        move_group: move_group(signature),
+                        color_group: SPECIAL_PRIME_COLOR_GROUP,
+                        attack_radius: attack_radius_from_move(signature.a, signature.b),
+                    };
+                }
+
                 let (bucket, t) = prime_knight_color_bucket(
                     candidate_index as u32 + 1,
                     self.settings.prime_modulo_divisor,
                 );
+                let color_group = bucket as u64 + 1;
 
                 CandidatePiece {
                     signature,
@@ -719,25 +748,42 @@ impl SimulationEngine {
                         rule: ColorRule::PrimeKnightModulo,
                         fixed_css: String::new(),
                         key: ColorKey {
-                            group: bucket as u64,
+                            group: color_group,
                             gradient_value: t,
                         },
                     },
                     move_group: move_group(signature),
-                    color_group: bucket as u64,
+                    color_group,
                     attack_radius: attack_radius_from_move(signature.a, signature.b),
                 }
             }
-            ArmyPreset::PrimeGap => {
+            ArmyPreset::PrimeGapper => {
                 let a = self.prime(candidate_index) as i32;
                 let b = self.prime(candidate_index + 1) as i32;
                 let signature = PieceSignature::new(a, b);
+                if candidate_index == 0 {
+                    return CandidatePiece {
+                        signature,
+                        color: PieceColor {
+                            rule: ColorRule::Fixed,
+                            fixed_css: SPECIAL_PRIME_COLOR.to_string(),
+                            key: ColorKey {
+                                group: SPECIAL_PRIME_COLOR_GROUP,
+                                gradient_value: 0.0,
+                            },
+                        },
+                        move_group: move_group(signature),
+                        color_group: SPECIAL_PRIME_COLOR_GROUP,
+                        attack_radius: attack_radius_from_move(signature.a, signature.b),
+                    };
+                }
+
                 let gap = signature_gap(signature);
 
                 CandidatePiece {
                     signature,
                     color: PieceColor {
-                        rule: ColorRule::PrimeGapBounds,
+                        rule: ColorRule::PrimeGapperBounds,
                         fixed_css: String::new(),
                         key: ColorKey {
                             group: gap as u64,
@@ -1042,7 +1088,7 @@ impl SimulationEngine {
     }
 }
 
-fn lattice_attack_targets(
+pub(crate) fn lattice_attack_targets(
     board: BoardKind,
     origin: (i64, i64),
     piece: PieceSignature,
@@ -1162,10 +1208,16 @@ fn center_triangle_shell_spots(shell: u64) -> Vec<BoardSpot> {
 fn min_center_distance_squared_for_shell(board: BoardKind, shell: u64) -> f64 {
     match board {
         BoardKind::LatticeSquare => (shell as f64).powi(2),
-        BoardKind::LatticeHex => 3.0 * (shell as f64).powi(2),
+        BoardKind::LatticeHex => min_hex_center_distance_squared_for_shell(shell),
         BoardKind::LatticeTriangle => min_triangle_center_distance_squared_for_shell(shell),
         BoardKind::ContinuousArchimedean => 0.0,
     }
+}
+
+fn min_hex_center_distance_squared_for_shell(shell: u64) -> f64 {
+    let shell = shell as f64;
+    let leg = (shell / 2.0).floor();
+    3.0 * (shell * shell - shell * leg + leg * leg)
 }
 
 fn min_triangle_center_distance_squared_for_shell(shell: u64) -> f64 {
@@ -1310,6 +1362,17 @@ fn continuous_piece_radius_changes_simulation(
     (current.board == BoardKind::ContinuousArchimedean
         || next.board == BoardKind::ContinuousArchimedean)
         && current.piece_radius != next.piece_radius
+}
+
+pub(crate) fn max_relevant_attack_radius(settings: &EngineSettings) -> f64 {
+    ATTACK_RELEVANCE_RADIUS_MULTIPLIER * settings.radius.max(0.0)
+}
+
+pub(crate) fn attack_radius_relevant_to_generation(
+    settings: &EngineSettings,
+    attack_radius: f64,
+) -> bool {
+    attack_radius <= max_relevant_attack_radius(settings) + f64::EPSILON
 }
 
 fn prime_knight_color_bucket(value: u32, divisor: u32) -> (u32, f64) {
@@ -1531,7 +1594,7 @@ mod tests {
                 for army_preset in [
                     ArmyPreset::CustomFinite,
                     ArmyPreset::PrimeKnight,
-                    ArmyPreset::PrimeGap,
+                    ArmyPreset::PrimeGapper,
                 ] {
                     for enemy_mode in [
                         EnemyMode::AttackSet,
@@ -1990,7 +2053,7 @@ mod tests {
         ] {
             for (army_preset, expected) in [
                 (ArmyPreset::PrimeKnight, first_prime_knight_signatures(24)),
-                (ArmyPreset::PrimeGap, first_prime_gap_signatures(24)),
+                (ArmyPreset::PrimeGapper, first_prime_gapper_signatures(24)),
             ] {
                 let mut engine = SimulationEngine::new(EngineSettings {
                     board: BoardKind::LatticeHex,
@@ -2017,7 +2080,7 @@ mod tests {
 
     #[test]
     fn center_distance_lattice_order_matches_bruteforce_sort() {
-        let radius = 5_u64;
+        let radius = 8_u64;
         for board in [
             BoardKind::LatticeSquare,
             BoardKind::LatticeHex,
@@ -2044,6 +2107,42 @@ mod tests {
 
             assert_eq!(got, expected, "board={board:?}");
         }
+    }
+
+    #[test]
+    fn hex_center_distance_includes_next_shell_side_points_before_farther_corners() {
+        let radius = 8_u64;
+        let expected = brute_force_center_distance_order(BoardKind::LatticeHex, radius);
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeHex,
+            shape: ShapeKind::Hex,
+            radius: radius as f64,
+            placement_search: PlacementSearchMode::CenterDistance,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(expected.len() as u32, 2_000_000);
+        let got = batch
+            .iter()
+            .map(|placement| placement.spot_index)
+            .collect::<Vec<_>>();
+
+        assert_eq!(got, expected);
+        assert!(
+            got.windows(2).any(|pair| HexSpiral::coord_at_index(pair[1])
+                .cube()
+                .0
+                .abs()
+                .max(HexSpiral::coord_at_index(pair[1]).cube().1.abs())
+                .max(HexSpiral::coord_at_index(pair[1]).cube().2.abs())
+                > HexSpiral::coord_at_index(pair[0])
+                    .cube()
+                    .0
+                    .abs()
+                    .max(HexSpiral::coord_at_index(pair[0]).cube().1.abs())
+                    .max(HexSpiral::coord_at_index(pair[0]).cube().2.abs())),
+            "expected at least one closer next-shell side spot before an older shell corner"
+        );
     }
 
     #[test]
@@ -2101,7 +2200,6 @@ mod tests {
     fn continuous_center_distance_preserves_exact_primary_offset() {
         assert_eq!(continuous_center_stream_offset(1.0, 0), 1.0);
         assert_eq!(continuous_center_stream_offset(0.0, 0), 0.0);
-        assert!((continuous_center_stream_offset(0.9, 1) - 0.025).abs() < 1.0e-12);
     }
 
     #[test]
@@ -2166,7 +2264,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_center_distance_uses_distinct_center_frontier() {
+    fn continuous_center_distance_uses_valid_configured_unit_chord_spots() {
         let settings = EngineSettings {
             board: BoardKind::ContinuousArchimedean,
             shape: ShapeKind::Circle,
@@ -2194,14 +2292,25 @@ mod tests {
             .iter()
             .map(|placement| placement.spot_index)
             .collect::<Vec<_>>();
+        let center_points = center_batch
+            .iter()
+            .map(|placement| match placement.coord {
+                SpotCoord::Continuous { x, y, .. } => Point2::new(x, y),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        let spiral_points = spiral_batch
+            .iter()
+            .map(|placement| match placement.coord {
+                SpotCoord::Continuous { x, y, .. } => Point2::new(x, y),
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
 
-        assert_ne!(center_indices, spiral_indices);
+        assert_eq!(center_indices, spiral_indices);
+        assert_eq!(center_points, spiral_points);
         assert_eq!(spiral_indices[0], 0);
         assert_eq!(center_indices[0], 0);
-        assert!(
-            center_indices.windows(2).any(|pair| pair[1] < pair[0]),
-            "center-distance search should not be hidden behind visual spiral-index sorting"
-        );
         assert!(center_distance.stats().exhausted);
     }
 
@@ -2229,7 +2338,7 @@ mod tests {
                 PieceSignature::new(1, 13),
             ]
         );
-        for color_group in [0, 1, 2] {
+        for color_group in [1, 2, 3] {
             let indices = batch
                 .iter()
                 .filter(|placement| placement.color.key.group == color_group)
@@ -2243,9 +2352,50 @@ mod tests {
     }
 
     #[test]
-    fn prime_gap_color_mode_keeps_strict_gap_order_and_gap_group_cursors() {
+    fn first_prime_knight_entry_uses_special_fixed_grey_group() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            army_preset: ArmyPreset::PrimeKnight,
+            enemy_mode: EnemyMode::Color,
+            prime_modulo_divisor: 6,
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(8, 5_000_000);
+
+        assert_eq!(batch[0].piece, PieceSignature::new(1, 2));
+        assert_eq!(batch[0].color.rule, ColorRule::Fixed);
+        assert_eq!(batch[0].color.fixed_css, "#808080");
+        assert_eq!(batch[0].color.key.group, 0);
+        assert!(
+            batch[1..]
+                .iter()
+                .all(|placement| placement.color.key.group != 0)
+        );
+    }
+
+    #[test]
+    fn first_prime_gapper_entry_uses_special_fixed_grey_group() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            army_preset: ArmyPreset::PrimeGapper,
+            enemy_mode: EnemyMode::Color,
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(8, 5_000_000);
+
+        assert_eq!(batch[0].piece, PieceSignature::new(2, 3));
+        assert_eq!(batch[0].color.rule, ColorRule::Fixed);
+        assert_eq!(batch[0].color.fixed_css, "#808080");
+        assert_eq!(batch[0].color.key.group, 0);
+        assert!(
+            batch[1..]
+                .iter()
+                .all(|placement| placement.color.key.group != 0)
+        );
+    }
+
+    #[test]
+    fn prime_gapper_color_mode_keeps_strict_gap_order_and_gap_group_cursors() {
         let settings = EngineSettings {
-            army_preset: ArmyPreset::PrimeGap,
+            army_preset: ArmyPreset::PrimeGapper,
             enemy_mode: EnemyMode::Color,
             ..EngineSettings::default()
         };
@@ -2416,7 +2566,7 @@ mod tests {
             .collect()
     }
 
-    fn first_prime_gap_signatures(count: usize) -> Vec<PieceSignature> {
+    fn first_prime_gapper_signatures(count: usize) -> Vec<PieceSignature> {
         let primes = first_primes(count + 1);
         primes
             .windows(2)
@@ -2521,7 +2671,7 @@ mod tests {
 
     #[test]
     fn continuous_prime_color_modes_keep_progressing() {
-        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGap] {
+        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGapper] {
             let settings = EngineSettings {
                 board: BoardKind::ContinuousArchimedean,
                 shape: ShapeKind::Circle,
@@ -2544,7 +2694,7 @@ mod tests {
 
     #[test]
     fn continuous_prime_modes_make_progress_on_interactive_work_budget() {
-        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGap] {
+        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGapper] {
             let settings = EngineSettings {
                 board: BoardKind::ContinuousArchimedean,
                 shape: ShapeKind::Circle,
@@ -2566,7 +2716,7 @@ mod tests {
 
     #[test]
     fn lattice_hex_prime_color_modes_keep_progressing() {
-        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGap] {
+        for army_preset in [ArmyPreset::PrimeKnight, ArmyPreset::PrimeGapper] {
             let settings = EngineSettings {
                 board: BoardKind::LatticeHex,
                 army_preset,

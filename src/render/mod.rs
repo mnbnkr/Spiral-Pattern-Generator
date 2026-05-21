@@ -1,3 +1,6 @@
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
@@ -5,9 +8,10 @@ use web_sys::{
     WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlUniformLocation,
 };
 
-use crate::math::{ArchimedeanSpiral, AxialCoord, HexSpiral, SquareSpiral, TriangleSpiral};
+use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
 use crate::protocol::{
-    BoardKind, ColorState, DisplayMode, EngineSettings, ShapeKind, VertexBufferUpdate,
+    AttackOverlayUpdate, BoardKind, ColorState, DisplayMode, EngineSettings, ShapeKind,
+    VertexBufferUpdate,
 };
 
 const FLOATS_PER_VERTEX: usize = 5;
@@ -15,8 +19,8 @@ const BYTES_PER_FLOAT: usize = std::mem::size_of::<f32>();
 const INITIAL_VERTEX_CAPACITY: usize = 16_384;
 const MAX_TRACK_POINTS: usize = 160_000;
 const MAX_BORDER_POINTS: usize = 4_096;
-const MAX_EXPORT_PIXELS: usize = 128_000_000;
-const MAX_EXPORT_DIMENSION: u32 = 32_767;
+const EXPORT_ENCODER_TIMEOUT_MS: i32 = 30_000;
+type ExportTick = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 
 const VERTEX_SHADER: &str = r#"
 attribute vec2 a_position;
@@ -100,15 +104,25 @@ pub struct CanvasRenderer {
     alpha_uniform: WebGlUniformLocation,
     saturation_uniform: WebGlUniformLocation,
     vertices: Vec<f32>,
+    attack_spot_vertices: Vec<f32>,
+    attack_hit_vertices: Vec<f32>,
+    attack_circle_vertices: Vec<f32>,
     track_vertices: Vec<f32>,
     border_vertices: Vec<f32>,
     pending_upload: PendingUpload,
+    attack_spot_upload_pending: bool,
+    attack_hit_upload_pending: bool,
+    attack_circle_upload_pending: bool,
     track_upload_pending: bool,
     border_upload_pending: bool,
     gpu_capacity_floats: usize,
+    attack_spot_buffer: WebGlBuffer,
+    attack_hit_buffer: WebGlBuffer,
+    attack_circle_buffer: WebGlBuffer,
     track_buffer: WebGlBuffer,
     border_buffer: WebGlBuffer,
     settings: EngineSettings,
+    placement_settings: EngineSettings,
     color_state: ColorState,
     color_saturation: f32,
     generation_border_visible: bool,
@@ -158,6 +172,15 @@ impl CanvasRenderer {
         let border_buffer = gl
             .create_buffer()
             .ok_or_else(|| JsValue::from_str("failed to create WebGL radius border buffer"))?;
+        let attack_spot_buffer = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("failed to create WebGL attack spot buffer"))?;
+        let attack_hit_buffer = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("failed to create WebGL attack hit buffer"))?;
+        let attack_circle_buffer = gl
+            .create_buffer()
+            .ok_or_else(|| JsValue::from_str("failed to create WebGL attack circle buffer"))?;
 
         gl.clear_color(0.031, 0.035, 0.039, 1.0);
         gl.disable(Gl::DEPTH_TEST);
@@ -179,15 +202,25 @@ impl CanvasRenderer {
             alpha_uniform,
             saturation_uniform,
             vertices: Vec::new(),
+            attack_spot_vertices: Vec::new(),
+            attack_hit_vertices: Vec::new(),
+            attack_circle_vertices: Vec::new(),
             track_vertices: Vec::new(),
             border_vertices: Vec::new(),
             pending_upload: PendingUpload::Full,
+            attack_spot_upload_pending: true,
+            attack_hit_upload_pending: true,
+            attack_circle_upload_pending: true,
             track_upload_pending: true,
             border_upload_pending: true,
             gpu_capacity_floats: 0,
+            attack_spot_buffer,
+            attack_hit_buffer,
+            attack_circle_buffer,
             track_buffer,
             border_buffer,
             settings: EngineSettings::default(),
+            placement_settings: EngineSettings::default(),
             color_state: ColorState::default(),
             color_saturation: 1.0,
             generation_border_visible: true,
@@ -204,19 +237,32 @@ impl CanvasRenderer {
     }
 
     pub fn set_settings(&mut self, settings: EngineSettings) -> Result<(), JsValue> {
-        let next_track_key = TrackKey::from_settings(&settings);
+        self.set_snapshot_settings(settings.clone(), settings)
+    }
+
+    pub fn set_snapshot_settings(
+        &mut self,
+        view_settings: EngineSettings,
+        placement_settings: EngineSettings,
+    ) -> Result<(), JsValue> {
+        let next_track_key = TrackKey::from_settings(&view_settings);
         if next_track_key != self.track_key {
-            self.track_vertices = build_track_vertices(&settings);
+            self.track_vertices = build_track_vertices(&view_settings);
             self.track_upload_pending = true;
             self.track_key = next_track_key;
         }
-        let next_border_key = BorderKey::from_settings(&settings);
+        let next_border_key = BorderKey::from_settings(&view_settings);
         if next_border_key != self.border_key {
-            self.border_vertices = build_generation_border_vertices(&settings);
+            self.border_vertices = build_generation_border_vertices(&view_settings);
             self.border_upload_pending = true;
             self.border_key = next_border_key;
         }
-        self.settings = settings;
+        self.settings = view_settings;
+        self.placement_settings = placement_settings;
+        self.canvas.set_attribute(
+            "data-piece-shape",
+            shape_data_value(self.placement_settings.shape),
+        )?;
         self.clamp_pan_to_view();
         self.redraw()
     }
@@ -242,9 +288,16 @@ impl CanvasRenderer {
 
     pub fn clear_placements(&mut self) -> Result<(), JsValue> {
         self.vertices.clear();
+        self.attack_spot_vertices.clear();
+        self.attack_hit_vertices.clear();
+        self.attack_circle_vertices.clear();
         self.pending_upload = PendingUpload::Full;
+        self.attack_spot_upload_pending = true;
+        self.attack_hit_upload_pending = true;
+        self.attack_circle_upload_pending = true;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
+        self.sync_attack_overlay_attributes()?;
         self.redraw()
     }
 
@@ -281,7 +334,7 @@ impl CanvasRenderer {
         let py = client_y * dpr;
         let width = self.canvas.width() as f64;
         let height = self.canvas.height() as f64;
-        let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
+        let bounds = self.view_bounds(rendered_piece_radius(&self.placement_settings));
         let old_scale = self.world_scale(width, height);
         let world_x = (px - width * 0.5) / old_scale - (self.pan_x - bounds.center_x());
         let world_y = (height * 0.5 - py) / old_scale - (self.pan_y - bounds.center_y());
@@ -298,20 +351,24 @@ impl CanvasRenderer {
     pub fn apply_batch(
         &mut self,
         vertex_update: &VertexBufferUpdate,
+        attack_overlay_update: &AttackOverlayUpdate,
         color_state: ColorState,
     ) -> Result<(), JsValue> {
         self.color_state = color_state;
         self.apply_vertex_update(vertex_update);
+        self.apply_attack_overlay_update(attack_overlay_update);
         Ok(())
     }
 
     pub fn apply_stats(
         &mut self,
         vertex_update: &VertexBufferUpdate,
+        attack_overlay_update: &AttackOverlayUpdate,
         color_state: ColorState,
     ) -> Result<(), JsValue> {
         self.color_state = color_state;
         self.apply_vertex_update(vertex_update);
+        self.apply_attack_overlay_update(attack_overlay_update);
         Ok(())
     }
 
@@ -335,6 +392,43 @@ impl CanvasRenderer {
                 self.pending_upload = PendingUpload::Full;
             }
         }
+    }
+
+    fn apply_attack_overlay_update(&mut self, update: &AttackOverlayUpdate) {
+        apply_static_vertex_update(
+            &mut self.attack_spot_vertices,
+            &mut self.attack_spot_upload_pending,
+            &update.spots,
+        );
+        apply_static_vertex_update(
+            &mut self.attack_hit_vertices,
+            &mut self.attack_hit_upload_pending,
+            &update.hits,
+        );
+        apply_static_vertex_update(
+            &mut self.attack_circle_vertices,
+            &mut self.attack_circle_upload_pending,
+            &update.circles,
+        );
+        if let Err(error) = self.sync_attack_overlay_attributes() {
+            web_sys::console::error_1(&error);
+        }
+    }
+
+    fn sync_attack_overlay_attributes(&self) -> Result<(), JsValue> {
+        self.canvas.set_attribute(
+            "data-attack-spots",
+            &(self.attack_spot_vertices.len() / FLOATS_PER_VERTEX).to_string(),
+        )?;
+        self.canvas.set_attribute(
+            "data-attack-hits",
+            &(self.attack_hit_vertices.len() / FLOATS_PER_VERTEX).to_string(),
+        )?;
+        self.canvas.set_attribute(
+            "data-attack-circles",
+            &(self.attack_circle_vertices.len() / FLOATS_PER_VERTEX).to_string(),
+        )?;
+        Ok(())
     }
 
     pub fn resize_to_viewport(&mut self) -> Result<(), JsValue> {
@@ -384,6 +478,12 @@ impl CanvasRenderer {
             self.draw_generation_border()?;
         }
 
+        if self.settings.attack_overlay_opacity > f32::EPSILON
+            && !self.attack_spot_vertices.is_empty()
+        {
+            self.draw_attack_spots(&render_state)?;
+        }
+
         if self.vertices.is_empty() {
             self.pending_upload = PendingUpload::None;
             return Ok(());
@@ -407,6 +507,88 @@ impl CanvasRenderer {
             (self.vertices.len() / FLOATS_PER_VERTEX) as i32,
         );
 
+        if self.settings.attack_overlay_opacity > f32::EPSILON {
+            if !self.attack_hit_vertices.is_empty() {
+                self.draw_attack_hits(&render_state)?;
+            }
+            if !self.attack_circle_vertices.is_empty() {
+                self.draw_attack_circles()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn draw_attack_spots(&mut self, render_state: &RenderState) -> Result<(), JsValue> {
+        upload_static_vertices(
+            &self.gl,
+            &self.attack_spot_buffer,
+            &self.attack_spot_vertices,
+            &mut self.attack_spot_upload_pending,
+        );
+        self.configure_vertex_attribs();
+        self.gl
+            .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
+        self.gl
+            .uniform1i(Some(&self.shape_uniform), render_state.shape);
+        self.gl.uniform1f(
+            Some(&self.alpha_uniform),
+            self.settings.attack_overlay_opacity.clamp(0.0, 1.0),
+        );
+        self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
+        self.gl.draw_arrays(
+            Gl::POINTS,
+            0,
+            (self.attack_spot_vertices.len() / FLOATS_PER_VERTEX) as i32,
+        );
+        Ok(())
+    }
+
+    fn draw_attack_hits(&mut self, render_state: &RenderState) -> Result<(), JsValue> {
+        upload_static_vertices(
+            &self.gl,
+            &self.attack_hit_buffer,
+            &self.attack_hit_vertices,
+            &mut self.attack_hit_upload_pending,
+        );
+        self.configure_vertex_attribs();
+        self.gl
+            .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
+        self.gl
+            .uniform1i(Some(&self.shape_uniform), render_state.shape);
+        self.gl.uniform1f(
+            Some(&self.alpha_uniform),
+            (self.settings.attack_overlay_opacity * 0.5).clamp(0.0, 0.5),
+        );
+        self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
+        self.gl.draw_arrays(
+            Gl::POINTS,
+            0,
+            (self.attack_hit_vertices.len() / FLOATS_PER_VERTEX) as i32,
+        );
+        Ok(())
+    }
+
+    fn draw_attack_circles(&mut self) -> Result<(), JsValue> {
+        upload_static_vertices(
+            &self.gl,
+            &self.attack_circle_buffer,
+            &self.attack_circle_vertices,
+            &mut self.attack_circle_upload_pending,
+        );
+        self.configure_vertex_attribs();
+        self.gl.uniform1f(Some(&self.point_size_uniform), 1.0);
+        self.gl.uniform1i(Some(&self.shape_uniform), 0);
+        self.gl.uniform1f(
+            Some(&self.alpha_uniform),
+            self.settings.attack_overlay_opacity.clamp(0.0, 1.0),
+        );
+        self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
+        self.gl.draw_arrays(
+            Gl::LINES,
+            0,
+            (self.attack_circle_vertices.len() / FLOATS_PER_VERTEX) as i32,
+        );
         Ok(())
     }
 
@@ -497,42 +679,14 @@ impl CanvasRenderer {
         filename: &str,
         kind: ExportKind,
         encoder_quality: Option<f64>,
+        cancel_flag: Rc<Cell<bool>>,
+        finish: Rc<dyn Fn(Result<(), String>)>,
     ) -> Result<(), JsValue> {
-        let export_canvas = self.pixel_export_canvas(kind)?;
-        let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
-        let document = window
-            .document()
-            .ok_or_else(|| JsValue::from_str("document unavailable"))?;
-        let anchor = document
-            .create_element("a")?
-            .dyn_into::<HtmlAnchorElement>()?;
-        anchor.set_download(filename);
-
-        let callback = Closure::<dyn FnMut(JsValue)>::new(move |blob_value: JsValue| {
-            if blob_value.is_null() || blob_value.is_undefined() {
-                web_sys::console::error_1(&JsValue::from_str("image encoder returned no blob"));
-                return;
-            }
-
-            let blob = blob_value.unchecked_into::<Blob>();
-            match Url::create_object_url_with_blob(&blob) {
-                Ok(url) => {
-                    anchor.set_href(&url);
-                    anchor.click();
-                    if let Err(error) = Url::revoke_object_url(&url) {
-                        web_sys::console::error_1(&error);
-                    }
-                }
-                Err(error) => web_sys::console::error_1(&error),
-            }
-        });
+        let job = Rc::new(RefCell::new(ExportJob::new(self, kind)?));
+        let mime_type = mime_type.to_string();
+        let filename = filename.to_string();
         let quality = encoder_quality.unwrap_or(0.92);
-        export_canvas.to_blob_with_type_and_encoder_options(
-            callback.as_ref().unchecked_ref(),
-            mime_type,
-            &JsValue::from_f64(quality),
-        )?;
-        callback.forget();
+        run_export_job(job, mime_type, filename, quality, cancel_flag, finish)?;
         Ok(())
     }
 
@@ -602,87 +756,13 @@ impl CanvasRenderer {
         Ok(())
     }
 
-    fn pixel_export_canvas(&self, kind: ExportKind) -> Result<HtmlCanvasElement, JsValue> {
-        let spec = self.export_spec(kind, 1.0);
-        if spec.width > MAX_EXPORT_DIMENSION || spec.height > MAX_EXPORT_DIMENSION {
-            return Err(JsValue::from_str(&format!(
-                "strict full-scale export is too large: {}x{} exceeds browser canvas limits",
-                spec.width, spec.height
-            )));
-        }
-        let pixel_count = checked_pixel_count(spec.width, spec.height)?;
-        if pixel_count > MAX_EXPORT_PIXELS {
-            return Err(JsValue::from_str(&format!(
-                "strict full-scale export is too large: {}x{} would exceed {} pixels",
-                spec.width, spec.height, MAX_EXPORT_PIXELS
-            )));
-        }
-
-        if !spec.square_pixel_cells {
-            let supersampled = self.export_spec(kind, 2.0);
-            if supersampled.width > MAX_EXPORT_DIMENSION
-                || supersampled.height > MAX_EXPORT_DIMENSION
-            {
-                return Err(JsValue::from_str(&format!(
-                    "strict smoothed export is too large: {}x{} supersample would exceed browser limits",
-                    supersampled.width, supersampled.height
-                )));
-            }
-            let supersampled_pixel_count =
-                checked_pixel_count(supersampled.width, supersampled.height)?;
-            if supersampled_pixel_count > MAX_EXPORT_PIXELS {
-                return Err(JsValue::from_str(&format!(
-                    "strict smoothed export is too large: {}x{} supersample would exceed browser limits",
-                    supersampled.width, supersampled.height
-                )));
-            }
-
-            let mut high_pixels = vec![0_u8; checked_rgba_len(supersampled_pixel_count)?];
-            fill_background(&mut high_pixels);
-            for vertex in self.vertices.chunks_exact(5) {
-                let center_x = vertex[0] as f64;
-                let center_y = vertex[1] as f64;
-                let color = [
-                    channel_to_u8(vertex[2]),
-                    channel_to_u8(vertex[3]),
-                    channel_to_u8(vertex[4]),
-                    255,
-                ];
-                draw_export_piece(&mut high_pixels, &supersampled, center_x, center_y, color);
-            }
-
-            let mut pixels = vec![0_u8; checked_rgba_len(pixel_count)?];
-            downsample_2x(
-                &high_pixels,
-                supersampled.width,
-                supersampled.height,
-                &mut pixels,
-                spec.width,
-                spec.height,
-            );
-            return canvas_from_pixels(spec.width, spec.height, pixels);
-        }
-
-        let mut pixels = vec![0_u8; checked_rgba_len(pixel_count)?];
-        fill_background(&mut pixels);
-
-        for vertex in self.vertices.chunks_exact(5) {
-            let center_x = vertex[0] as f64;
-            let center_y = vertex[1] as f64;
-            let color = [
-                channel_to_u8(vertex[2]),
-                channel_to_u8(vertex[3]),
-                channel_to_u8(vertex[4]),
-                255,
-            ];
-            draw_export_piece(&mut pixels, &spec, center_x, center_y, color);
-        }
-
-        canvas_from_pixels(spec.width, spec.height, pixels)
-    }
-
     fn world_scale(&self, width: f64, height: f64) -> f64 {
-        world_scale_for_settings(&self.settings, width, height)
+        world_scale_for_settings_with_margin(
+            &self.settings,
+            rendered_piece_radius(&self.placement_settings),
+            width,
+            height,
+        )
     }
 
     fn view_bounds(&self, margin: f64) -> WorldBounds {
@@ -691,9 +771,9 @@ impl CanvasRenderer {
 
     fn render_state(&self, width: u32, height: u32) -> RenderState {
         let scale = self.world_scale(width as f64, height as f64);
-        let radius_px = (scale * rendered_piece_radius(&self.settings)).max(1.0);
-        let shape = shader_shape(&self.settings);
-        let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
+        let radius_px = (scale * rendered_piece_radius(&self.placement_settings)).max(1.0);
+        let shape = shader_shape(&self.placement_settings);
+        let bounds = self.view_bounds(rendered_piece_radius(&self.placement_settings));
 
         RenderState {
             width,
@@ -709,8 +789,8 @@ impl CanvasRenderer {
     fn export_spec(&self, kind: ExportKind, supersample: f64) -> ExportSpec {
         let board = self.settings.board;
         let square_pixel_cells =
-            board == BoardKind::LatticeSquare && self.settings.shape == ShapeKind::Square;
-        let piece_radius = rendered_piece_radius(&self.settings).max(0.0);
+            board == BoardKind::LatticeSquare && self.placement_settings.shape == ShapeKind::Square;
+        let piece_radius = rendered_piece_radius(&self.placement_settings).max(0.0);
         let scale = export_scale(kind, square_pixel_cells, piece_radius) * supersample.max(1.0);
         let margin = if square_pixel_cells {
             0.0
@@ -723,7 +803,7 @@ impl CanvasRenderer {
 
         let width = export_dimension(max_x - min_x, scale);
         let height = export_dimension(max_y - min_y, scale);
-        let shape = export_shape(&self.settings);
+        let shape = export_shape(&self.placement_settings);
 
         ExportSpec {
             min_x,
@@ -751,13 +831,14 @@ impl CanvasRenderer {
             return;
         }
 
-        let bounds = self.view_bounds(rendered_piece_radius(&self.settings));
+        let bounds = self.view_bounds(rendered_piece_radius(&self.placement_settings));
         let half_board_width = bounds.width() * 0.5;
         let half_board_height = bounds.height() * 0.5;
         let half_width = self.canvas.width() as f64 / (2.0 * scale);
         let half_height = self.canvas.height() as f64 / (2.0 * scale);
-        let edge_room =
-            half_width.min(half_height) * 0.25 + rendered_piece_radius(&self.settings) + 4.0;
+        let edge_room = half_width.min(half_height) * 0.25
+            + rendered_piece_radius(&self.placement_settings)
+            + 4.0;
         let max_x = (half_board_width + edge_room - half_width).max(0.0);
         let max_y = (half_board_height + edge_room - half_height).max(0.0);
         self.pan_x = self.pan_x.clamp(-max_x, max_x);
@@ -770,6 +851,41 @@ enum PendingUpload {
     None,
     Append { start_float: usize },
     Full,
+}
+
+fn apply_static_vertex_update(
+    target: &mut Vec<f32>,
+    upload_pending: &mut bool,
+    update: &VertexBufferUpdate,
+) {
+    match update {
+        VertexBufferUpdate::None => {}
+        VertexBufferUpdate::Append(vertices) => {
+            target.extend_from_slice(vertices);
+            *upload_pending = true;
+        }
+        VertexBufferUpdate::Replace(vertices) => {
+            target.clear();
+            target.extend_from_slice(vertices);
+            *upload_pending = true;
+        }
+    }
+}
+
+fn upload_static_vertices(
+    gl: &Gl,
+    buffer: &WebGlBuffer,
+    vertices: &[f32],
+    upload_pending: &mut bool,
+) {
+    gl.bind_buffer(Gl::ARRAY_BUFFER, Some(buffer));
+    if *upload_pending {
+        unsafe {
+            let view = js_sys::Float32Array::view(vertices);
+            gl.buffer_data_with_array_buffer_view(Gl::ARRAY_BUFFER, &view, Gl::STATIC_DRAW);
+        }
+        *upload_pending = false;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -793,6 +909,185 @@ struct ExportSpec {
     piece_radius: f64,
     shape: ExportShape,
     square_pixel_cells: bool,
+}
+
+enum ExportJob {
+    Direct {
+        spec: ExportSpec,
+        vertices: Vec<f32>,
+        pixels: Vec<u8>,
+        stage: ExportStage,
+    },
+    Supersampled {
+        spec: ExportSpec,
+        supersampled: ExportSpec,
+        vertices: Vec<f32>,
+        high_pixels: Vec<u8>,
+        pixels: Vec<u8>,
+        stage: ExportStage,
+    },
+}
+
+enum ExportStage {
+    Fill { next_pixel: usize },
+    DrawPieces { next_vertex: usize },
+    Downsample { next_row: u32 },
+    Finish,
+    Done,
+}
+
+enum ExportStep {
+    Pending,
+    Complete(HtmlCanvasElement),
+}
+
+impl ExportJob {
+    fn new(renderer: &CanvasRenderer, kind: ExportKind) -> Result<Self, JsValue> {
+        let spec = renderer.export_spec(kind, 1.0);
+        let pixel_count = checked_pixel_count(spec.width, spec.height)?;
+        let pixels = allocate_pixel_buffer(pixel_count)?;
+        let vertices = renderer.vertices.clone();
+
+        if spec.square_pixel_cells {
+            return Ok(Self::Direct {
+                spec,
+                vertices,
+                pixels,
+                stage: ExportStage::Fill { next_pixel: 0 },
+            });
+        }
+
+        let supersampled = renderer.export_spec(kind, 2.0);
+        let supersampled_pixel_count =
+            checked_pixel_count(supersampled.width, supersampled.height)?;
+        let high_pixels = allocate_pixel_buffer(supersampled_pixel_count)?;
+
+        Ok(Self::Supersampled {
+            spec,
+            supersampled,
+            vertices,
+            high_pixels,
+            pixels,
+            stage: ExportStage::Fill { next_pixel: 0 },
+        })
+    }
+
+    fn step(&mut self) -> Result<ExportStep, JsValue> {
+        const PIXELS_PER_CHUNK: usize = 250_000;
+        const DIRECT_VERTICES_PER_CHUNK: usize = 8_192;
+        const SQUARE_PIXEL_VERTICES_PER_CHUNK: usize = 100_000;
+        const SUPERSAMPLED_VERTICES_PER_CHUNK: usize = 1_024;
+        const DOWNSAMPLE_ROWS_PER_CHUNK: u32 = 64;
+
+        match self {
+            Self::Direct {
+                spec,
+                vertices,
+                pixels,
+                stage,
+            } => match stage {
+                ExportStage::Fill { next_pixel } => {
+                    let total_pixels = pixels.len() / 4;
+                    let end = next_pixel
+                        .saturating_add(PIXELS_PER_CHUNK)
+                        .min(total_pixels);
+                    fill_background_range(pixels, *next_pixel, end);
+                    if end >= total_pixels {
+                        *stage = ExportStage::DrawPieces { next_vertex: 0 };
+                    } else {
+                        *next_pixel = end;
+                    }
+                    Ok(ExportStep::Pending)
+                }
+                ExportStage::DrawPieces { next_vertex } => {
+                    let total_vertices = vertices.len() / FLOATS_PER_VERTEX;
+                    let vertices_per_chunk = if spec.square_pixel_cells {
+                        SQUARE_PIXEL_VERTICES_PER_CHUNK
+                    } else {
+                        DIRECT_VERTICES_PER_CHUNK
+                    };
+                    let end = next_vertex
+                        .saturating_add(vertices_per_chunk)
+                        .min(total_vertices);
+                    draw_export_vertices(pixels, spec, vertices, *next_vertex, end);
+                    if end >= total_vertices {
+                        *stage = ExportStage::Finish;
+                    } else {
+                        *next_vertex = end;
+                    }
+                    Ok(ExportStep::Pending)
+                }
+                ExportStage::Finish => {
+                    *stage = ExportStage::Done;
+                    canvas_from_pixels(spec.width, spec.height, std::mem::take(pixels))
+                        .map(ExportStep::Complete)
+                }
+                ExportStage::Done => Ok(ExportStep::Pending),
+                ExportStage::Downsample { .. } => Ok(ExportStep::Pending),
+            },
+            Self::Supersampled {
+                spec,
+                supersampled,
+                vertices,
+                high_pixels,
+                pixels,
+                stage,
+            } => match stage {
+                ExportStage::Fill { next_pixel } => {
+                    let total_pixels = high_pixels.len() / 4;
+                    let end = next_pixel
+                        .saturating_add(PIXELS_PER_CHUNK)
+                        .min(total_pixels);
+                    fill_background_range(high_pixels, *next_pixel, end);
+                    if end >= total_pixels {
+                        *stage = ExportStage::DrawPieces { next_vertex: 0 };
+                    } else {
+                        *next_pixel = end;
+                    }
+                    Ok(ExportStep::Pending)
+                }
+                ExportStage::DrawPieces { next_vertex } => {
+                    let total_vertices = vertices.len() / FLOATS_PER_VERTEX;
+                    let end = next_vertex
+                        .saturating_add(SUPERSAMPLED_VERTICES_PER_CHUNK)
+                        .min(total_vertices);
+                    draw_export_vertices(high_pixels, supersampled, vertices, *next_vertex, end);
+                    if end >= total_vertices {
+                        *stage = ExportStage::Downsample { next_row: 0 };
+                    } else {
+                        *next_vertex = end;
+                    }
+                    Ok(ExportStep::Pending)
+                }
+                ExportStage::Downsample { next_row } => {
+                    let end = next_row
+                        .saturating_add(DOWNSAMPLE_ROWS_PER_CHUNK)
+                        .min(spec.height);
+                    downsample_2x_rows(
+                        high_pixels,
+                        supersampled.width,
+                        supersampled.height,
+                        pixels,
+                        spec.width,
+                        *next_row,
+                        end,
+                    );
+                    if end >= spec.height {
+                        *stage = ExportStage::Finish;
+                    } else {
+                        *next_row = end;
+                    }
+                    Ok(ExportStep::Pending)
+                }
+                ExportStage::Finish => {
+                    *stage = ExportStage::Done;
+                    canvas_from_pixels(spec.width, spec.height, std::mem::take(pixels))
+                        .map(ExportStep::Complete)
+                }
+                ExportStage::Done => Ok(ExportStep::Pending),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -906,6 +1201,15 @@ fn shader_shape(settings: &EngineSettings) -> i32 {
     }
 }
 
+fn shape_data_value(shape: ShapeKind) -> &'static str {
+    match shape {
+        ShapeKind::Square => "Square",
+        ShapeKind::Circle => "Circle",
+        ShapeKind::Hex => "Hex",
+        ShapeKind::Triangle => "Triangle",
+    }
+}
+
 fn export_shape(settings: &EngineSettings) -> ExportShape {
     if settings.board == BoardKind::ContinuousArchimedean || settings.shape == ShapeKind::Circle {
         ExportShape::Circle
@@ -961,12 +1265,18 @@ fn board_world_bounds(settings: &EngineSettings, margin: f64) -> WorldBounds {
     }
 }
 
+#[cfg(test)]
 fn world_scale_for_settings(settings: &EngineSettings, width: f64, height: f64) -> f64 {
-    let fit_scale = fit_screen_scale(
-        width,
-        height,
-        board_world_bounds(settings, rendered_piece_radius(settings)),
-    );
+    world_scale_for_settings_with_margin(settings, rendered_piece_radius(settings), width, height)
+}
+
+fn world_scale_for_settings_with_margin(
+    settings: &EngineSettings,
+    margin: f64,
+    width: f64,
+    height: f64,
+) -> f64 {
+    let fit_scale = fit_screen_scale(width, height, board_world_bounds(settings, margin));
     match settings.display_mode {
         DisplayMode::FitScreen => fit_scale,
         DisplayMode::PixelOneToOne => fit_scale * settings.zoom.clamp(1, 32) as f64,
@@ -986,32 +1296,15 @@ fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
     match settings.board {
         BoardKind::LatticeSquare => {
             let bound = settings.radius.max(0.0).floor() as u64;
-            let side = bound.saturating_mul(2).saturating_add(1);
-            let total_points = side.saturating_mul(side);
-            push_lattice_track_points(&mut vertices, total_points, |index| {
-                let point = SquareSpiral::coord_at_index(index).to_point();
-                (point.x, point.y)
-            });
+            push_square_track_vertices(&mut vertices, bound);
         }
         BoardKind::LatticeHex => {
             let bound = settings.radius.max(0.0).floor() as u64;
-            let total_points = 1_u64.saturating_add(
-                3_u64
-                    .saturating_mul(bound)
-                    .saturating_mul(bound.saturating_add(1)),
-            );
-            push_lattice_track_points(&mut vertices, total_points, |index| {
-                let point = HexSpiral::coord_at_index(index).to_point();
-                (point.x, point.y)
-            });
+            push_hex_track_vertices(&mut vertices, bound);
         }
         BoardKind::LatticeTriangle => {
             let bound = settings.radius.max(0.0).floor() as u64;
-            let total_points = triangular_number(bound.saturating_mul(3)).saturating_add(1);
-            push_lattice_track_points(&mut vertices, total_points, |index| {
-                let point = TriangleSpiral::coord_at_index(index).to_point();
-                (point.x, point.y)
-            });
+            push_triangle_track_vertices(&mut vertices, bound);
         }
         BoardKind::ContinuousArchimedean => {
             let radius = settings.radius.max(0.0);
@@ -1113,26 +1406,89 @@ where
     push_border_vertex(vertices, points[0].0, points[0].1);
 }
 
-fn push_lattice_track_points<F>(vertices: &mut Vec<f32>, total_points: u64, mut point_at: F)
-where
-    F: FnMut(u64) -> (f64, f64),
-{
-    if total_points == 0 {
-        return;
-    }
-
-    if let Ok(points) = usize::try_from(total_points) {
-        vertices.reserve(points.saturating_mul(FLOATS_PER_VERTEX));
-    }
-    for index in 0..total_points {
-        let point = point_at(index);
-        push_track_vertex(vertices, point.0, point.1);
+fn push_square_track_vertices(vertices: &mut Vec<f32>, bound: u64) {
+    reserve_track_vertex_floats(vertices, bound.saturating_mul(5).saturating_add(1));
+    push_square_track_coord(vertices, 0, 0);
+    for radius in 1..=bound {
+        let r = radius as i64;
+        for (x, y) in [(r, 1 - r), (r, r), (-r, r), (-r, -r), (r, -r)] {
+            push_square_track_coord(vertices, x, y);
+        }
     }
 }
 
-#[must_use]
-fn triangular_number(n: u64) -> u64 {
-    n.saturating_mul(n.saturating_add(1)) / 2
+fn push_square_track_coord(vertices: &mut Vec<f32>, x: i64, y: i64) {
+    let point = SquareCoord::new(x, y).to_point();
+    push_track_vertex(vertices, point.x, point.y);
+}
+
+fn push_hex_track_vertices(vertices: &mut Vec<f32>, bound: u64) {
+    const AXIAL_DIRECTIONS: [AxialCoord; 6] = [
+        AxialCoord { q: 1, r: 0 },
+        AxialCoord { q: 0, r: 1 },
+        AxialCoord { q: -1, r: 1 },
+        AxialCoord { q: -1, r: 0 },
+        AxialCoord { q: 0, r: -1 },
+        AxialCoord { q: 1, r: -1 },
+    ];
+
+    reserve_track_vertex_floats(vertices, bound.saturating_mul(7).saturating_add(1));
+    push_hex_track_coord(vertices, AxialCoord::new(0, 0));
+    for radius in 1..=bound {
+        let r = radius as i64;
+        let mut coord = AxialCoord::new(r, 1 - r);
+        push_hex_track_coord(vertices, coord);
+
+        if radius > 1 {
+            coord = coord.add(AXIAL_DIRECTIONS[1].scale(radius as i64 - 1));
+            push_hex_track_coord(vertices, coord);
+        }
+
+        for direction in AXIAL_DIRECTIONS
+            .iter()
+            .skip(2)
+            .chain(AXIAL_DIRECTIONS.iter().take(1))
+        {
+            coord = coord.add(direction.scale(radius as i64));
+            push_hex_track_coord(vertices, coord);
+        }
+    }
+}
+
+fn push_hex_track_coord(vertices: &mut Vec<f32>, coord: AxialCoord) {
+    let point = coord.to_point();
+    push_track_vertex(vertices, point.x, point.y);
+}
+
+fn push_triangle_track_vertices(vertices: &mut Vec<f32>, bound: u64) {
+    const TRIANGLE_DIRECTIONS: [TriangleCoord; 3] = [
+        TriangleCoord { u: 1, v: 0 },
+        TriangleCoord { u: -1, v: 1 },
+        TriangleCoord { u: 0, v: -1 },
+    ];
+
+    reserve_track_vertex_floats(vertices, bound.saturating_mul(3).saturating_add(1));
+    let mut coord = TriangleCoord::new(0, 0);
+    push_triangle_track_coord(vertices, coord);
+    for segment in 1..=bound.saturating_mul(3) {
+        let direction = TRIANGLE_DIRECTIONS[(segment as usize - 1) % TRIANGLE_DIRECTIONS.len()];
+        coord = coord.add(direction.scale(segment as i64));
+        push_triangle_track_coord(vertices, coord);
+    }
+}
+
+fn reserve_track_vertex_floats(vertices: &mut Vec<f32>, point_count: u64) {
+    if let Some(float_count) = point_count
+        .checked_mul(FLOATS_PER_VERTEX as u64)
+        .and_then(|count| usize::try_from(count).ok())
+    {
+        vertices.reserve(float_count);
+    }
+}
+
+fn push_triangle_track_coord(vertices: &mut Vec<f32>, coord: TriangleCoord) {
+    let point = coord.to_point();
+    push_track_vertex(vertices, point.x, point.y);
 }
 
 fn export_dimension(span: f64, scale: f64) -> u32 {
@@ -1163,21 +1519,212 @@ fn push_border_vertex(vertices: &mut Vec<f32>, x: f64, y: f64) {
     vertices.extend_from_slice(&[x as f32, y as f32, 0.92, 0.96, 1.0]);
 }
 
-fn fill_background(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
+fn run_export_job(
+    job: Rc<RefCell<ExportJob>>,
+    mime_type: String,
+    filename: String,
+    quality: f64,
+    cancel_flag: Rc<Cell<bool>>,
+    finish: Rc<dyn Fn(Result<(), String>)>,
+) -> Result<(), JsValue> {
+    let tick: ExportTick = Rc::new(RefCell::new(None));
+    let tick_ref = Rc::clone(&tick);
+    let closure = Closure::<dyn FnMut()>::new(move || {
+        if cancel_flag.get() {
+            finish(Err("Export canceled".to_string()));
+            tick_ref.borrow_mut().take();
+            return;
+        }
+
+        let step = job.borrow_mut().step();
+        match step {
+            Ok(ExportStep::Pending) => {
+                if let Err(error) = schedule_export_tick(&tick_ref) {
+                    finish(Err(js_value_text(&error)));
+                    tick_ref.borrow_mut().take();
+                }
+            }
+            Ok(ExportStep::Complete(canvas)) => {
+                tick_ref.borrow_mut().take();
+                if let Err(error) = download_canvas_blob(
+                    canvas,
+                    &mime_type,
+                    &filename,
+                    quality,
+                    Rc::clone(&cancel_flag),
+                    Rc::clone(&finish),
+                ) {
+                    finish(Err(js_value_text(&error)));
+                }
+            }
+            Err(error) => {
+                finish(Err(js_value_text(&error)));
+                tick_ref.borrow_mut().take();
+            }
+        }
+    });
+    *tick.borrow_mut() = Some(closure);
+    schedule_export_tick(&tick)
+}
+
+fn schedule_export_tick(tick: &ExportTick) -> Result<(), JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
+    let Some(callback) = tick
+        .borrow()
+        .as_ref()
+        .map(|closure| closure.as_ref().unchecked_ref::<js_sys::Function>().clone())
+    else {
+        return Ok(());
+    };
+    window.set_timeout_with_callback_and_timeout_and_arguments_0(&callback, 0)?;
+    Ok(())
+}
+
+fn download_canvas_blob(
+    canvas: HtmlCanvasElement,
+    mime_type: &str,
+    filename: &str,
+    quality: f64,
+    cancel_flag: Rc<Cell<bool>>,
+    finish: Rc<dyn Fn(Result<(), String>)>,
+) -> Result<(), JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("document unavailable"))?;
+    let anchor = document
+        .create_element("a")?
+        .dyn_into::<HtmlAnchorElement>()?;
+    anchor.set_download(filename);
+
+    let completed = Rc::new(Cell::new(false));
+    let timeout_completed = Rc::clone(&completed);
+    let timeout_finish = Rc::clone(&finish);
+    let timeout = Closure::<dyn FnMut()>::new(move || {
+        if !timeout_completed.replace(true) {
+            timeout_finish(Err("image encoder timed out".to_string()));
+        }
+    });
+    window.set_timeout_with_callback_and_timeout_and_arguments_0(
+        timeout.as_ref().unchecked_ref(),
+        EXPORT_ENCODER_TIMEOUT_MS,
+    )?;
+    timeout.forget();
+
+    let callback_completed = Rc::clone(&completed);
+    let callback = Closure::<dyn FnMut(JsValue)>::new(move |blob_value: JsValue| {
+        if callback_completed.replace(true) {
+            return;
+        }
+        if cancel_flag.get() {
+            finish(Err("Export canceled".to_string()));
+            return;
+        }
+        if blob_value.is_null() || blob_value.is_undefined() {
+            finish(Err("image encoder returned no blob".to_string()));
+            return;
+        }
+
+        let blob = blob_value.unchecked_into::<Blob>();
+        match Url::create_object_url_with_blob(&blob) {
+            Ok(url) => {
+                anchor.set_href(&url);
+                anchor.click();
+                if let Err(error) = Url::revoke_object_url(&url) {
+                    finish(Err(js_value_text(&error)));
+                    return;
+                }
+                finish(Ok(()));
+            }
+            Err(error) => finish(Err(js_value_text(&error))),
+        }
+    });
+    let encode_result = canvas.to_blob_with_type_and_encoder_options(
+        callback.as_ref().unchecked_ref(),
+        mime_type,
+        &JsValue::from_f64(quality),
+    );
+    if let Err(error) = encode_result {
+        completed.set(true);
+        return Err(error);
+    }
+    callback.forget();
+    Ok(())
+}
+
+fn allocate_pixel_buffer(pixel_count: usize) -> Result<Vec<u8>, JsValue> {
+    let len = checked_rgba_len(pixel_count)?;
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(len)
+        .map_err(|_| JsValue::from_str("export pixel buffer allocation failed"))?;
+    pixels.resize(len, 0);
+    Ok(pixels)
+}
+
+fn fill_background_range(pixels: &mut [u8], start_pixel: usize, end_pixel: usize) {
+    let start = start_pixel.saturating_mul(4).min(pixels.len());
+    let end = end_pixel.saturating_mul(4).min(pixels.len());
+    for pixel in pixels[start..end].chunks_exact_mut(4) {
         pixel.copy_from_slice(&[8, 9, 10, 255]);
     }
 }
 
-fn downsample_2x(
+fn draw_export_vertices(
+    pixels: &mut [u8],
+    spec: &ExportSpec,
+    vertices: &[f32],
+    start_vertex: usize,
+    end_vertex: usize,
+) {
+    let start = start_vertex
+        .saturating_mul(FLOATS_PER_VERTEX)
+        .min(vertices.len());
+    let end = end_vertex
+        .saturating_mul(FLOATS_PER_VERTEX)
+        .min(vertices.len());
+    for vertex in vertices[start..end].chunks_exact(FLOATS_PER_VERTEX) {
+        let center_x = vertex[0] as f64;
+        let center_y = vertex[1] as f64;
+        let color = [
+            channel_to_u8(vertex[2]),
+            channel_to_u8(vertex[3]),
+            channel_to_u8(vertex[4]),
+            255,
+        ];
+        if spec.square_pixel_cells {
+            draw_square_cell_export_pixel(pixels, spec, center_x, center_y, color);
+        } else {
+            draw_export_piece(pixels, spec, center_x, center_y, color);
+        }
+    }
+}
+
+fn draw_square_cell_export_pixel(
+    pixels: &mut [u8],
+    spec: &ExportSpec,
+    center_x: f64,
+    center_y: f64,
+    color: [u8; 4],
+) {
+    let px = ((center_x - spec.min_x) * spec.scale).round() as i32;
+    let py = ((spec.max_y - center_y) * spec.scale).round() as i32;
+    if px < 0 || py < 0 || px >= spec.width as i32 || py >= spec.height as i32 {
+        return;
+    }
+    set_pixel(pixels, spec.width, px as u32, py as u32, color);
+}
+
+fn downsample_2x_rows(
     source: &[u8],
     source_width: u32,
     source_height: u32,
     target: &mut [u8],
     target_width: u32,
-    target_height: u32,
+    start_y: u32,
+    end_y: u32,
 ) {
-    for y in 0..target_height {
+    for y in start_y..end_y {
         for x in 0..target_width {
             let mut accum = [0_u32; 4];
             let mut count = 0_u32;
@@ -1307,6 +1854,10 @@ fn channel_to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+fn js_value_text(value: &JsValue) -> String {
+    value.as_string().unwrap_or_else(|| format!("{value:?}"))
+}
+
 fn compile_shader(gl: &Gl, shader_type: u32, source: &str) -> Result<WebGlShader, JsValue> {
     let shader = gl
         .create_shader(shader_type)
@@ -1422,15 +1973,13 @@ mod tests {
     }
 
     #[test]
-    fn strict_export_cap_allows_reported_8003_case_but_keeps_guard() {
+    fn export_dimension_still_allows_reported_8003_case_without_policy_cap() {
         let width = export_dimension(8002.0, 1.0);
         let height = export_dimension(8002.0, 1.0);
         let reported_count = checked_pixel_count(width, height).unwrap();
-        let too_large_count = checked_pixel_count(12_000, 12_000).unwrap();
 
         assert_eq!((width, height), (8003, 8003));
-        assert!(reported_count <= MAX_EXPORT_PIXELS);
-        assert!(too_large_count > MAX_EXPORT_PIXELS);
+        assert_eq!(reported_count, 64_048_009);
     }
 
     #[test]
@@ -1461,7 +2010,7 @@ mod tests {
     }
 
     #[test]
-    fn lattice_track_radius_150_draws_every_adjacent_segment() {
+    fn lattice_track_radius_150_draws_exact_turn_vertices() {
         for board in [
             BoardKind::LatticeSquare,
             BoardKind::LatticeHex,
@@ -1475,12 +2024,9 @@ mod tests {
             };
             let vertices = build_track_vertices(&settings);
             let expected_points = match board {
-                BoardKind::LatticeSquare => {
-                    let side = 150_u64 * 2 + 1;
-                    side * side
-                }
-                BoardKind::LatticeHex => 1 + 3 * 150_u64 * 151,
-                BoardKind::LatticeTriangle => triangular_number(150_u64 * 3) + 1,
+                BoardKind::LatticeSquare => 1 + 5 * 150_u64,
+                BoardKind::LatticeHex => 7 * 150_u64,
+                BoardKind::LatticeTriangle => 1 + 3 * 150_u64,
                 BoardKind::ContinuousArchimedean => unreachable!(),
             };
 
@@ -1493,7 +2039,7 @@ mod tests {
     }
 
     #[test]
-    fn lattice_track_radius_300_draws_connected_adjacent_path() {
+    fn lattice_track_radius_300_keeps_full_uncompressed_shape() {
         for board in [
             BoardKind::LatticeSquare,
             BoardKind::LatticeHex,
@@ -1508,24 +2054,65 @@ mod tests {
             let vertices = build_track_vertices(&settings);
             let point_count = vertices.len() / FLOATS_PER_VERTEX;
             assert!(
-                point_count > 250_000,
+                point_count <= 2_100,
                 "board={board:?}, points={point_count}"
             );
 
-            let mut previous: Option<(f64, f64)> = None;
-            let mut max_segment = 0.0_f64;
-            for point in vertices.chunks_exact(FLOATS_PER_VERTEX) {
-                let current = (point[0] as f64, point[1] as f64);
-                if let Some((x0, y0)) = previous {
-                    max_segment = max_segment.max((current.0 - x0).hypot(current.1 - y0));
-                }
-                previous = Some(current);
-            }
+            let xs = vertices
+                .chunks_exact(FLOATS_PER_VERTEX)
+                .map(|point| point[0].abs() as f64)
+                .fold(0.0, f64::max);
+            let ys = vertices
+                .chunks_exact(FLOATS_PER_VERTEX)
+                .map(|point| point[1].abs() as f64)
+                .fold(0.0, f64::max);
 
+            match board {
+                BoardKind::LatticeSquare => {
+                    assert_eq!(xs, 300.0);
+                    assert_eq!(ys, 300.0);
+                }
+                BoardKind::LatticeHex => {
+                    assert!(xs > 500.0, "hex x span compressed to {xs}");
+                    assert_eq!(ys, 450.0);
+                }
+                BoardKind::LatticeTriangle => {
+                    assert!(xs > 445.0, "triangle x span compressed to {xs}");
+                    assert!(ys > 515.0, "triangle y span compressed to {ys}");
+                }
+                BoardKind::ContinuousArchimedean => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn lattice_track_extreme_radius_uses_exact_turns_and_reaches_edge() {
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::LatticeTriangle,
+        ] {
+            let settings = EngineSettings {
+                board,
+                radius: 1500.0,
+                track_opacity: 0.5,
+                ..EngineSettings::default()
+            };
+            let vertices = build_track_vertices(&settings);
+            let point_count = vertices.len() / FLOATS_PER_VERTEX;
             assert!(
-                max_segment <= 2.0,
-                "board={board:?}, max segment length={max_segment}"
+                point_count <= 10_500,
+                "board={board:?}, points={point_count}"
             );
+            let last = &vertices[vertices.len() - FLOATS_PER_VERTEX..];
+            let distance = match board {
+                BoardKind::LatticeSquare => last[0].abs().max(last[1].abs()) as f64,
+                BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
+                    (last[0] as f64).hypot(last[1] as f64)
+                }
+                BoardKind::ContinuousArchimedean => unreachable!(),
+            };
+            assert!(distance > 1400.0, "board={board:?}, distance={distance}");
         }
     }
 

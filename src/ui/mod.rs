@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
@@ -10,8 +10,8 @@ use web_sys::{
 };
 
 use crate::protocol::{
-    AppToWorker, ArmyPreset, BoardKind, CustomPiece, DisplayMode, EnemyMode, EngineSettings,
-    EngineStats, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
+    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DisplayMode, EnemyMode,
+    EngineSettings, EngineStats, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
     VertexBufferUpdate, WorkerToApp, normalize_prime_modulo_divisor, rainbow_color,
 };
 use crate::render::{CanvasRenderer, ExportKind};
@@ -40,6 +40,7 @@ struct AppState {
     total_logged: u64,
     last_ui_refresh_ms: f64,
     render_scheduled: bool,
+    run_tick_generation: u64,
     snapshot_stale: bool,
     generation_staged: bool,
     preserve_next_empty_worker_reset: bool,
@@ -52,6 +53,9 @@ struct AppState {
     preferred_square_shape: ShapeKind,
     preferred_hex_shape: ShapeKind,
     preferred_triangle_shape: ShapeKind,
+    active_export_cancel: Option<Rc<Cell<bool>>>,
+    active_export_button_id: Option<String>,
+    active_export_button_text: Option<String>,
 }
 
 #[derive(Clone)]
@@ -61,6 +65,16 @@ enum SyncAction {
     ResetWorker,
     DebounceRadius,
     AutoControl(String),
+}
+
+#[derive(Clone, Copy)]
+struct ImageExportButtonConfig {
+    id: &'static str,
+    artifact: &'static str,
+    extension: &'static str,
+    mime_type: &'static str,
+    kind: ExportKind,
+    encoder_quality: Option<f64>,
 }
 
 pub fn boot_app() -> Result<(), JsValue> {
@@ -99,6 +113,7 @@ pub fn boot_app() -> Result<(), JsValue> {
         total_logged: 0,
         last_ui_refresh_ms: 0.0,
         render_scheduled: false,
+        run_tick_generation: 0,
         snapshot_stale: false,
         generation_staged: false,
         preserve_next_empty_worker_reset: false,
@@ -111,6 +126,9 @@ pub fn boot_app() -> Result<(), JsValue> {
         preferred_square_shape: ShapeKind::Square,
         preferred_hex_shape: ShapeKind::Hex,
         preferred_triangle_shape: ShapeKind::Triangle,
+        active_export_cancel: None,
+        active_export_button_id: None,
+        active_export_button_text: None,
     }));
 
     install_worker_handler(Rc::clone(&state))?;
@@ -231,6 +249,8 @@ fn install_worker_handler_on(
                 epoch,
                 log_placements,
                 vertex_update,
+                attack_overlay_update,
+                attack_overlay_pending,
                 stats,
                 color_state,
             }) => {
@@ -250,7 +270,11 @@ fn install_worker_handler_on(
                         }
                         clear_placement_log_state(&mut state);
                     }
-                    if let Err(error) = state.renderer.apply_batch(&vertex_update, color_state) {
+                    if let Err(error) = state.renderer.apply_batch(
+                        &vertex_update,
+                        &attack_overlay_update,
+                        color_state,
+                    ) {
                         log_error(&error);
                     }
                     state.visible_settings = state.worker_settings.clone();
@@ -296,6 +320,11 @@ fn install_worker_handler_on(
                 if let Err(error) = schedule_render(Rc::clone(&callback_state)) {
                     log_error(&error);
                 }
+                if attack_overlay_pending
+                    && let Err(error) = request_attack_overlay_chunk(Rc::clone(&callback_state))
+                {
+                    log_error(&error);
+                }
                 if exhausted {
                     if let Ok(document) = current_document()
                         && let Err(error) =
@@ -314,6 +343,8 @@ fn install_worker_handler_on(
                 stats,
                 color_state,
                 vertex_update,
+                attack_overlay_update,
+                attack_overlay_pending,
             }) => {
                 if callback_state.borrow().worker_epoch != epoch {
                     return;
@@ -360,12 +391,17 @@ fn install_worker_handler_on(
                 }
 
                 let exhausted = stats.exhausted;
-                let needs_render = !matches!(vertex_update, VertexBufferUpdate::None);
+                let needs_render = !matches!(vertex_update, VertexBufferUpdate::None)
+                    || !attack_overlay_update_is_none(&attack_overlay_update);
                 let empty_replace = stats.placements == 0
                     && matches!(&vertex_update, VertexBufferUpdate::Replace(vertices) if vertices.is_empty());
                 let status = {
                     let mut state = callback_state.borrow_mut();
-                    if let Err(error) = state.renderer.apply_stats(&vertex_update, color_state) {
+                    if let Err(error) = state.renderer.apply_stats(
+                        &vertex_update,
+                        &attack_overlay_update,
+                        color_state,
+                    ) {
                         log_error(&error);
                     }
                     if !matches!(vertex_update, VertexBufferUpdate::None) {
@@ -405,6 +441,11 @@ fn install_worker_handler_on(
                     log_error(&error);
                 }
                 if needs_render && let Err(error) = schedule_render(Rc::clone(&callback_state)) {
+                    log_error(&error);
+                }
+                if attack_overlay_pending
+                    && let Err(error) = request_attack_overlay_chunk(Rc::clone(&callback_state))
+                {
                     log_error(&error);
                 }
                 if exhausted {
@@ -490,11 +531,19 @@ fn clear_placement_log_state(state: &mut AppState) {
     state.total_logged = 0;
 }
 
+fn attack_overlay_update_is_none(update: &AttackOverlayUpdate) -> bool {
+    matches!(update.spots, VertexBufferUpdate::None)
+        && matches!(update.hits, VertexBufferUpdate::None)
+        && matches!(update.circles, VertexBufferUpdate::None)
+}
+
 fn update_renderer_snapshot(state: &mut AppState) -> Result<(), JsValue> {
     state.snapshot_stale = state.last_stats.placements > 0
         && !simulation_settings_match(&state.visible_settings, &state.settings);
-    let render_settings = render_settings_for_snapshot(state);
-    state.renderer.set_settings(render_settings)?;
+    let (view_settings, placement_settings) = render_settings_for_snapshot(state);
+    state
+        .renderer
+        .set_snapshot_settings(view_settings, placement_settings)?;
     state
         .renderer
         .set_color_saturation(if state.snapshot_stale { 0.5 } else { 1.0 })?;
@@ -517,20 +566,17 @@ fn should_hide_generation_border(state: &AppState) -> bool {
         && state.last_stats.current_radius + 1.0e-9 >= state.settings.radius.max(0.0)
 }
 
-fn render_settings_for_snapshot(state: &AppState) -> EngineSettings {
-    let mut render_settings = if state.snapshot_stale {
+fn render_settings_for_snapshot(state: &AppState) -> (EngineSettings, EngineSettings) {
+    let mut placement_settings = if state.snapshot_stale {
         state.visible_settings.clone()
     } else {
         state.settings.clone()
     };
-    render_settings.board = state.settings.board;
-    render_settings.shape = state.settings.shape;
-    render_settings.radius = state.settings.radius;
-    render_settings.display_mode = state.settings.display_mode;
-    render_settings.zoom = state.settings.zoom;
-    render_settings.track_opacity = state.settings.track_opacity;
-    render_settings.continuous_offset = state.settings.continuous_offset;
-    render_settings
+    placement_settings.attack_overlay_opacity = state.settings.attack_overlay_opacity;
+
+    let mut view_settings = state.settings.clone();
+    view_settings.attack_overlay_opacity = state.settings.attack_overlay_opacity;
+    (view_settings, placement_settings)
 }
 
 fn simulation_settings_match(visible: &EngineSettings, current: &EngineSettings) -> bool {
@@ -587,7 +633,7 @@ fn placement_log_text(state: &AppState) -> String {
     }
 
     let mut out = format!(
-        "settings: board={:?} shape={:?} search={:?} army={:?} enemy={:?} attacking={} radius={:.2} piece_radius={:.2} visual_progress={} track={:.2} offset={:.3} anchors={}..{}\nplacements logged: {}\n\nfirst placements:\n",
+        "settings: board={:?} shape={:?} search={:?} army={:?} enemy={:?} attacking={} radius={:.2} piece_radius={:.2} visual_progress={} track={:.2} attacks={:.2} offset={:.3} anchors={}..{}\nplacements logged: {}\n\nfirst placements:\n",
         state.settings.board,
         state.settings.shape,
         state.settings.placement_search,
@@ -598,6 +644,7 @@ fn placement_log_text(state: &AppState) -> String {
         state.settings.piece_radius,
         state.settings.visual_progress,
         state.settings.track_opacity,
+        state.settings.attack_overlay_opacity,
         state.settings.continuous_offset,
         state.settings.anchor_color_a,
         state.settings.anchor_color_b,
@@ -716,9 +763,19 @@ fn number_token(value: f64, decimals: usize) -> String {
 }
 
 fn schedule_next_run_tick(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
-    let delay_ms = run_delay_ms(&state.borrow().settings.speed);
+    let (delay_ms, generation) = {
+        let mut state = state.borrow_mut();
+        state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
+        (
+            run_delay_ms(&state.settings.speed),
+            state.run_tick_generation,
+        )
+    };
     let closure = Closure::<dyn FnMut()>::new(move || {
         let state = state.borrow();
+        if state.run_tick_generation != generation {
+            return;
+        }
         if state.running
             && state.worker_ready
             && let Err(error) = send_to_worker(
@@ -740,6 +797,19 @@ fn schedule_next_run_tick(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
         )?;
     closure.forget();
     Ok(())
+}
+
+fn request_attack_overlay_chunk(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
+    let state = state.borrow();
+    if !state.worker_ready {
+        return Ok(());
+    }
+    send_to_worker(
+        &state.worker,
+        &AppToWorker::BuildAttackOverlay {
+            epoch: state.worker_epoch,
+        },
+    )
 }
 
 fn schedule_step_batch(worker: Worker, epoch: u64) -> Result<(), JsValue> {
@@ -768,7 +838,11 @@ fn schedule_step_batch(worker: Worker, epoch: u64) -> Result<(), JsValue> {
 fn run_delay_ms(speed: &SpeedMode) -> i32 {
     match speed {
         SpeedMode::Fastest => 0,
-        SpeedMode::PerSecond(_) => 50,
+        SpeedMode::PerSecond(rate) => {
+            let rate = (*rate).max(1) as u32;
+            let batch = if rate <= 20 { 1 } else { rate.div_ceil(20) };
+            ((1000.0 * batch as f64) / rate as f64).round().max(1.0) as i32
+        }
     }
 }
 
@@ -877,6 +951,20 @@ fn install_canvas_interaction_handlers(
     let wheel_state = Rc::clone(&state);
     let wheel = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
         let mut state = wheel_state.borrow_mut();
+        if state.settings.display_mode == DisplayMode::FitScreen {
+            state.settings.display_mode = DisplayMode::PixelOneToOne;
+            if let Err(error) =
+                set_select_value(&wheel_document, "display-mode-select", "PixelOneToOne")
+            {
+                log_error(&error);
+            }
+            if let Err(error) = update_outputs(&wheel_document, &state.settings) {
+                log_error(&error);
+            }
+            if let Err(error) = update_renderer_snapshot(&mut state) {
+                log_error(&error);
+            }
+        }
         if state.settings.display_mode != DisplayMode::PixelOneToOne {
             return;
         }
@@ -960,6 +1048,12 @@ fn install_control_handlers(
     for id in ["display-mode-select", "zoom-slider", "track-opacity-slider"] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::RenderOnly)?;
     }
+    install_settings_handler(
+        document,
+        "attack-overlay-opacity-slider",
+        Rc::clone(&state),
+        SyncAction::UpdateWorker,
+    )?;
 
     for id in ["anchor-a-input", "anchor-b-input"] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::UpdateWorker)?;
@@ -977,6 +1071,7 @@ fn install_control_handlers(
             return Ok(());
         }
         prepare_new_generation_if_staged(state, &document)?;
+        state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
         state.running = true;
         state.has_run = true;
         update_run_buttons(&document, state.running)?;
@@ -998,6 +1093,7 @@ fn install_control_handlers(
         if !state.running {
             return Ok(());
         }
+        state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
         state.running = false;
         state.has_run = true;
         update_run_buttons(&document, state.running)?;
@@ -1040,71 +1136,40 @@ fn install_control_handlers(
         )
     })?;
     install_refresh_handler(document, Rc::clone(&state))?;
-    install_button(
+    install_image_export_button(
         document,
-        "download-full-png-button",
         Rc::clone(&state),
-        |state| {
-            let document = current_document()?;
-            sync_state_from_controls(&document, state, false)?;
-            let download_settings = render_settings_for_download(state);
-            let filename =
-                download_filename(&download_settings, state.last_stats, "image-full", "png");
-            match state
-                .renderer
-                .download_image("image/png", &filename, ExportKind::FullPng, None)
-            {
-                Ok(()) => set_status("Preparing full PNG export"),
-                Err(error) => {
-                    set_status(&format!("Export failed: {}", js_value_text(&error)))?;
-                    Ok(())
-                }
-            }
+        ImageExportButtonConfig {
+            id: "download-full-png-button",
+            artifact: "image-full",
+            extension: "png",
+            mime_type: "image/png",
+            kind: ExportKind::FullPng,
+            encoder_quality: None,
         },
     )?;
-    install_button(
+    install_image_export_button(
         document,
-        "download-png-button",
         Rc::clone(&state),
-        |state| {
-            let document = current_document()?;
-            sync_state_from_controls(&document, state, false)?;
-            let download_settings = render_settings_for_download(state);
-            let filename = download_filename(&download_settings, state.last_stats, "image", "png");
-            match state
-                .renderer
-                .download_image("image/png", &filename, ExportKind::Png, None)
-            {
-                Ok(()) => set_status("Preparing PNG export"),
-                Err(error) => {
-                    set_status(&format!("Export failed: {}", js_value_text(&error)))?;
-                    Ok(())
-                }
-            }
+        ImageExportButtonConfig {
+            id: "download-png-button",
+            artifact: "image",
+            extension: "png",
+            mime_type: "image/png",
+            kind: ExportKind::Png,
+            encoder_quality: None,
         },
     )?;
-    install_button(
+    install_image_export_button(
         document,
-        "download-jpeg-button",
         Rc::clone(&state),
-        |state| {
-            let document = current_document()?;
-            sync_state_from_controls(&document, state, false)?;
-            let download_settings = render_settings_for_download(state);
-            let filename =
-                download_filename(&download_settings, state.last_stats, "image-half", "jpg");
-            match state.renderer.download_image(
-                "image/jpeg",
-                &filename,
-                ExportKind::JpegHalf,
-                Some(0.82),
-            ) {
-                Ok(()) => set_status("Preparing JPEG export"),
-                Err(error) => {
-                    set_status(&format!("Export failed: {}", js_value_text(&error)))?;
-                    Ok(())
-                }
-            }
+        ImageExportButtonConfig {
+            id: "download-jpeg-button",
+            artifact: "image-half",
+            extension: "jpg",
+            mime_type: "image/jpeg",
+            kind: ExportKind::JpegHalf,
+            encoder_quality: Some(0.82),
         },
     )?;
     install_button(document, "download-log-button", state, |state| {
@@ -1414,6 +1479,130 @@ where
     Ok(())
 }
 
+fn install_image_export_button(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+    config: ImageExportButtonConfig,
+) -> Result<(), JsValue> {
+    let button = button(document, config.id)?;
+    let button_id = config.id.to_string();
+    let closure_button = button.clone();
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let mut state_ref = state.borrow_mut();
+        if let Some(cancel) = state_ref.active_export_cancel.as_ref() {
+            if state_ref.active_export_button_id.as_deref() == Some(button_id.as_str()) {
+                cancel.set(true);
+                closure_button.set_text_content(Some("Canceling"));
+                closure_button.set_disabled(true);
+                if let Err(error) = set_status("Canceling export") {
+                    log_error(&error);
+                }
+            } else if let Err(error) = set_status("Another export is already running") {
+                log_error(&error);
+            }
+            return;
+        }
+
+        let document = match current_document() {
+            Ok(document) => document,
+            Err(error) => {
+                log_error(&error);
+                return;
+            }
+        };
+        if let Err(error) = sync_state_from_controls(&document, &mut state_ref, false) {
+            log_error(&error);
+            return;
+        }
+
+        let original_text = closure_button
+            .text_content()
+            .unwrap_or_else(|| "Export".to_string());
+        let cancel_flag = Rc::new(Cell::new(false));
+        state_ref.active_export_cancel = Some(Rc::clone(&cancel_flag));
+        state_ref.active_export_button_id = Some(button_id.clone());
+        state_ref.active_export_button_text = Some(original_text.clone());
+        closure_button.set_text_content(Some("Cancel"));
+        closure_button.set_disabled(false);
+        if let Err(error) = closure_button.class_list().add_1("export-cancel-active") {
+            log_error(&error);
+        }
+
+        let download_settings = render_settings_for_download(&state_ref);
+        let filename = download_filename(
+            &download_settings,
+            state_ref.last_stats,
+            config.artifact,
+            config.extension,
+        );
+        let finish_state = Rc::clone(&state);
+        let finish_button = closure_button.clone();
+        let finish_button_id = button_id.clone();
+        let finish = Rc::new(move |result: Result<(), String>| {
+            let mut state = finish_state.borrow_mut();
+            let original = state
+                .active_export_button_text
+                .clone()
+                .unwrap_or_else(|| "Export".to_string());
+            if state.active_export_button_id.as_deref() == Some(finish_button_id.as_str()) {
+                state.active_export_cancel = None;
+                state.active_export_button_id = None;
+                state.active_export_button_text = None;
+            }
+            finish_button.set_text_content(Some(&original));
+            finish_button.set_disabled(false);
+            if let Err(error) = finish_button.class_list().remove_1("export-cancel-active") {
+                log_error(&error);
+            }
+            drop(state);
+            let status = match result {
+                Ok(()) => "Export ready".to_string(),
+                Err(message) if message == "Export canceled" => message,
+                Err(message) => format!("Export failed: {message}"),
+            };
+            if let Err(error) = set_status(&status) {
+                log_error(&error);
+            }
+        });
+
+        match state_ref.renderer.download_image(
+            config.mime_type,
+            &filename,
+            config.kind,
+            config.encoder_quality,
+            cancel_flag,
+            finish,
+        ) {
+            Ok(()) => {
+                if let Err(error) = set_status("Preparing export | Click Cancel to stop") {
+                    log_error(&error);
+                }
+            }
+            Err(error) => {
+                state_ref.active_export_cancel = None;
+                state_ref.active_export_button_id = None;
+                state_ref.active_export_button_text = None;
+                closure_button.set_text_content(Some(&original_text));
+                closure_button.set_disabled(false);
+                if let Err(class_error) =
+                    closure_button.class_list().remove_1("export-cancel-active")
+                {
+                    log_error(&class_error);
+                }
+                if let Err(status_error) =
+                    set_status(&format!("Export failed: {}", js_value_text(&error)))
+                {
+                    log_error(&status_error);
+                }
+            }
+        }
+    });
+
+    button.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
 fn install_refresh_handler(
     document: &Document,
     state: Rc<RefCell<AppState>>,
@@ -1498,6 +1687,7 @@ fn recreate_worker_with_settings(
         state.allow_default_auto_start = false;
         state.radius_commit_pending = false;
         state.radius_commit_generation = state.radius_commit_generation.wrapping_add(1);
+        state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
         state.running = restart_after_ready;
         state.has_run = restart_after_ready || state.has_run;
         state.last_ui_refresh_ms = 0.0;
@@ -1681,8 +1871,12 @@ fn install_piece_drag_handlers(
     index: usize,
 ) -> Result<(), JsValue> {
     let drag_state = Rc::clone(&state);
+    let drag_row = row.clone();
     let drag_start = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
         drag_state.borrow_mut().dragging_army_index = Some(index);
+        if let Err(error) = drag_row.class_list().add_1("drag-source") {
+            log_error(&error);
+        }
         if let Some(data_transfer) = event.data_transfer() {
             data_transfer.set_effect_allowed("move");
             let _ = data_transfer.set_data("text/plain", &index.to_string());
@@ -1691,8 +1885,12 @@ fn install_piece_drag_handlers(
     row.add_event_listener_with_callback("dragstart", drag_start.as_ref().unchecked_ref())?;
     drag_start.forget();
 
+    let over_row = row.clone();
     let drag_over = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
         event.prevent_default();
+        if let Err(error) = over_row.class_list().add_1("drag-over") {
+            log_error(&error);
+        }
         if let Some(data_transfer) = event.data_transfer() {
             data_transfer.set_drop_effect("move");
         }
@@ -1700,18 +1898,33 @@ fn install_piece_drag_handlers(
     row.add_event_listener_with_callback("dragover", drag_over.as_ref().unchecked_ref())?;
     drag_over.forget();
 
+    let leave_row = row.clone();
+    let drag_leave = Closure::<dyn FnMut(DragEvent)>::new(move |_event: DragEvent| {
+        if let Err(error) = leave_row.class_list().remove_1("drag-over") {
+            log_error(&error);
+        }
+    });
+    row.add_event_listener_with_callback("dragleave", drag_leave.as_ref().unchecked_ref())?;
+    drag_leave.forget();
+
     let drop_document = document.clone();
     let drop_state = Rc::clone(&state);
+    let drop_row = row.clone();
     let drop = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
         event.prevent_default();
+        if let Err(error) = drop_row.class_list().remove_1("drag-over") {
+            log_error(&error);
+        }
         let (moved, previous_settings) = {
             let mut state = drop_state.borrow_mut();
             let Some(from) = state.dragging_army_index.take() else {
                 return;
             };
             let previous_settings = state.settings.clone();
+            let before = state.settings.custom_army.clone();
+            let changed = move_custom_piece(&mut state.settings.custom_army, from, index);
             (
-                move_custom_piece(&mut state.settings.custom_army, from, index),
+                changed && before != state.settings.custom_army,
                 previous_settings,
             )
         };
@@ -1732,8 +1945,15 @@ fn install_piece_drag_handlers(
     drop.forget();
 
     let end_state = state;
+    let end_row = row.clone();
     let drag_end = Closure::<dyn FnMut(DragEvent)>::new(move |_event: DragEvent| {
         end_state.borrow_mut().dragging_army_index = None;
+        if let Err(error) = end_row.class_list().remove_1("drag-source") {
+            log_error(&error);
+        }
+        if let Err(error) = end_row.class_list().remove_1("drag-over") {
+            log_error(&error);
+        }
     });
     row.add_event_listener_with_callback("dragend", drag_end.as_ref().unchecked_ref())?;
     drag_end.forget();
@@ -1885,6 +2105,9 @@ fn apply_synced_settings(
         }
         SyncAction::UpdateWorker => {
             let mut state = state.borrow_mut();
+            if previous_settings.speed != settings.speed {
+                state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
+            }
             let worker_settings = worker_visible_settings(&state);
             state.worker_settings = worker_settings;
             if ensure_worker_initialized(&mut state)? {
@@ -1910,6 +2133,7 @@ fn apply_synced_settings(
         }
     }
 
+    schedule_render(Rc::clone(&state))?;
     Ok(())
 }
 
@@ -1968,7 +2192,8 @@ fn sync_state_from_controls_with_previous(
 }
 
 fn render_settings_for_download(state: &AppState) -> EngineSettings {
-    render_settings_for_snapshot(state)
+    let (_, placement_settings) = render_settings_for_snapshot(state);
+    placement_settings
 }
 
 fn worker_visible_settings(state: &AppState) -> EngineSettings {
@@ -2258,7 +2483,7 @@ fn read_settings(
 
     let army_preset = match select_value(document, "army-preset-select")?.as_str() {
         "PrimeKnight" => ArmyPreset::PrimeKnight,
-        "PrimeGap" => ArmyPreset::PrimeGap,
+        "PrimeGapper" => ArmyPreset::PrimeGapper,
         _ => ArmyPreset::CustomFinite,
     };
 
@@ -2278,7 +2503,7 @@ fn read_settings(
     Ok(EngineSettings {
         board,
         shape,
-        radius: parse_finite_f64(&input_value(document, "radius-input")?, 100.0).max(1.0),
+        radius: parse_finite_f64(&input_value(document, "radius-input")?, 150.0).max(1.0),
         piece_radius: parse_finite_f64(&input_value(document, "piece-radius-slider")?, 0.5)
             .clamp(0.05, 0.5),
         visual_progress: input_checked(document, "visual-progress-toggle")?,
@@ -2290,6 +2515,12 @@ fn read_settings(
             .clamp(1, 32),
         track_opacity: parse_finite_f64(&input_value(document, "track-opacity-slider")?, 0.0)
             .clamp(0.0, 100.0) as f32
+            / 100.0,
+        attack_overlay_opacity: parse_finite_f64(
+            &input_value(document, "attack-overlay-opacity-slider")?,
+            0.0,
+        )
+        .clamp(0.0, 100.0) as f32
             / 100.0,
         proactive_attacking: input_checked(document, "attacking-toggle")?,
         enemy_mode,
@@ -2362,6 +2593,19 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
         format!("{}%", (settings.track_opacity * 100.0).round() as u32)
     };
     set_text(document, "track-opacity-output", &track_text)?;
+    let attack_overlay_text = if settings.attack_overlay_opacity <= f32::EPSILON {
+        "Off".to_string()
+    } else {
+        format!(
+            "{}%",
+            (settings.attack_overlay_opacity * 100.0).round() as u32
+        )
+    };
+    set_text(
+        document,
+        "attack-overlay-opacity-output",
+        &attack_overlay_text,
+    )?;
 
     input(document, "speed-slider")?.set_disabled(matches!(settings.speed, SpeedMode::Fastest));
     let continuous = settings.board == BoardKind::ContinuousArchimedean;
@@ -2380,12 +2624,7 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     select(document, "enemy-mode-select")?.set_disabled(false);
 
     let zoom_row = html_element(document, "zoom-row")?;
-    let zoom_display = if settings.display_mode == DisplayMode::PixelOneToOne {
-        "grid"
-    } else {
-        "none"
-    };
-    zoom_row.style().set_property("display", zoom_display)?;
+    zoom_row.style().set_property("display", "none")?;
     set_text(
         document,
         "zoom-output",
@@ -2431,7 +2670,7 @@ fn update_canvas_pan_class(document: &Document, settings: &EngineSettings) -> Re
 }
 
 fn canvas_pan_enabled(settings: &EngineSettings) -> bool {
-    settings.display_mode == DisplayMode::PixelOneToOne && settings.zoom > 1
+    settings.display_mode == DisplayMode::PixelOneToOne
 }
 
 fn read_continuous_offset(document: &Document, fallback: f64) -> Result<f64, JsValue> {
@@ -2576,6 +2815,7 @@ fn maybe_auto_start_default(
         return Ok(());
     }
 
+    state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
     state.running = true;
     state.has_run = true;
     update_run_buttons(document, state.running)?;
@@ -2621,7 +2861,7 @@ fn stats_text(settings: &EngineSettings, stats: EngineStats) -> String {
                 stats.placements, stats.current_radius, settings.radius, stats.spots_tested
             )
         }
-        ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap => format!(
+        ArmyPreset::PrimeKnight | ArmyPreset::PrimeGapper => format!(
             "{} placements | radius {:.2}/{:.2} | {} prime spot checks | {} skipped spots",
             stats.placements,
             stats.current_radius,

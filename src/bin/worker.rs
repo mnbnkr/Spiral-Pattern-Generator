@@ -7,11 +7,14 @@ use std::rc::Rc;
 use spiral_pattern_generator::engine::SimulationEngine;
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::protocol::{
-    AppToWorker, ArmyPreset, BoardKind, EngineSettings, Placement, SpeedMode, VertexBufferUpdate,
-    WorkerToApp,
+    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, EngineSettings, Placement, SpeedMode,
+    VertexBufferUpdate, WorkerToApp,
 };
 #[cfg(target_arch = "wasm32")]
-use spiral_pattern_generator::render_data::pack_vertices;
+use spiral_pattern_generator::render_data::{
+    AttackOverlayBuildJob, AttackOverlayCache,
+    attack_overlay_requires_full_rebuild_for_new_placements, pack_vertices,
+};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 #[cfg(target_arch = "wasm32")]
@@ -24,9 +27,14 @@ struct WorkerRuntime {
     scope: DedicatedWorkerGlobalScope,
     engine: SimulationEngine,
     placements: Vec<Placement>,
+    attack_overlay_cache: Option<AttackOverlayCache>,
+    attack_overlay_job: Option<AttackOverlayBuildJob>,
     running: bool,
     epoch: u64,
 }
+
+#[cfg(target_arch = "wasm32")]
+const ATTACK_OVERLAY_BUILD_CHUNK: usize = 4_096;
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen(start)]
@@ -38,6 +46,8 @@ pub fn start() -> Result<(), JsValue> {
         scope: scope.clone(),
         engine: SimulationEngine::new(EngineSettings::default()),
         placements: Vec::new(),
+        attack_overlay_cache: None,
+        attack_overlay_job: None,
         running: false,
         epoch: 0,
     }));
@@ -75,7 +85,13 @@ fn handle_message(
             runtime.running = false;
             runtime.engine.reset(settings);
             runtime.placements.clear();
-            post_stats_with_vertex_update(&runtime, VertexBufferUpdate::Replace(Vec::new()));
+            runtime.attack_overlay_cache = None;
+            runtime.attack_overlay_job = None;
+            post_stats_with_updates(
+                &runtime,
+                VertexBufferUpdate::Replace(Vec::new()),
+                AttackOverlayUpdate::replace_empty(),
+            );
         }
         AppToWorker::UpdateSettings { epoch, settings } => {
             let mut runtime = runtime.borrow_mut();
@@ -85,17 +101,34 @@ fn handle_message(
             let old_settings = runtime.engine.settings().clone();
             let anchor_colors_changed = old_settings.anchor_color_a != settings.anchor_color_a
                 || old_settings.anchor_color_b != settings.anchor_color_b;
+            let overlay_may_need_refresh = old_settings.attack_overlay_opacity > f32::EPSILON
+                || settings.attack_overlay_opacity > f32::EPSILON;
             let reset = runtime.engine.update_settings(settings);
             if reset {
                 runtime.placements.clear();
-                post_stats_with_vertex_update(&runtime, VertexBufferUpdate::Replace(Vec::new()));
+                runtime.attack_overlay_cache = None;
+                runtime.attack_overlay_job = None;
+                post_stats_with_updates(
+                    &runtime,
+                    VertexBufferUpdate::Replace(Vec::new()),
+                    AttackOverlayUpdate::replace_empty(),
+                );
             } else if anchor_colors_changed && !runtime.placements.is_empty() {
                 let vertices = pack_vertices(
                     &runtime.placements,
                     runtime.engine.settings(),
                     runtime.engine.color_state(),
                 );
-                post_stats_with_vertex_update(&runtime, VertexBufferUpdate::Replace(vertices));
+                let attack_overlay_update =
+                    attack_overlay_update_for_runtime(&mut runtime, overlay_may_need_refresh);
+                post_stats_with_updates(
+                    &runtime,
+                    VertexBufferUpdate::Replace(vertices),
+                    attack_overlay_update,
+                );
+            } else if overlay_may_need_refresh {
+                let attack_overlay_update = attack_overlay_update_for_runtime(&mut runtime, true);
+                post_stats_with_updates(&runtime, VertexBufferUpdate::None, attack_overlay_update);
             } else {
                 post_stats(&runtime);
             }
@@ -136,6 +169,13 @@ fn handle_message(
                 return Ok(());
             }
             post_step_result(&mut runtime, max_steps, 2_000_000);
+        }
+        AppToWorker::BuildAttackOverlay { epoch } => {
+            let mut runtime = runtime.borrow_mut();
+            if epoch != runtime.epoch {
+                return Ok(());
+            }
+            post_attack_overlay_build_chunk(&mut runtime);
         }
     }
 
@@ -186,12 +226,15 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
         runtime.running = false;
         let vertices = pack_vertices(&runtime.placements, runtime.engine.settings(), color_state);
         let log_placements = log_sample_for_full_run(&runtime.placements);
+        let attack_overlay_update = attack_overlay_update_for_runtime(runtime, false);
         post_worker_message(
             &runtime.scope,
             &WorkerToApp::Batch {
                 epoch: runtime.epoch,
                 log_placements,
                 vertex_update: VertexBufferUpdate::Replace(vertices),
+                attack_overlay_update,
+                attack_overlay_pending: attack_overlay_pending(runtime),
                 stats,
                 color_state,
             },
@@ -204,6 +247,8 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
                 stats,
                 color_state,
                 vertex_update: VertexBufferUpdate::None,
+                attack_overlay_update: AttackOverlayUpdate::none(),
+                attack_overlay_pending: attack_overlay_pending(runtime),
             },
         );
     }
@@ -225,6 +270,8 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
                 stats,
                 color_state,
                 vertex_update: VertexBufferUpdate::None,
+                attack_overlay_update: AttackOverlayUpdate::none(),
+                attack_overlay_pending: attack_overlay_pending(runtime),
             },
         );
     } else {
@@ -242,6 +289,7 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
                 color_state,
             ))
         };
+        let attack_overlay_update = attack_overlay_update_for_new_placements(runtime, &placements);
         let log_placements = log_sample_for_batch(previous_placement_count, &placements);
         post_worker_message(
             &runtime.scope,
@@ -249,6 +297,8 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
                 epoch: runtime.epoch,
                 log_placements,
                 vertex_update,
+                attack_overlay_update,
+                attack_overlay_pending: attack_overlay_pending(runtime),
                 stats,
                 color_state,
             },
@@ -258,11 +308,19 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
 
 #[cfg(target_arch = "wasm32")]
 fn post_stats(runtime: &WorkerRuntime) {
-    post_stats_with_vertex_update(runtime, VertexBufferUpdate::None);
+    post_stats_with_updates(
+        runtime,
+        VertexBufferUpdate::None,
+        AttackOverlayUpdate::none(),
+    );
 }
 
 #[cfg(target_arch = "wasm32")]
-fn post_stats_with_vertex_update(runtime: &WorkerRuntime, vertex_update: VertexBufferUpdate) {
+fn post_stats_with_updates(
+    runtime: &WorkerRuntime,
+    vertex_update: VertexBufferUpdate,
+    attack_overlay_update: AttackOverlayUpdate,
+) {
     post_worker_message(
         &runtime.scope,
         &WorkerToApp::Stats {
@@ -270,23 +328,171 @@ fn post_stats_with_vertex_update(runtime: &WorkerRuntime, vertex_update: VertexB
             stats: runtime.engine.stats(),
             color_state: runtime.engine.color_state(),
             vertex_update,
+            attack_overlay_update,
+            attack_overlay_pending: attack_overlay_pending(runtime),
         },
     );
+}
+
+#[cfg(target_arch = "wasm32")]
+fn attack_overlay_update_for_runtime(
+    runtime: &mut WorkerRuntime,
+    force_clear_when_disabled: bool,
+) -> AttackOverlayUpdate {
+    if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
+        runtime.attack_overlay_cache = None;
+        runtime.attack_overlay_job = None;
+        return if force_clear_when_disabled {
+            AttackOverlayUpdate::replace_empty()
+        } else {
+            AttackOverlayUpdate::none()
+        };
+    }
+
+    runtime.attack_overlay_cache = None;
+    runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
+        runtime.engine.settings().clone(),
+        runtime.placements.len(),
+    ));
+    AttackOverlayUpdate::replace_empty()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn attack_overlay_update_for_new_placements(
+    runtime: &mut WorkerRuntime,
+    placements: &[Placement],
+) -> AttackOverlayUpdate {
+    if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
+        runtime.attack_overlay_cache = None;
+        runtime.attack_overlay_job = None;
+        return AttackOverlayUpdate::none();
+    }
+
+    if runtime.attack_overlay_job.is_some() {
+        return AttackOverlayUpdate::none();
+    }
+
+    if attack_overlay_requires_full_rebuild_for_new_placements(runtime.engine.settings()) {
+        runtime.attack_overlay_cache = None;
+        runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
+            runtime.engine.settings().clone(),
+            runtime.placements.len(),
+        ));
+        return AttackOverlayUpdate::replace_empty();
+    }
+
+    if runtime.attack_overlay_cache.is_none() {
+        if runtime.placements.len() > placements.len() {
+            runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
+                runtime.engine.settings().clone(),
+                runtime.placements.len(),
+            ));
+            return AttackOverlayUpdate::replace_empty();
+        }
+        runtime.attack_overlay_cache =
+            Some(AttackOverlayCache::new(runtime.engine.settings().clone()));
+    }
+
+    runtime
+        .attack_overlay_cache
+        .as_mut()
+        .map_or_else(AttackOverlayUpdate::none, |cache| {
+            cache.append_placements(placements)
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn post_attack_overlay_build_chunk(runtime: &mut WorkerRuntime) {
+    if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
+        runtime.attack_overlay_cache = None;
+        runtime.attack_overlay_job = None;
+        post_stats_with_updates(
+            runtime,
+            VertexBufferUpdate::None,
+            AttackOverlayUpdate::replace_empty(),
+        );
+        return;
+    }
+
+    let Some(mut job) = runtime.attack_overlay_job.take() else {
+        post_stats(runtime);
+        return;
+    };
+
+    let (mut update, pending) = job.process_chunk(&runtime.placements, ATTACK_OVERLAY_BUILD_CHUNK);
+    if pending {
+        runtime.attack_overlay_job = Some(job);
+    } else {
+        let mut cache = job.into_cache();
+        let synced = cache.placement_count();
+        if runtime.placements.len() > synced {
+            if attack_overlay_requires_full_rebuild_for_new_placements(runtime.engine.settings()) {
+                runtime.attack_overlay_cache = None;
+                runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
+                    runtime.engine.settings().clone(),
+                    runtime.placements.len(),
+                ));
+                update = AttackOverlayUpdate::replace_empty();
+            } else {
+                let extra = cache.append_placements(&runtime.placements[synced..]);
+                update = merge_attack_overlay_updates(update, extra);
+                runtime.attack_overlay_cache = Some(cache);
+            }
+        } else {
+            runtime.attack_overlay_cache = Some(cache);
+        }
+    }
+
+    post_stats_with_updates(runtime, VertexBufferUpdate::None, update);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn attack_overlay_pending(runtime: &WorkerRuntime) -> bool {
+    runtime.attack_overlay_job.is_some()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn merge_attack_overlay_updates(
+    first: AttackOverlayUpdate,
+    second: AttackOverlayUpdate,
+) -> AttackOverlayUpdate {
+    AttackOverlayUpdate {
+        spots: merge_vertex_updates(first.spots, second.spots),
+        hits: merge_vertex_updates(first.hits, second.hits),
+        circles: merge_vertex_updates(first.circles, second.circles),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn merge_vertex_updates(
+    first: VertexBufferUpdate,
+    second: VertexBufferUpdate,
+) -> VertexBufferUpdate {
+    match (first, second) {
+        (VertexBufferUpdate::None, update) | (update, VertexBufferUpdate::None) => update,
+        (VertexBufferUpdate::Append(mut a), VertexBufferUpdate::Append(b)) => {
+            a.extend_from_slice(&b);
+            VertexBufferUpdate::Append(a)
+        }
+        (_, replace @ VertexBufferUpdate::Replace(_)) => replace,
+        (replace @ VertexBufferUpdate::Replace(_), _) => replace,
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 fn batch_parameters(settings: &EngineSettings) -> (u32, u64) {
     match settings.speed {
         SpeedMode::Fastest => match (settings.board, settings.army_preset) {
-            (BoardKind::ContinuousArchimedean, ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap) => {
-                (64, 200_000)
-            }
-            (_, ArmyPreset::PrimeKnight | ArmyPreset::PrimeGap) => (512, 500_000),
+            (
+                BoardKind::ContinuousArchimedean,
+                ArmyPreset::PrimeKnight | ArmyPreset::PrimeGapper,
+            ) => (64, 200_000),
+            (_, ArmyPreset::PrimeKnight | ArmyPreset::PrimeGapper) => (512, 500_000),
             _ => (4_096, 1_000_000),
         },
         SpeedMode::PerSecond(rate) => {
-            let frames_per_second = 20;
-            let batch = ((rate as u32).max(1) / frames_per_second).max(1);
+            let rate = (rate as u32).max(1);
+            let batch = if rate <= 20 { 1 } else { rate.div_ceil(20) };
             (batch, 20_000)
         }
     }

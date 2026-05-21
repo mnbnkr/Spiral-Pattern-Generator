@@ -42,7 +42,7 @@ pub enum PlacementSearchMode {
 pub enum ArmyPreset {
     CustomFinite,
     PrimeKnight,
-    PrimeGap,
+    PrimeGapper,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -303,6 +303,7 @@ pub struct EngineSettings {
     pub display_mode: DisplayMode,
     pub zoom: u8,
     pub track_opacity: f32,
+    pub attack_overlay_opacity: f32,
     pub proactive_attacking: bool,
     pub enemy_mode: EnemyMode,
     pub placement_search: PlacementSearchMode,
@@ -319,13 +320,14 @@ impl Default for EngineSettings {
         Self {
             board: BoardKind::LatticeSquare,
             shape: ShapeKind::Square,
-            radius: 100.0,
+            radius: 150.0,
             piece_radius: 0.5,
             visual_progress: true,
             speed: SpeedMode::Fastest,
             display_mode: DisplayMode::FitScreen,
             zoom: 4,
-            track_opacity: 0.0,
+            track_opacity: 0.1,
+            attack_overlay_opacity: 0.0,
             proactive_attacking: false,
             enemy_mode: EnemyMode::Color,
             placement_search: PlacementSearchMode::SpiralPath,
@@ -374,7 +376,7 @@ pub enum ColorRule {
     Fixed,
     OrderRainbow,
     PrimeKnightModulo,
-    PrimeGapBounds,
+    PrimeGapperBounds,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -449,6 +451,9 @@ pub enum AppToWorker {
         epoch: u64,
         max_steps: u32,
     },
+    BuildAttackOverlay {
+        epoch: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -458,6 +463,8 @@ pub enum WorkerToApp {
         epoch: u64,
         log_placements: Vec<Placement>,
         vertex_update: VertexBufferUpdate,
+        attack_overlay_update: AttackOverlayUpdate,
+        attack_overlay_pending: bool,
         stats: EngineStats,
         color_state: ColorState,
     },
@@ -466,6 +473,8 @@ pub enum WorkerToApp {
         stats: EngineStats,
         color_state: ColorState,
         vertex_update: VertexBufferUpdate,
+        attack_overlay_update: AttackOverlayUpdate,
+        attack_overlay_pending: bool,
     },
     Error {
         epoch: u64,
@@ -478,6 +487,33 @@ pub enum VertexBufferUpdate {
     None,
     Append(Vec<f32>),
     Replace(Vec<f32>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AttackOverlayUpdate {
+    pub spots: VertexBufferUpdate,
+    pub hits: VertexBufferUpdate,
+    pub circles: VertexBufferUpdate,
+}
+
+impl AttackOverlayUpdate {
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            spots: VertexBufferUpdate::None,
+            hits: VertexBufferUpdate::None,
+            circles: VertexBufferUpdate::None,
+        }
+    }
+
+    #[must_use]
+    pub fn replace_empty() -> Self {
+        Self {
+            spots: VertexBufferUpdate::Replace(Vec::new()),
+            hits: VertexBufferUpdate::Replace(Vec::new()),
+            circles: VertexBufferUpdate::Replace(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]

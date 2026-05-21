@@ -36,7 +36,7 @@
       <div class="panel-body">
 
       <section class="control-section">
-        <div class="two-column-row separated-row">
+        <div class="two-column-row separated-row render-settings-row">
           <label for="board-select"
             ><span class="label-row"
               >Board Type
@@ -92,7 +92,7 @@
             <input
               id="radius-input"
               type="text"
-              value="100"
+              value="150"
               inputmode="decimal"
               autocomplete="off"
             />
@@ -180,42 +180,63 @@
       </section>
 
       <section class="control-section">
-        <div class="two-column-row separated-row">
+        <div class="two-column-row separated-row render-settings-row">
           <label for="display-mode-select"
             ><span class="label-row"
               >Display Mode
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Fit Screen locks the view to Radius. 1:1 Pixel enables panning only after Zoom is above x1; the wheel zooms around the cursor."
+                data-tip="Fit Screen locks the view to Radius. Free Zoom enables panning and wheel zoom around the cursor."
                 >i</span
               ></span
             >
             <select id="display-mode-select">
               <option value="FitScreen">Fit Screen</option>
-              <option value="PixelOneToOne">1:1 Pixel</option>
+              <option value="PixelOneToOne">Free Zoom</option>
             </select>
           </label>
 
-          <label for="track-opacity-slider"
-            ><span class="label-row"
-              >Spiral Track <output id="track-opacity-output">Off</output>
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Draws the board's underlying spiral path behind pieces. This is render-only and does not reset the worker."
-                >i</span
-              ></span
-            >
-            <input
-              id="track-opacity-slider"
-              type="range"
-              min="0"
-              max="100"
-              step="1"
-              value="0"
-            />
-          </label>
+          <div class="stacked-render-sliders">
+            <label for="track-opacity-slider"
+              ><span class="label-row"
+                >Spiral Track <output id="track-opacity-output">10%</output>
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Draws the board's underlying spiral path behind pieces. This is render-only and does not reset the worker."
+                  >i</span
+                ></span
+              >
+              <input
+                id="track-opacity-slider"
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value="10"
+              />
+            </label>
+            <label for="attack-overlay-opacity-slider"
+              ><span class="label-row"
+                >Attack Spots <output id="attack-overlay-opacity-output">Off</output>
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Draws placed pieces' attack spots, proactive attack-rule shadows, or continuous attack circles. This is visual only and can be slower on dense high-radius runs."
+                  >i</span
+                ></span
+              >
+              <input
+                id="attack-overlay-opacity-slider"
+                type="range"
+                min="0"
+                max="100"
+                step="1"
+                value="0"
+              />
+            </label>
+          </div>
         </div>
 
         <div id="zoom-row">
@@ -304,7 +325,7 @@
           <select id="army-preset-select">
             <option value="CustomFinite">Custom Finite</option>
             <option value="PrimeKnight">Prime Knight</option>
-            <option value="PrimeGap">Prime Gap Knight</option>
+            <option value="PrimeGapper">Prime Gapper</option>
           </select>
         </label>
 

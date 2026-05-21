@@ -50,6 +50,35 @@ async function renderedPixelCount(page) {
   });
 }
 
+async function statusPlacementCount(page) {
+  const text = await page.locator("#status-line").textContent();
+  const match = text?.match(/(\d+) placements/);
+  return match ? Number(match[1]) : 0;
+}
+
+async function lightPixelCount(page) {
+  return page.locator("#sim-canvas").evaluate((canvas) => {
+    const source = canvas as HTMLCanvasElement;
+    const copy = document.createElement("canvas");
+    copy.width = source.width;
+    copy.height = source.height;
+    const context = copy.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("missing 2d context");
+    context.drawImage(source, 0, 0);
+    const data = context.getImageData(0, 0, copy.width, copy.height).data;
+    let pixels = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      if (r > 180 && g > 180 && b > 180) {
+        pixels += 1;
+      }
+    }
+    return pixels;
+  });
+}
+
 async function continuousSpotsForSearch(page, search: string) {
   await pauseIfRunning(page);
   await page.selectOption("#board-select", "ContinuousArchimedean");
@@ -86,6 +115,9 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect(page.locator("#enemy-mode-select option").nth(2)).toHaveText(
     "Color-Attack-set",
   );
+  await expect(page.locator("#radius-input")).toHaveValue("150");
+  await expect(page.locator("#track-opacity-output")).toHaveText("10%");
+  await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
   await page.waitForFunction(
     () => {
       const text = document.querySelector("#status-line")?.textContent ?? "";
@@ -104,6 +136,14 @@ test("radius border renders with track off and subpath-loaded app is nonblank", 
 }) => {
   await pauseIfRunning(page);
   await page.fill("#radius-input", "12");
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "0";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
   await page.click("#refresh-button");
   await expect(page.locator("#track-opacity-output")).toHaveText("Off");
   await expect
@@ -124,7 +164,7 @@ test("radius border renders with track off and subpath-loaded app is nonblank", 
     .toBeGreaterThan(0);
 });
 
-test("continuous center distance produces a distinct logical order", async ({
+test("continuous center distance uses the configured unit-chord spiral spots", async ({
   page,
 }) => {
   const spiralPath = await continuousSpotsForSearch(page, "SpiralPath");
@@ -132,13 +172,13 @@ test("continuous center distance produces a distinct logical order", async ({
 
   expect(spiralPath.length).toBeGreaterThan(8);
   expect(centerDistance.length).toBeGreaterThan(8);
-  expect(centerDistance).not.toEqual(spiralPath);
+  expect(centerDistance).toEqual(spiralPath);
 });
 
 test("continuous prime presets show early progress in fastest mode", async ({
   page,
 }) => {
-  for (const preset of ["PrimeKnight", "PrimeGap"]) {
+  for (const preset of ["PrimeKnight", "PrimeGapper"]) {
     await page.selectOption("#board-select", "ContinuousArchimedean");
     await expect(page.locator("#piece-radius-output")).toHaveText("0.50");
     await page.selectOption("#army-preset-select", preset);
@@ -162,6 +202,48 @@ test("continuous prime presets show early progress in fastest mode", async ({
       timeout: 15_000,
     });
   }
+});
+
+test("1/s speed remains slow after faster slider changes", async ({ page }) => {
+  await pauseIfRunning(page);
+  await page.locator("#fastest-toggle").uncheck();
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>("#speed-slider");
+    if (!slider) throw new Error("missing speed slider");
+    slider.value = "1";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("#speed-output")).toHaveText("1/s");
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+
+  await page.waitForTimeout(750);
+  const slowInitial = await statusPlacementCount(page);
+  expect(slowInitial).toBeLessThanOrEqual(1);
+  await page.waitForTimeout(700);
+  const first = await statusPlacementCount(page);
+  expect(first).toBeLessThanOrEqual(2);
+
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>("#speed-slider");
+    if (!slider) throw new Error("missing speed slider");
+    slider.value = "200";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect
+    .poll(() => statusPlacementCount(page), { timeout: 5_000 })
+    .toBeGreaterThan(first + 2);
+
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>("#speed-slider");
+    if (!slider) throw new Error("missing speed slider");
+    slider.value = "1";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("#speed-output")).toHaveText("1/s");
+  const slowed = await statusPlacementCount(page);
+  await page.waitForTimeout(650);
+  expect(await statusPlacementCount(page)).toBeLessThanOrEqual(slowed + 1);
 });
 
 test("lattice render-only controls do not reset placements", async ({
@@ -240,6 +322,24 @@ test("custom row edits stage without clearing the visible snapshot", async ({
   await expect.poll(() => renderedPixelCount(page)).toBeGreaterThan(0);
 });
 
+test("dragging identical custom rows is a visual no-op and preserves the snapshot", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  const beforePixels = await renderedPixelCount(page);
+  expect(beforePixels).toBeGreaterThan(0);
+  const beforeStatus = await page.locator("#status-line").textContent();
+
+  const rows = page.locator(".army-row");
+  await rows.nth(0).dragTo(rows.nth(1));
+
+  await expect(page.locator("#placement-log")).toContainText("placements logged:");
+  await expect(page.locator("#placement-log")).not.toContainText("No placements yet.");
+  await expect.poll(() => renderedPixelCount(page)).toBeGreaterThan(0);
+  expect(await page.locator("#status-line").textContent()).toBe(beforeStatus);
+});
+
 test("complete runs hide the radius border until settings change", async ({
   page,
 }) => {
@@ -267,7 +367,7 @@ test("complete runs hide the radius border until settings change", async ({
   );
 });
 
-test("canvas cursor only advertises panning when panning is available", async ({
+test("canvas cursor and wheel activate Free Zoom panning", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -279,6 +379,9 @@ test("canvas cursor only advertises panning when panning is available", async ({
     )
     .not.toBe("grab");
 
+  await page.mouse.move(500, 360);
+  await page.mouse.wheel(0, -120);
+  await expect(page.locator("#display-mode-select")).toHaveValue("PixelOneToOne");
   await page.selectOption("#display-mode-select", "PixelOneToOne");
   await expect
     .poll(() =>
@@ -300,7 +403,24 @@ test("canvas cursor only advertises panning when panning is available", async ({
         return getComputedStyle(canvas as HTMLCanvasElement).cursor;
       }),
     )
-    .not.toBe("grab");
+    .toBe("grab");
+});
+
+test("display mode row is vertically centered against render sliders", async ({
+  page,
+}) => {
+  const delta = await page.locator("#display-mode-select").evaluate((select) => {
+    const label = select.closest("label");
+    const stack = label?.nextElementSibling;
+    if (!label || !stack) throw new Error("missing display mode row");
+    const labelRect = label.getBoundingClientRect();
+    const stackRect = stack.getBoundingClientRect();
+    return Math.abs(
+      labelRect.top + labelRect.height / 2 - (stackRect.top + stackRect.height / 2),
+    );
+  });
+
+  expect(delta).toBeLessThanOrEqual(2);
 });
 
 test("color labels do not open broad clickable color targets", async ({
@@ -345,12 +465,71 @@ test("hex shape, spiral track, and compressed export stay wired", async ({
   });
   await expect(page.locator("#track-opacity-output")).toHaveText("45%");
 
+  await page.fill("#radius-input", "10");
+  await page.click("#refresh-button");
+  await expect(page.locator("#status-line")).toContainText("Paused");
   await page.click("#step-button");
   await expect(page.locator("#status-line")).toContainText("1 placements");
+  const statusBeforeOverlay = await page.locator("#status-line").textContent();
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#attack-overlay-opacity-slider",
+    );
+    if (!slider) throw new Error("missing attack overlay slider");
+    slider.value = "80";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("80%");
+  await expect(page.locator("#status-line")).not.toContainText("0 placements");
+  expect(await page.locator("#status-line").textContent()).toBe(statusBeforeOverlay);
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+      }),
+    )
+    .toBeGreaterThan(0);
 
   const download = page.waitForEvent("download");
   await page.click("#download-jpeg-button");
   expect((await download).suggestedFilename()).toContain("image-half");
+});
+
+test("proactive attack spots initialize while a prime run is active", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "80");
+  await page.selectOption("#army-preset-select", "PrimeKnight");
+  await page.check("#attacking-toggle");
+  await page.click("#refresh-button");
+  await expect(page.locator("#status-line")).toContainText("Paused");
+  await page.click("#start-button");
+  await expect
+    .poll(() => statusPlacementCount(page), { timeout: 15_000 })
+    .toBeGreaterThan(8);
+
+  const before = await statusPlacementCount(page);
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#attack-overlay-opacity-slider",
+    );
+    if (!slider) throw new Error("missing attack overlay slider");
+    slider.value = "75";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+
+  await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("75%");
+  await expect(page.locator("#status-line")).not.toContainText("0 placements");
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+      }),
+      { timeout: 15_000 },
+    )
+    .toBeGreaterThan(0);
+  expect(await statusPlacementCount(page)).toBeGreaterThanOrEqual(before);
 });
 
 test("full png, regular png, and jpeg export buttons produce downloads", async ({
@@ -379,6 +558,45 @@ test("full png, regular png, and jpeg export buttons produce downloads", async (
   expect((await jpeg).suggestedFilename()).toContain("image-half");
 });
 
+test("failed image export restores the button and later reduced-radius exports work", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.click("#refresh-button");
+  await expect(page.locator("#status-line")).toContainText("Paused");
+  await page.click("#step-button");
+  await expect(page.locator("#status-line")).toContainText("1 placements", {
+    timeout: 15_000,
+  });
+
+  await page.evaluate(() => {
+    const original = HTMLCanvasElement.prototype.toBlob;
+    (window as typeof window & { __originalToBlob?: typeof original }).__originalToBlob =
+      original;
+    HTMLCanvasElement.prototype.toBlob = function (callback) {
+      window.setTimeout(() => callback(null), 0);
+    };
+  });
+  await page.click("#download-png-button");
+  await expect(page.locator("#status-line")).toContainText("Export failed", {
+    timeout: 10_000,
+  });
+  await expect(page.locator("#download-png-button")).toHaveText("PNG");
+  await expect(page.locator("#download-png-button")).toBeEnabled();
+
+  await page.fill("#radius-input", "20");
+  await page.evaluate(() => {
+    const original = (window as typeof window & {
+      __originalToBlob?: typeof HTMLCanvasElement.prototype.toBlob;
+    }).__originalToBlob;
+    if (!original) throw new Error("missing original toBlob");
+    HTMLCanvasElement.prototype.toBlob = original;
+  });
+  const download = page.waitForEvent("download");
+  await page.click("#download-png-button");
+  expect((await download).suggestedFilename()).toContain("image");
+});
+
 test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async ({
   page,
 }) => {
@@ -389,9 +607,17 @@ test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async 
       timeout: 15_000,
     });
   }
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-piece-shape",
+    "Square",
+  );
 
   await page.selectOption("#board-select", "LatticeTriangle");
   await expect(page.locator("#shape-select")).toHaveValue("Triangle");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-piece-shape",
+    "Square",
+  );
   await expect(page.locator("#placement-search-select")).toHaveValue("SpiralPath");
   await expect(page.locator("#placement-log")).toContainText("board=LatticeSquare");
   await expect(page.locator("#shape-option-square")).toHaveAttribute(
@@ -407,6 +633,10 @@ test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async 
   await expect(page.locator("#placement-log")).toContainText("triangle(");
   await expect(page.locator("#placement-log")).toContainText("coord=triangle(0,0)");
   await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-piece-shape",
+    "Triangle",
+  );
 
   await page.fill("#radius-input", "12");
   await page.click("#refresh-button");
@@ -425,7 +655,7 @@ test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async 
   await page.mouse.move(560, 390);
   await page.mouse.up();
   await page.mouse.wheel(0, -120);
-  await expect(page.locator("#zoom-output")).toHaveText("x5");
+  await expect(page.locator("#display-mode-select")).toHaveValue("PixelOneToOne");
 });
 
 test("visual progress off is explicit and re-enabling pauses cleanly", async ({
@@ -456,7 +686,7 @@ test("refresh terminates a silent continuous run and keeps controls usable", asy
 }) => {
   await pauseIfRunning(page);
   await page.selectOption("#board-select", "ContinuousArchimedean");
-  await page.selectOption("#army-preset-select", "PrimeGap");
+  await page.selectOption("#army-preset-select", "PrimeGapper");
   await page.uncheck("#visual-progress-toggle");
   await page.click("#start-button");
   await expect(page.locator("#status-line")).toContainText("Running silently");
@@ -465,7 +695,7 @@ test("refresh terminates a silent continuous run and keeps controls usable", asy
   await expect(page.locator("#status-line")).toContainText("Paused", {
     timeout: 10_000,
   });
-  await expect(page.locator("#army-preset-select")).toHaveValue("PrimeGap");
+  await expect(page.locator("#army-preset-select")).toHaveValue("PrimeGapper");
   await expect(page.locator("#visual-progress-toggle")).not.toBeChecked();
 
   await page.selectOption("#board-select", "LatticeHex");
@@ -746,6 +976,14 @@ test("high-radius center distance starts without a full-radius prebuild", async 
   page,
 }) => {
   await pauseIfRunning(page);
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "0";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
   await page.fill("#radius-input", "1500");
   await page.selectOption("#placement-search-select", "CenterDistance");
   await page.click("#step-button");
@@ -774,23 +1012,27 @@ test("higher radius commits without clearing the visible generation", async ({
   const beforeLog = await page.locator("#placement-log").textContent();
   expect(beforeLog).toContain("placements logged:");
 
-  await page.fill("#radius-input", "130");
+  await page.fill("#radius-input", "180");
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
   await page.waitForTimeout(2_300);
-  await expect(page.locator("#radius-input")).toHaveValue("130");
+  await expect(page.locator("#radius-input")).toHaveValue("180");
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
   await expect(page.locator("#status-line")).not.toContainText("0 placements");
 });
 
-test("large strict export reports a visible error instead of silently doing nothing", async ({
+test("image export button enters cancel state and can cancel", async ({
   page,
 }) => {
   await pauseIfRunning(page);
-  await page.selectOption("#board-select", "LatticeHex");
-  await page.fill("#radius-input", "3000");
+  await page.fill("#radius-input", "1000");
 
   await page.click("#download-full-png-button");
-  await expect(page.locator("#status-line")).toContainText("Export failed", {
+  await expect(page.locator("#download-full-png-button")).toHaveText("Cancel", {
     timeout: 5_000,
   });
+  await page.click("#download-full-png-button");
+  await expect(page.locator("#status-line")).toContainText("Export canceled", {
+    timeout: 10_000,
+  });
+  await expect(page.locator("#download-full-png-button")).toHaveText("Full PNG");
 });

@@ -208,6 +208,16 @@ button:hover {
   background: #2b333b;
 }
 
+button.export-cancel-active {
+  border-color: #f7f7f7;
+  background: #5a3440;
+  color: #ffffff;
+}
+
+button.export-cancel-active:hover {
+  background: #6d3c4c;
+}
+
 select:disabled,
 input:disabled,
 button:disabled {
@@ -334,6 +344,19 @@ input[type="color"] {
   border-left: 1px solid rgb(255 255 255 / 12%);
 }
 
+.stacked-render-sliders {
+  display: grid;
+  gap: 8px;
+}
+
+.render-settings-row {
+  align-items: center;
+}
+
+.render-settings-row > label {
+  align-self: center;
+}
+
 .invalid-input {
   border-color: #ff6b6b !important;
   color: #ffb4b4 !important;
@@ -445,6 +468,9 @@ input[type="color"] {
   align-items: center;
   min-height: 36px;
   cursor: grab;
+  border-radius: 6px;
+  outline: 1px solid transparent;
+  transition: background 120ms ease, opacity 120ms ease, outline-color 120ms ease;
 }
 
 .army-empty-row {
@@ -455,6 +481,15 @@ input[type="color"] {
 
 .army-row:active {
   cursor: grabbing;
+}
+
+.army-row.drag-source {
+  opacity: 0.62;
+}
+
+.army-row.drag-over {
+  background: rgb(247 247 247 / 8%);
+  outline-color: rgb(247 247 247 / 35%);
 }
 
 .army-row span {
