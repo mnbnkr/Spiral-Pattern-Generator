@@ -5,9 +5,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::spatial::{ContinuousSpatialHash, LatticeSpatialIndex};
 use crate::math::{
-    ArchimedeanSpiral, ArchimedeanSpots, AxialCoord, HexSpiral, Point2, SquareCoord, SquareSpiral,
-    TriangleCoord, TriangleSpiral, attack_circle_hits_body_distance_squared,
-    attack_radius_from_move, bodies_overlap,
+    ArchimedeanSpiral, ArchimedeanSpots, AxialCoord, GEOM_EPS, HexSpiral, Point2, SquareCoord,
+    SquareSpiral, TriangleCoord, TriangleSpiral, attack_circle_hits_body_distance_squared,
+    attack_radius_from_move,
 };
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
@@ -19,6 +19,8 @@ const CONTINUOUS_CENTER_STREAMS: usize = 1;
 const SPECIAL_PRIME_COLOR_GROUP: u64 = 0;
 const SPECIAL_PRIME_COLOR: &str = "#808080";
 const ATTACK_RELEVANCE_RADIUS_MULTIPLIER: f64 = 4.0;
+const CONTINUOUS_BODY_OVERLAP_ALLOWANCE_FRACTION: f64 = 0.005;
+const MAX_PREALLOCATED_SPIRAL_PATH_SPOTS: u64 = 12_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimulationMode {
@@ -46,18 +48,134 @@ struct CandidatePiece {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct PlacedPiece {
-    id: u64,
     spot_index: u64,
-    lattice_coord: Option<(i64, i64)>,
-    center: Point2,
+    location: PlacedLocation,
     piece: PieceSignature,
-    color: PieceColor,
-    shape: ShapeKind,
-    move_group: (i32, i32),
-    color_group: u64,
+    color_rule: ColorRule,
+    fixed_color: StoredFixedColor,
+    color_key: ColorKey,
     attack_radius: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PlacedLocation {
+    Lattice { a: i64, b: i64 },
+    Continuous { center: Point2, theta: f64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredFixedColor {
+    None,
+    SpecialPrime,
+}
+
+impl StoredFixedColor {
+    fn from_color(color: &PieceColor) -> Self {
+        if color.rule == ColorRule::Fixed && color.fixed_css == SPECIAL_PRIME_COLOR {
+            Self::SpecialPrime
+        } else {
+            Self::None
+        }
+    }
+
+    fn to_css(self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::SpecialPrime => SPECIAL_PRIME_COLOR.to_string(),
+        }
+    }
+}
+
+impl PlacedPiece {
+    fn to_protocol(&self, id: u64, board: BoardKind, shape: ShapeKind) -> Placement {
+        let coord = match board {
+            BoardKind::LatticeSquare => {
+                let (x, y) = self.lattice_coord();
+                SpotCoord::Square { x, y }
+            }
+            BoardKind::LatticeHex => {
+                let (q, r) = self.lattice_coord();
+                SpotCoord::Hex { q, r }
+            }
+            BoardKind::LatticeTriangle => {
+                let (u, v) = self.lattice_coord();
+                SpotCoord::Triangle { u, v }
+            }
+            BoardKind::ContinuousArchimedean => match self.location {
+                PlacedLocation::Continuous { center, theta } => SpotCoord::Continuous {
+                    x: center.x,
+                    y: center.y,
+                    theta,
+                },
+                PlacedLocation::Lattice { .. } => SpotCoord::Continuous {
+                    x: 0.0,
+                    y: 0.0,
+                    theta: 0.0,
+                },
+            },
+        };
+
+        Placement {
+            id,
+            spot_index: self.spot_index,
+            coord,
+            piece: self.piece,
+            color: PieceColor {
+                rule: self.color_rule,
+                fixed_css: self.fixed_color.to_css(),
+                key: self.color_key,
+            },
+            shape,
+        }
+    }
+
+    fn lattice_coord(&self) -> (i64, i64) {
+        match self.location {
+            PlacedLocation::Lattice { a, b } => (a, b),
+            PlacedLocation::Continuous { .. } => (0, 0),
+        }
+    }
+
+    fn continuous_center(&self) -> Option<Point2> {
+        match self.location {
+            PlacedLocation::Continuous { center, .. } => Some(center),
+            PlacedLocation::Lattice { .. } => None,
+        }
+    }
+}
+
+fn preallocated_spiral_path_spots(settings: &EngineSettings) -> Option<usize> {
+    if settings.placement_search != PlacementSearchMode::SpiralPath {
+        return None;
+    }
+
+    let radius = settings.radius.max(0.0).floor() as u64;
+    let count = match settings.board {
+        BoardKind::LatticeSquare => {
+            let side = radius.saturating_mul(2).saturating_add(1);
+            side.saturating_mul(side)
+        }
+        BoardKind::LatticeHex => 1_u64.saturating_add(
+            3_u64
+                .saturating_mul(radius)
+                .saturating_mul(radius.saturating_add(1)),
+        ),
+        BoardKind::LatticeTriangle => {
+            let last_segment = radius.saturating_mul(3);
+            last_segment
+                .saturating_mul(last_segment.saturating_add(1))
+                .saturating_div(2)
+                .saturating_add(1)
+        }
+        BoardKind::ContinuousArchimedean => return None,
+    };
+
+    if count <= MAX_PREALLOCATED_SPIRAL_PATH_SPOTS {
+        usize::try_from(count).ok()
+    } else {
+        None
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -206,13 +324,9 @@ pub struct SimulationEngine {
     center_queue: BinaryHeap<CenterQueueEntry>,
     center_next_shell: u64,
     center_shells_exhausted: bool,
-    square_spiral: SquareSpiral,
-    hex_spiral: HexSpiral,
-    triangle_spiral: TriangleSpiral,
     continuous_spiral: ArchimedeanSpots,
     continuous_center_spirals: Vec<ArchimedeanSpots>,
     continuous_center_streams_exhausted: Vec<bool>,
-    occupied_spots: FxHashMap<u64, u64>,
     lattice_index: LatticeSpatialIndex,
     continuous_index: ContinuousSpatialHash,
     max_continuous_attack_radius: f64,
@@ -230,6 +344,15 @@ impl SimulationEngine {
         let continuous_spiral = ArchimedeanSpiral::spots(settings.continuous_offset);
         let continuous_center_spirals = continuous_center_spirals(&settings);
         let continuous_center_streams_exhausted = vec![false; continuous_center_spirals.len()];
+        let preallocated_spiral_path_spots = preallocated_spiral_path_spots(&settings);
+        let mut spots = Vec::new();
+        let mut placed = Vec::new();
+        if let Some(capacity) = preallocated_spiral_path_spots {
+            if settings.board == BoardKind::ContinuousArchimedean {
+                let _ = spots.try_reserve_exact(capacity);
+            }
+            let _ = placed.try_reserve_exact(capacity);
+        }
         Self {
             settings,
             mode,
@@ -240,24 +363,20 @@ impl SimulationEngine {
             next_prime_candidate_index: 0,
             shared_prime_spot_order_index: 0,
             prime_color_spot_order_indices: FxHashMap::default(),
-            spots: Vec::new(),
+            spots,
             spots_exhausted: false,
             first_out_of_radius_spot: None,
             center_ordered_spots: Vec::new(),
             center_queue: BinaryHeap::new(),
             center_next_shell: 0,
             center_shells_exhausted: false,
-            square_spiral: SquareSpiral::new(),
-            hex_spiral: HexSpiral::new(),
-            triangle_spiral: TriangleSpiral::new(),
             continuous_spiral,
             continuous_center_spirals,
             continuous_center_streams_exhausted,
-            occupied_spots: FxHashMap::default(),
             lattice_index: LatticeSpatialIndex::new(),
             continuous_index: ContinuousSpatialHash::new(2.0),
             max_continuous_attack_radius: 0.0,
-            placed: Vec::new(),
+            placed,
             prime_cache: Vec::new(),
             min_gap_seen: None,
             max_gap_seen: None,
@@ -266,6 +385,39 @@ impl SimulationEngine {
 
     pub fn reset(&mut self, settings: EngineSettings) {
         *self = Self::new(settings);
+    }
+
+    #[must_use]
+    pub fn placement_count(&self) -> usize {
+        self.placed.len()
+    }
+
+    #[must_use]
+    pub fn placement_at(&self, index: usize) -> Option<Placement> {
+        let shape = forced_shape_for_board(self.settings.board, self.settings.shape);
+        self.placed
+            .get(index)
+            .map(|placement| placement.to_protocol(index as u64, self.settings.board, shape))
+    }
+
+    #[must_use]
+    pub fn placements_in_range(&self, start: usize, end: usize) -> Vec<Placement> {
+        let end = end.min(self.placed.len());
+        if start >= end {
+            return Vec::new();
+        }
+
+        let mut placements = Vec::with_capacity(end - start);
+        let shape = forced_shape_for_board(self.settings.board, self.settings.shape);
+        placements.extend(
+            self.placed[start..end]
+                .iter()
+                .enumerate()
+                .map(|(offset, placement)| {
+                    placement.to_protocol((start + offset) as u64, self.settings.board, shape)
+                }),
+        );
+        placements
     }
 
     pub fn update_settings(&mut self, settings: EngineSettings) -> bool {
@@ -403,23 +555,32 @@ impl SimulationEngine {
         let center = spot.center();
         let lattice_coord = spot.lattice_coord();
         let coord = spot.spot_coord();
+        let continuous_theta = match coord {
+            SpotCoord::Continuous { theta, .. } => theta,
+            _ => 0.0,
+        };
         let spot_index = spot.index();
         let id = self.next_id;
+        let fixed_color = StoredFixedColor::from_color(&piece.color);
+        let color_rule = piece.color.rule;
+        let color_key = piece.color.key;
+        let location = lattice_coord.map_or(
+            PlacedLocation::Continuous {
+                center,
+                theta: continuous_theta,
+            },
+            |(a, b)| PlacedLocation::Lattice { a, b },
+        );
 
         let placed_piece = PlacedPiece {
-            id,
             spot_index,
-            lattice_coord,
-            center,
+            location,
             piece: piece.signature,
-            color: piece.color.clone(),
-            shape,
-            move_group: piece.move_group,
-            color_group: piece.color_group,
+            color_rule,
+            fixed_color,
+            color_key,
             attack_radius: piece.attack_radius,
         };
-
-        self.occupied_spots.insert(spot_index, id);
 
         if let Some(coord) = lattice_coord {
             self.lattice_index.insert_occupied(coord, id);
@@ -455,10 +616,6 @@ impl SimulationEngine {
     }
 
     fn is_valid_candidate(&mut self, spot: &BoardSpot, candidate: &CandidatePiece) -> bool {
-        if self.occupied_spots.contains_key(&spot.index()) {
-            return false;
-        }
-
         match self.settings.board {
             BoardKind::LatticeSquare | BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
                 self.is_valid_lattice_candidate(spot, candidate)
@@ -521,8 +678,11 @@ impl SimulationEngine {
             let Some(existing) = self.placed.get(id as usize) else {
                 continue;
             };
+            let Some(existing_center) = existing.continuous_center() else {
+                continue;
+            };
 
-            if bodies_overlap(center, existing.center, body_radius) {
+            if continuous_bodies_overlap(center, existing_center, body_radius) {
                 return false;
             }
         }
@@ -531,10 +691,13 @@ impl SimulationEngine {
             let Some(existing) = self.placed.get(id as usize) else {
                 continue;
             };
+            let Some(existing_center) = existing.continuous_center() else {
+                continue;
+            };
 
             if self.are_enemies(existing, candidate)
                 && attack_circle_hits_body_distance_squared(
-                    existing.center.squared_distance(center),
+                    existing_center.squared_distance(center),
                     existing.attack_radius,
                     body_radius,
                 )
@@ -549,10 +712,13 @@ impl SimulationEngine {
                 let Some(existing) = self.placed.get(id as usize) else {
                     continue;
                 };
+                let Some(existing_center) = existing.continuous_center() else {
+                    continue;
+                };
 
                 if self.are_enemies(existing, candidate)
                     && attack_circle_hits_body_distance_squared(
-                        center.squared_distance(existing.center),
+                        center.squared_distance(existing_center),
                         candidate.attack_radius,
                         body_radius,
                     )
@@ -605,11 +771,11 @@ impl SimulationEngine {
     }
 
     fn are_enemies(&self, existing: &PlacedPiece, candidate: &CandidatePiece) -> bool {
-        if self.enemy_mode_uses_color() && existing.color_group != candidate.color_group {
+        if self.enemy_mode_uses_color() && existing.color_key.group != candidate.color_group {
             return true;
         }
 
-        self.enemy_mode_uses_attack_set() && existing.move_group != candidate.move_group
+        self.enemy_mode_uses_attack_set() && move_group(existing.piece) != candidate.move_group
     }
 
     fn enemy_mode_uses_color(&self) -> bool {
@@ -980,6 +1146,10 @@ impl SimulationEngine {
     }
 
     fn spot_at(&mut self, index: usize) -> Option<BoardSpot> {
+        if self.settings.board != BoardKind::ContinuousArchimedean {
+            return self.lattice_spiral_path_spot_at(index);
+        }
+
         if self.spots_exhausted && self.spots.len() <= index {
             return None;
         }
@@ -989,37 +1159,11 @@ impl SimulationEngine {
             let spot = if let Some(spot) = self.first_out_of_radius_spot.take() {
                 spot
             } else {
-                match self.settings.board {
-                    BoardKind::LatticeSquare => {
-                        let coord = self.square_spiral.next()?;
-                        BoardSpot::Square {
-                            index: next_index,
-                            coord,
-                        }
-                    }
-                    BoardKind::LatticeHex => {
-                        let coord = self.hex_spiral.next()?;
-                        BoardSpot::Hex {
-                            index: next_index,
-                            coord,
-                        }
-                    }
-                    BoardKind::LatticeTriangle => {
-                        let coord = self.triangle_spiral.next()?;
-                        BoardSpot::Triangle {
-                            index: next_index,
-                            coord,
-                            spiral_radius: TriangleSpiral::radius_for_index(next_index),
-                        }
-                    }
-                    BoardKind::ContinuousArchimedean => {
-                        let spot = self.continuous_spiral.next()?;
-                        BoardSpot::Continuous {
-                            index: next_index,
-                            theta: spot.theta,
-                            center: spot.center,
-                        }
-                    }
+                let spot = self.continuous_spiral.next()?;
+                BoardSpot::Continuous {
+                    index: next_index,
+                    theta: spot.theta,
+                    center: spot.center,
                 }
             };
 
@@ -1036,6 +1180,46 @@ impl SimulationEngine {
         }
 
         self.spots.get(index).cloned()
+    }
+
+    fn lattice_spiral_path_spot_at(&mut self, index: usize) -> Option<BoardSpot> {
+        let index = index as u64;
+        if self
+            .first_out_of_radius_spot
+            .as_ref()
+            .is_some_and(|spot| index >= spot.index())
+            && self.spots_exhausted
+        {
+            return None;
+        }
+
+        let spot = match self.settings.board {
+            BoardKind::LatticeSquare => BoardSpot::Square {
+                index,
+                coord: SquareSpiral::coord_at_index(index),
+            },
+            BoardKind::LatticeHex => BoardSpot::Hex {
+                index,
+                coord: HexSpiral::coord_at_index(index),
+            },
+            BoardKind::LatticeTriangle => BoardSpot::Triangle {
+                index,
+                coord: TriangleSpiral::coord_at_index(index),
+                spiral_radius: TriangleSpiral::radius_for_index(index),
+            },
+            BoardKind::ContinuousArchimedean => return None,
+        };
+
+        if !self.spot_within_generation_radius(&spot) {
+            self.first_out_of_radius_spot = Some(spot);
+            self.stats.current_radius =
+                self.stats.current_radius.max(self.settings.radius.max(0.0));
+            self.spots_exhausted = true;
+            return None;
+        }
+
+        self.stats.current_radius = self.stats.current_radius.max(spot.generation_radius());
+        Some(spot)
     }
 
     fn spot_within_generation_radius(&self, spot: &BoardSpot) -> bool {
@@ -1373,6 +1557,12 @@ pub(crate) fn attack_radius_relevant_to_generation(
     attack_radius: f64,
 ) -> bool {
     attack_radius <= max_relevant_attack_radius(settings) + f64::EPSILON
+}
+
+fn continuous_bodies_overlap(a: Point2, b: Point2, body_radius: f64) -> bool {
+    let minimum_distance = (2.0 * body_radius.max(0.0)).max(0.0);
+    let allowance = minimum_distance * CONTINUOUS_BODY_OVERLAP_ALLOWANCE_FRACTION;
+    a.distance(b) < minimum_distance - allowance - GEOM_EPS
 }
 
 fn prime_knight_color_bucket(value: u32, divisor: u32) -> (u32, f64) {
@@ -2178,6 +2368,61 @@ mod tests {
     }
 
     #[test]
+    fn high_radius_spiral_path_preallocates_lattice_without_caching_spots() {
+        let radius = 1_500.0;
+        for (board, expected_capacity) in [
+            (BoardKind::LatticeSquare, 9_006_001_usize),
+            (BoardKind::LatticeHex, 6_754_501_usize),
+            (BoardKind::LatticeTriangle, 10_127_251_usize),
+        ] {
+            let settings = EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else {
+                    ShapeKind::Square
+                },
+                radius,
+                placement_search: PlacementSearchMode::SpiralPath,
+                custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+                ..EngineSettings::default()
+            };
+            assert_eq!(
+                preallocated_spiral_path_spots(&settings),
+                Some(expected_capacity),
+                "board={board:?}"
+            );
+
+            let mut engine = SimulationEngine::new(settings);
+            let batch = engine.step_budget(8, 8);
+            assert_eq!(batch.len(), 8, "board={board:?}");
+            assert!(
+                engine.spots.is_empty(),
+                "lattice SpiralPath should compute spots by index instead of caching every spot"
+            );
+        }
+    }
+
+    #[test]
+    fn continuous_spiral_path_does_not_preallocate_large_spot_cache() {
+        let settings = EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            shape: ShapeKind::Circle,
+            radius: 1_500.0,
+            piece_radius: 0.50,
+            placement_search: PlacementSearchMode::SpiralPath,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        };
+
+        assert_eq!(preallocated_spiral_path_spots(&settings), None);
+        let mut engine = SimulationEngine::new(settings);
+        let batch = engine.step_budget(8, 8);
+        assert_eq!(batch.len(), 8);
+        assert_eq!(engine.spots.len(), 8);
+    }
+
+    #[test]
     fn continuous_center_distance_high_radius_starts_without_prebuilding_full_radius() {
         let mut engine = SimulationEngine::new(EngineSettings {
             board: BoardKind::ContinuousArchimedean,
@@ -2312,6 +2557,43 @@ mod tests {
         assert_eq!(spiral_indices[0], 0);
         assert_eq!(center_indices[0], 0);
         assert!(center_distance.stats().exhausted);
+    }
+
+    #[test]
+    fn continuous_spiral_path_inert_piece_fills_every_unit_chord_spot() {
+        let radius = 200.0;
+        let mut expected = Vec::new();
+        for spot in ArchimedeanSpiral::spots(0.0) {
+            if spot.center.radius() > radius + 1.0e-9 {
+                break;
+            }
+            expected.push(spot.index);
+        }
+
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::ContinuousArchimedean,
+            shape: ShapeKind::Circle,
+            radius,
+            piece_radius: 0.50,
+            placement_search: PlacementSearchMode::SpiralPath,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(expected.len() as u32 + 1, 20_000_000);
+        let actual = batch
+            .iter()
+            .map(|placement| placement.spot_index)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual.len(), expected.len());
+        for (position, expected_index) in expected.iter().enumerate() {
+            assert_eq!(
+                actual.get(position),
+                Some(expected_index),
+                "first missing or reordered continuous spot at placement position {position}"
+            );
+        }
+        assert!(engine.stats().exhausted);
     }
 
     #[test]

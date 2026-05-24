@@ -7,12 +7,12 @@ use std::rc::Rc;
 use spiral_pattern_generator::engine::SimulationEngine;
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::protocol::{
-    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, EngineSettings, Placement, SpeedMode,
-    VertexBufferUpdate, WorkerToApp,
+    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, ColorState, EngineSettings, Placement,
+    SpeedMode, VertexBufferUpdate, WorkerToApp,
 };
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::render_data::{
-    AttackOverlayBuildJob, AttackOverlayCache,
+    AttackOverlayBuildJob, AttackOverlayCache, ColorAnchors, append_vertices,
     attack_overlay_requires_full_rebuild_for_new_placements, pack_vertices,
 };
 #[cfg(target_arch = "wasm32")]
@@ -26,7 +26,6 @@ use web_sys::{DedicatedWorkerGlobalScope, MessageEvent};
 struct WorkerRuntime {
     scope: DedicatedWorkerGlobalScope,
     engine: SimulationEngine,
-    placements: Vec<Placement>,
     attack_overlay_cache: Option<AttackOverlayCache>,
     attack_overlay_job: Option<AttackOverlayBuildJob>,
     running: bool,
@@ -45,7 +44,6 @@ pub fn start() -> Result<(), JsValue> {
     let runtime = Rc::new(RefCell::new(WorkerRuntime {
         scope: scope.clone(),
         engine: SimulationEngine::new(EngineSettings::default()),
-        placements: Vec::new(),
         attack_overlay_cache: None,
         attack_overlay_job: None,
         running: false,
@@ -84,7 +82,6 @@ fn handle_message(
             runtime.epoch = epoch;
             runtime.running = false;
             runtime.engine.reset(settings);
-            runtime.placements.clear();
             runtime.attack_overlay_cache = None;
             runtime.attack_overlay_job = None;
             post_stats_with_updates(
@@ -106,7 +103,6 @@ fn handle_message(
             let overlay_enabled = settings.attack_overlay_opacity > f32::EPSILON;
             let reset = runtime.engine.update_settings(settings);
             if reset {
-                runtime.placements.clear();
                 runtime.attack_overlay_cache = None;
                 runtime.attack_overlay_job = None;
                 post_stats_with_updates(
@@ -127,7 +123,8 @@ fn handle_message(
                 let attack_overlay_update = if overlay_needs_rebuild && overlay_enabled {
                     attack_overlay_update_for_runtime(&mut runtime, true)
                 } else if overlay_enabled
-                    && runtime.placements.len() > attack_overlay_synced_placement_count(&runtime)
+                    && runtime.engine.placement_count()
+                        > attack_overlay_synced_placement_count(&runtime)
                     && runtime.attack_overlay_job.is_none()
                 {
                     attack_overlay_update_for_missing_placements(&mut runtime)
@@ -135,12 +132,9 @@ fn handle_message(
                     AttackOverlayUpdate::none()
                 };
 
-                if anchor_colors_changed && !runtime.placements.is_empty() {
-                    let vertices = pack_vertices(
-                        &runtime.placements,
-                        runtime.engine.settings(),
-                        runtime.engine.color_state(),
-                    );
+                if anchor_colors_changed && runtime.engine.placement_count() > 0 {
+                    let vertices =
+                        pack_vertices_for_runtime(&runtime, runtime.engine.color_state());
                     post_stats_with_updates(
                         &runtime,
                         VertexBufferUpdate::Replace(vertices),
@@ -240,7 +234,6 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
             empty_loops += 1;
         } else {
             empty_loops = 0;
-            runtime.placements.extend_from_slice(&placements);
         }
     }
 
@@ -248,8 +241,8 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
     let color_state = runtime.engine.color_state();
     if stats.exhausted {
         runtime.running = false;
-        let vertices = pack_vertices(&runtime.placements, runtime.engine.settings(), color_state);
-        let log_placements = log_sample_for_full_run(&runtime.placements);
+        let vertices = pack_vertices_for_runtime(runtime, color_state);
+        let log_placements = log_sample_for_full_run(runtime);
         let attack_overlay_update = attack_overlay_update_for_runtime(runtime, false);
         post_worker_message(
             &runtime.scope,
@@ -281,8 +274,8 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
 #[cfg(target_arch = "wasm32")]
 fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u64) {
     let old_color_state = runtime.engine.color_state();
-    let had_existing_placements = !runtime.placements.is_empty();
     let previous_placement_count = runtime.engine.stats().placements;
+    let had_existing_placements = previous_placement_count > 0;
     let placements = runtime.engine.step_budget(max_steps, work_budget);
     let stats = runtime.engine.stats();
     let color_state = runtime.engine.color_state();
@@ -299,13 +292,8 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
             },
         );
     } else {
-        runtime.placements.extend_from_slice(&placements);
         let vertex_update = if had_existing_placements && color_state != old_color_state {
-            VertexBufferUpdate::Replace(pack_vertices(
-                &runtime.placements,
-                runtime.engine.settings(),
-                color_state,
-            ))
+            VertexBufferUpdate::Replace(pack_vertices_for_runtime(runtime, color_state))
         } else {
             VertexBufferUpdate::Append(pack_vertices(
                 &placements,
@@ -374,7 +362,7 @@ fn attack_overlay_update_for_runtime(
     runtime.attack_overlay_cache = None;
     runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
         runtime.engine.settings().clone(),
-        runtime.placements.len(),
+        runtime.engine.placement_count(),
     ));
     AttackOverlayUpdate::replace_empty()
 }
@@ -397,16 +385,16 @@ fn attack_overlay_update_for_new_placements(
         runtime.attack_overlay_cache = None;
         runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
             runtime.engine.settings().clone(),
-            runtime.placements.len(),
+            runtime.engine.placement_count(),
         ));
         return AttackOverlayUpdate::replace_empty();
     }
 
     if runtime.attack_overlay_cache.is_none() {
-        if runtime.placements.len() > placements.len() {
+        if runtime.engine.placement_count() > placements.len() {
             runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
                 runtime.engine.settings().clone(),
-                runtime.placements.len(),
+                runtime.engine.placement_count(),
             ));
             return AttackOverlayUpdate::replace_empty();
         }
@@ -435,7 +423,8 @@ fn attack_overlay_update_for_missing_placements(
     }
 
     let synced = attack_overlay_synced_placement_count(runtime);
-    if synced >= runtime.placements.len() {
+    let placement_count = runtime.engine.placement_count();
+    if synced >= placement_count {
         return AttackOverlayUpdate::none();
     }
 
@@ -445,16 +434,17 @@ fn attack_overlay_update_for_missing_placements(
         runtime.attack_overlay_cache = None;
         runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
             runtime.engine.settings().clone(),
-            runtime.placements.len(),
+            placement_count,
         ));
         return AttackOverlayUpdate::replace_empty();
     }
 
+    let placements = runtime.engine.placements_in_range(synced, placement_count);
     runtime
         .attack_overlay_cache
         .as_mut()
         .map_or_else(AttackOverlayUpdate::none, |cache| {
-            cache.append_placements(&runtime.placements[synced..])
+            cache.append_placements(&placements)
         })
 }
 
@@ -471,22 +461,27 @@ fn post_attack_overlay_build_chunk(runtime: &mut WorkerRuntime) {
         return;
     };
 
-    let (mut update, pending) = job.process_chunk(&runtime.placements, ATTACK_OVERLAY_BUILD_CHUNK);
+    let placement_count = runtime.engine.placement_count();
+    let (mut update, pending) =
+        job.process_chunk_from(placement_count, ATTACK_OVERLAY_BUILD_CHUNK, |start, end| {
+            runtime.engine.placements_in_range(start, end)
+        });
     if pending {
         runtime.attack_overlay_job = Some(job);
     } else {
         let mut cache = job.into_cache();
         let synced = cache.placement_count();
-        if runtime.placements.len() > synced {
+        if placement_count > synced {
             if attack_overlay_requires_full_rebuild_for_new_placements(runtime.engine.settings()) {
                 runtime.attack_overlay_cache = None;
                 runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
                     runtime.engine.settings().clone(),
-                    runtime.placements.len(),
+                    placement_count,
                 ));
                 update = AttackOverlayUpdate::replace_empty();
             } else {
-                let extra = cache.append_placements(&runtime.placements[synced..]);
+                let placements = runtime.engine.placements_in_range(synced, placement_count);
+                let extra = cache.append_placements(&placements);
                 update = merge_attack_overlay_updates(update, extra);
                 runtime.attack_overlay_cache = Some(cache);
             }
@@ -581,6 +576,23 @@ fn batch_parameters(settings: &EngineSettings) -> (u32, u64) {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn pack_vertices_for_runtime(runtime: &WorkerRuntime, color_state: ColorState) -> Vec<f32> {
+    const PACK_CHUNK: usize = 65_536;
+
+    let placement_count = runtime.engine.placement_count();
+    let anchors = ColorAnchors::from_settings(runtime.engine.settings());
+    let mut vertices = Vec::with_capacity(placement_count.saturating_mul(5));
+    let mut start = 0;
+    while start < placement_count {
+        let end = start.saturating_add(PACK_CHUNK).min(placement_count);
+        let placements = runtime.engine.placements_in_range(start, end);
+        append_vertices(&mut vertices, &placements, anchors, color_state);
+        start = end;
+    }
+    vertices
+}
+
+#[cfg(target_arch = "wasm32")]
 fn log_sample_for_batch(previous_placement_count: u64, placements: &[Placement]) -> Vec<Placement> {
     const LOG_EDGE_COUNT: usize = 32;
 
@@ -610,16 +622,21 @@ fn log_sample_for_batch(previous_placement_count: u64, placements: &[Placement])
 }
 
 #[cfg(target_arch = "wasm32")]
-fn log_sample_for_full_run(placements: &[Placement]) -> Vec<Placement> {
+fn log_sample_for_full_run(runtime: &WorkerRuntime) -> Vec<Placement> {
     const LOG_EDGE_COUNT: usize = 32;
 
-    if placements.len() <= LOG_EDGE_COUNT * 2 {
-        return placements.to_vec();
+    let placement_count = runtime.engine.placement_count();
+    if placement_count <= LOG_EDGE_COUNT * 2 {
+        return runtime.engine.placements_in_range(0, placement_count);
     }
 
     let mut out = Vec::with_capacity(LOG_EDGE_COUNT * 2);
-    out.extend_from_slice(&placements[..LOG_EDGE_COUNT]);
-    out.extend_from_slice(&placements[placements.len() - LOG_EDGE_COUNT..]);
+    out.extend(runtime.engine.placements_in_range(0, LOG_EDGE_COUNT));
+    out.extend(
+        runtime
+            .engine
+            .placements_in_range(placement_count - LOG_EDGE_COUNT, placement_count),
+    );
     out
 }
 

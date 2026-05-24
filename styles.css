@@ -72,7 +72,8 @@ body {
 .panel-body {
   min-height: 0;
   overflow: auto;
-  padding-right: 2px;
+  padding-right: 10px;
+  scrollbar-gutter: stable;
 }
 
 .title-row {
@@ -460,9 +461,15 @@ input[type="color"] {
 .piece-action-row {
   grid-column: 1 / -1;
   display: grid;
-  grid-template-columns: 33fr 33fr 20fr 36px;
+  grid-template-columns: 33fr 1px 33fr 20fr 36px;
   gap: 6px;
   align-items: end;
+}
+
+.piece-action-divider {
+  width: 1px;
+  height: 36px;
+  background: rgb(255 255 255 / 12%);
 }
 
 .piece-action-row button,
@@ -474,6 +481,11 @@ input[type="color"] {
   padding: 0;
   font-size: 16px;
   line-height: 1;
+}
+
+.piece-action-row .mirrored-icon {
+  display: inline-block;
+  transform: scaleX(-1);
 }
 
 .piece-action-row .square-icon-button[aria-pressed="true"] {

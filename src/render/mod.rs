@@ -172,13 +172,13 @@ pub struct CanvasRenderer {
     circle_pan_uniform: WebGlUniformLocation,
     circle_alpha_uniform: WebGlUniformLocation,
     circle_line_width_uniform: WebGlUniformLocation,
-    vertices: Vec<f32>,
     attack_spot_vertices: Vec<f32>,
     attack_hit_vertices: Vec<f32>,
     attack_circle_vertices: Vec<f32>,
     track_vertices: Vec<f32>,
     border_vertices: Vec<f32>,
     pending_upload: PendingUpload,
+    placement_float_count: usize,
     attack_spot_upload_pending: bool,
     attack_hit_upload_pending: bool,
     attack_circle_upload_pending: bool,
@@ -290,13 +290,13 @@ impl CanvasRenderer {
             circle_pan_uniform,
             circle_alpha_uniform,
             circle_line_width_uniform,
-            vertices: Vec::new(),
             attack_spot_vertices: Vec::new(),
             attack_hit_vertices: Vec::new(),
             attack_circle_vertices: Vec::new(),
             track_vertices: Vec::new(),
             border_vertices: Vec::new(),
             pending_upload: PendingUpload::Full,
+            placement_float_count: 0,
             attack_spot_upload_pending: true,
             attack_hit_upload_pending: true,
             attack_circle_upload_pending: true,
@@ -334,6 +334,9 @@ impl CanvasRenderer {
         view_settings: EngineSettings,
         placement_settings: EngineSettings,
     ) -> Result<(), JsValue> {
+        let clear_attack_overlay =
+            !attack_overlay_cache_compatible(&view_settings, &placement_settings)
+                || !attack_overlay_cache_compatible(&self.placement_settings, &placement_settings);
         let next_track_key = TrackKey::from_settings(&view_settings);
         if next_track_key != self.track_key {
             self.track_vertices = build_track_vertices(&view_settings);
@@ -345,6 +348,9 @@ impl CanvasRenderer {
             self.border_vertices = build_generation_border_vertices(&view_settings);
             self.border_upload_pending = true;
             self.border_key = next_border_key;
+        }
+        if clear_attack_overlay {
+            self.clear_attack_overlay_vertices()?;
         }
         self.settings = view_settings;
         self.placement_settings = placement_settings;
@@ -376,18 +382,21 @@ impl CanvasRenderer {
     }
 
     pub fn clear_placements(&mut self) -> Result<(), JsValue> {
-        self.vertices.clear();
+        self.clear_placement_vertices();
+        self.clear_attack_overlay_vertices()?;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+        self.redraw()
+    }
+
+    fn clear_attack_overlay_vertices(&mut self) -> Result<(), JsValue> {
         self.attack_spot_vertices.clear();
         self.attack_hit_vertices.clear();
         self.attack_circle_vertices.clear();
-        self.pending_upload = PendingUpload::Full;
         self.attack_spot_upload_pending = true;
         self.attack_hit_upload_pending = true;
         self.attack_circle_upload_pending = true;
-        self.pan_x = 0.0;
-        self.pan_y = 0.0;
-        self.sync_attack_overlay_attributes()?;
-        self.redraw()
+        self.sync_attack_overlay_attributes()
     }
 
     pub fn pan_by_pixels(&mut self, dx: f64, dy: f64) -> Result<(), JsValue> {
@@ -444,7 +453,7 @@ impl CanvasRenderer {
         color_state: ColorState,
     ) -> Result<(), JsValue> {
         self.color_state = color_state;
-        self.apply_vertex_update(vertex_update);
+        self.apply_vertex_update(vertex_update)?;
         self.apply_attack_overlay_update(attack_overlay_update);
         Ok(())
     }
@@ -456,17 +465,17 @@ impl CanvasRenderer {
         color_state: ColorState,
     ) -> Result<(), JsValue> {
         self.color_state = color_state;
-        self.apply_vertex_update(vertex_update);
+        self.apply_vertex_update(vertex_update)?;
         self.apply_attack_overlay_update(attack_overlay_update);
         Ok(())
     }
 
-    fn apply_vertex_update(&mut self, vertex_update: &VertexBufferUpdate) {
+    fn apply_vertex_update(&mut self, vertex_update: &VertexBufferUpdate) -> Result<(), JsValue> {
         match vertex_update {
             VertexBufferUpdate::None => {}
             VertexBufferUpdate::Append(vertices) => {
-                let start = self.vertices.len();
-                self.vertices.extend_from_slice(vertices);
+                let start = self.placement_float_count;
+                self.append_placement_vertices(vertices)?;
                 self.pending_upload = match self.pending_upload {
                     PendingUpload::Full => PendingUpload::Full,
                     PendingUpload::Append { start_float } => PendingUpload::Append {
@@ -476,11 +485,12 @@ impl CanvasRenderer {
                 };
             }
             VertexBufferUpdate::Replace(vertices) => {
-                self.vertices.clear();
-                self.vertices.extend_from_slice(vertices);
+                self.clear_placement_vertices();
+                self.append_placement_vertices(vertices)?;
                 self.pending_upload = PendingUpload::Full;
             }
         }
+        Ok(())
     }
 
     fn apply_attack_overlay_update(&mut self, update: &AttackOverlayUpdate) {
@@ -525,13 +535,12 @@ impl CanvasRenderer {
     fn sync_placement_attributes(&self) -> Result<(), JsValue> {
         self.canvas.set_attribute(
             "data-placements",
-            &(self.vertices.len() / FLOATS_PER_VERTEX).to_string(),
+            &(self.placement_float_count / FLOATS_PER_VERTEX).to_string(),
         )?;
         self.canvas.set_attribute(
             "data-placement-pages",
             &self
-                .vertices
-                .len()
+                .placement_float_count
                 .div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS)
                 .to_string(),
         )?;
@@ -591,7 +600,7 @@ impl CanvasRenderer {
             self.draw_attack_spots(&render_state)?;
         }
 
-        if self.vertices.is_empty() {
+        if self.placement_float_count == 0 {
             self.pending_upload = PendingUpload::None;
             self.sync_placement_attributes()?;
             return Ok(());
@@ -860,12 +869,12 @@ impl CanvasRenderer {
             PendingUpload::None => Ok(()),
             PendingUpload::Full => {
                 self.reset_placement_page_uploads();
-                self.upload_vertex_range(0, self.vertices.len())?;
+                self.upload_vertex_range(0, self.placement_float_count)?;
                 self.pending_upload = PendingUpload::None;
                 Ok(())
             }
             PendingUpload::Append { start_float } => {
-                let total = self.vertices.len();
+                let total = self.placement_float_count;
                 let start_float = start_float.min(total);
                 self.upload_vertex_range(start_float, total)?;
                 self.pending_upload = PendingUpload::None;
@@ -882,6 +891,7 @@ impl CanvasRenderer {
                     .gl
                     .create_buffer()
                     .ok_or_else(|| JsValue::from_str("failed to create WebGL placement buffer"))?,
+                vertices: Vec::new(),
                 allocated: false,
                 uploaded_floats: 0,
             });
@@ -893,6 +903,65 @@ impl CanvasRenderer {
         for page in &mut self.placement_pages {
             page.uploaded_floats = 0;
         }
+    }
+
+    fn clear_placement_vertices(&mut self) {
+        self.placement_pages.clear();
+        self.placement_float_count = 0;
+        self.pending_upload = PendingUpload::None;
+    }
+
+    fn append_placement_vertices(&mut self, mut vertices: &[f32]) -> Result<(), JsValue> {
+        if vertices.is_empty() {
+            return Ok(());
+        }
+
+        let end_float = self
+            .placement_float_count
+            .checked_add(vertices.len())
+            .ok_or_else(|| JsValue::from_str("placement vertex count overflow"))?;
+        self.ensure_placement_pages(end_float)?;
+
+        while !vertices.is_empty() {
+            let page_index = self.placement_float_count / PLACEMENT_VERTEX_PAGE_FLOATS;
+            let local_start = self.placement_float_count % PLACEMENT_VERTEX_PAGE_FLOATS;
+            let page_room = PLACEMENT_VERTEX_PAGE_FLOATS.saturating_sub(local_start);
+            let take = vertices.len().min(page_room);
+            if take == 0 {
+                return Err(JsValue::from_str("placement vertex page is full"));
+            }
+
+            let page = &mut self.placement_pages[page_index];
+            if page.vertices.len() != local_start {
+                page.vertices.truncate(local_start);
+                page.uploaded_floats = page.uploaded_floats.min(local_start);
+            }
+            reserve_page_vertices(page, take)?;
+            page.vertices.extend_from_slice(&vertices[..take]);
+            self.placement_float_count += take;
+            vertices = &vertices[take..];
+        }
+
+        Ok(())
+    }
+
+    fn collect_placement_vertices(&self) -> Result<Vec<f32>, JsValue> {
+        let mut vertices = Vec::new();
+        vertices
+            .try_reserve_exact(self.placement_float_count)
+            .map_err(|_| JsValue::from_str("export placement vertex buffer allocation failed"))?;
+
+        let mut remaining = self.placement_float_count;
+        for page in &self.placement_pages {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(page.vertices.len());
+            vertices.extend_from_slice(&page.vertices[..take]);
+            remaining -= take;
+        }
+
+        Ok(vertices)
     }
 
     fn upload_vertex_range(&mut self, start_float: usize, end_float: usize) -> Result<(), JsValue> {
@@ -928,25 +997,28 @@ impl CanvasRenderer {
                 .checked_mul(BYTES_PER_FLOAT)
                 .and_then(|bytes| i32::try_from(bytes).ok())
                 .ok_or_else(|| JsValue::from_str("WebGL vertex upload offset is too large"))?;
-            let global_start = page_start + local_start;
-            let global_end = page_start + local_end;
+            let upload_start = local_start.min(page.vertices.len());
+            let upload_end = local_end.min(page.vertices.len());
+            if upload_start >= upload_end {
+                continue;
+            }
 
             unsafe {
-                let view = js_sys::Float32Array::view(&self.vertices[global_start..global_end]);
+                let view = js_sys::Float32Array::view(&page.vertices[upload_start..upload_end]);
                 self.gl.buffer_sub_data_with_i32_and_array_buffer_view(
                     Gl::ARRAY_BUFFER,
                     offset_bytes,
                     &view,
                 );
             }
-            page.uploaded_floats = page.uploaded_floats.max(local_end);
+            page.uploaded_floats = page.uploaded_floats.max(upload_end);
         }
 
         Ok(())
     }
 
     fn draw_placement_pages(&self) -> Result<(), JsValue> {
-        let total = self.vertices.len();
+        let total = self.placement_float_count;
         let page_count = total.div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS);
         for page_index in 0..page_count {
             let Some(page) = self.placement_pages.get(page_index) else {
@@ -954,7 +1026,10 @@ impl CanvasRenderer {
             };
             let start = page_index * PLACEMENT_VERTEX_PAGE_FLOATS;
             let end = (start + PLACEMENT_VERTEX_PAGE_FLOATS).min(total);
-            let draw_floats = end.saturating_sub(start).min(page.uploaded_floats);
+            let draw_floats = end
+                .saturating_sub(start)
+                .min(page.vertices.len())
+                .min(page.uploaded_floats);
             if draw_floats < FLOATS_PER_VERTEX {
                 continue;
             }
@@ -1066,8 +1141,25 @@ enum PendingUpload {
 
 struct VertexPage {
     buffer: WebGlBuffer,
+    vertices: Vec<f32>,
     allocated: bool,
     uploaded_floats: usize,
+}
+
+fn reserve_page_vertices(page: &mut VertexPage, additional: usize) -> Result<(), JsValue> {
+    let needed = page
+        .vertices
+        .len()
+        .checked_add(additional)
+        .ok_or_else(|| JsValue::from_str("placement vertex page capacity overflow"))?;
+    if needed <= page.vertices.capacity() {
+        return Ok(());
+    }
+
+    let target_capacity = needed.next_power_of_two().min(PLACEMENT_VERTEX_PAGE_FLOATS);
+    page.vertices
+        .try_reserve_exact(target_capacity.saturating_sub(page.vertices.capacity()))
+        .map_err(|_| JsValue::from_str("placement vertex page allocation failed"))
 }
 
 fn apply_static_vertex_update(
@@ -1163,7 +1255,7 @@ impl ExportJob {
         let spec = renderer.export_spec(kind, 1.0);
         let pixel_count = checked_pixel_count(spec.width, spec.height)?;
         let pixels = allocate_pixel_buffer(pixel_count)?;
-        let vertices = renderer.vertices.clone();
+        let vertices = renderer.collect_placement_vertices()?;
 
         if spec.square_pixel_cells {
             return Ok(Self::Direct {
@@ -1436,6 +1528,27 @@ fn export_shape(settings: &EngineSettings) -> ExportShape {
         ExportShape::Triangle
     } else {
         ExportShape::Square
+    }
+}
+
+fn attack_overlay_cache_compatible(a: &EngineSettings, b: &EngineSettings) -> bool {
+    a.board == b.board
+        && a.radius == b.radius
+        && a.proactive_attacking == b.proactive_attacking
+        && a.enemy_mode == b.enemy_mode
+        && a.placement_search == b.placement_search
+        && a.army_preset == b.army_preset
+        && a.custom_army == b.custom_army
+        && a.continuous_offset == b.continuous_offset
+        && a.prime_modulo_divisor == b.prime_modulo_divisor
+        && continuous_piece_radius_overlay_compatible(a, b)
+}
+
+fn continuous_piece_radius_overlay_compatible(a: &EngineSettings, b: &EngineSettings) -> bool {
+    if a.board == BoardKind::ContinuousArchimedean || b.board == BoardKind::ContinuousArchimedean {
+        a.piece_radius == b.piece_radius
+    } else {
+        true
     }
 }
 

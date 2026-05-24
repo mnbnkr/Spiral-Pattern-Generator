@@ -19,12 +19,28 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function pauseIfRunning(page) {
-  await page.locator("#pause-button").evaluate((button) => {
+  const requestedPause = await page.locator("#pause-button").evaluate((button) => {
     const pauseButton = button as HTMLButtonElement;
     if (!pauseButton.disabled) {
       pauseButton.click();
+      return true;
     }
+    return false;
   });
+  if (requestedPause) {
+    await expect(page.locator("#pause-button")).toBeDisabled({ timeout: 10_000 });
+    await expect
+      .poll(
+        async () => {
+          const before = await page.locator("#status-line").textContent();
+          await page.waitForTimeout(150);
+          const after = await page.locator("#status-line").textContent();
+          return before === after;
+        },
+        { timeout: 10_000 },
+      )
+      .toBe(true);
+  }
 }
 
 async function renderedPixelCount(page) {
@@ -107,7 +123,7 @@ async function continuousSpotsForSearch(page, search: string) {
     .map((match) => Number(match[1]));
 }
 
-test("high-radius rendering crosses the previous multi-million buffer cliff", async ({
+test("high-radius rendering completes past the previous multi-million buffer cliff", async ({
   page,
 }) => {
   test.setTimeout(160_000);
@@ -126,16 +142,18 @@ test("high-radius rendering crosses the previous multi-million buffer cliff", as
   await page.click("#start-button");
 
   await expect
-    .poll(() => statusPlacementCount(page), {
+    .poll(() => page.locator("#status-line").textContent(), {
       timeout: 140_000,
       intervals: [1_000, 2_000, 5_000],
     })
-    .toBeGreaterThan(4_250_000);
+    .toContain("Complete");
+  expect(await statusPlacementCount(page)).toBeGreaterThan(8_800_000);
   await expect
     .poll(() => canvasPlacementPages(page), { timeout: 10_000 })
-    .toBeGreaterThanOrEqual(5);
+    .toBeGreaterThanOrEqual(9);
+  await expect(page.locator("#start-button")).toBeEnabled();
+  await expect(page.locator("#pause-button")).toBeDisabled();
   expect(await renderedPixelCount(page)).toBeGreaterThan(0);
-  await pauseIfRunning(page);
 });
 
 test("default simulation auto-runs", async ({ page }) => {
@@ -152,7 +170,7 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect(page.locator("#enemy-mode-select option").nth(2)).toHaveText(
     "Color-Attack-set",
   );
-  await expect(page.locator("#radius-input")).toHaveValue("150");
+  await expect(page.locator("#radius-input")).toHaveValue("200");
   await expect(page.locator("#track-opacity-output")).toHaveText("10%");
   await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
   await expect(page.locator("#download-jpeg-button")).toHaveText("Half JPEG");
@@ -351,6 +369,17 @@ test("panel header remains visible while the control body scrolls", async ({
   const after = await page.locator("#panel-toggle-button").boundingBox();
   expect(after).not.toBeNull();
   expect(Math.abs((after?.y ?? 0) - (before?.y ?? 0))).toBeLessThanOrEqual(1);
+  const bodyMetrics = await page.locator(".panel-body").evaluate((body) => {
+    const element = body as HTMLElement;
+    const style = getComputedStyle(element);
+    return {
+      gutter: style.scrollbarGutter,
+      scrollWidth: element.scrollWidth,
+      clientWidth: element.clientWidth,
+    };
+  });
+  expect(bodyMetrics.gutter).toContain("stable");
+  expect(bodyMetrics.scrollWidth).toBeLessThanOrEqual(bodyMetrics.clientWidth);
 });
 
 test("quick second click closes an already focused select", async ({ page }) => {
@@ -363,7 +392,7 @@ test("quick second click closes an already focused select", async ({ page }) => 
     )
     .toBe("enemy-mode-select");
 
-  await page.dispatchEvent("#enemy-mode-select", "mousedown", {
+  await page.dispatchEvent("#enemy-mode-select", "pointerdown", {
     bubbles: true,
     button: 0,
   });
@@ -381,8 +410,17 @@ test("random custom army controls populate and edit the random pool", async ({
   page,
 }) => {
   await pauseIfRunning(page);
-  await expect(page.locator("#random-count-input")).toHaveValue("4");
+  await expect(page.locator("#random-count-input")).toHaveValue("3");
   await expect(page.locator("#random-piece-button")).toBeEnabled();
+  await expect(page.locator(".piece-action-divider")).toBeVisible();
+  await expect
+    .poll(() =>
+      page
+        .locator("#random-pool-toggle-button .mirrored-icon")
+        .evaluate((icon) => getComputedStyle(icon).transform),
+    )
+    .toContain("-1");
+  await expect(page.locator("#prime-divisor-label")).toBeHidden();
 
   await page.click("#random-pool-toggle-button");
   await expect(page.locator("#random-pool-toggle-button")).toHaveAttribute(
@@ -410,9 +448,12 @@ test("random custom army controls populate and edit the random pool", async ({
   await expect(page.locator(".army-row")).toHaveCount(4);
 
   await page.selectOption("#army-preset-select", "PrimeKnight");
+  await expect(page.locator("#prime-divisor-label")).toBeVisible();
   await expect(page.locator("#random-piece-button")).toBeDisabled();
   await expect(page.locator("#random-count-input")).toBeDisabled();
   await expect(page.locator("#random-pool-toggle-button")).toBeDisabled();
+  await page.selectOption("#army-preset-select", "PrimeGapper");
+  await expect(page.locator("#prime-divisor-label")).toBeHidden();
 });
 
 test("custom row edits stage without clearing the visible snapshot", async ({
@@ -670,6 +711,56 @@ test("proactive attack spots initialize while a prime run is active", async ({
     )
     .toBeGreaterThan(0);
   expect(await statusPlacementCount(page)).toBeGreaterThanOrEqual(before);
+});
+
+test("attack spots clear when board or attack settings change", async ({ page }) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "12");
+  await page.click("#refresh-button");
+  await page.click("#step-button");
+  await expect(page.locator("#status-line")).toContainText("1 placements");
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#attack-overlay-opacity-slider",
+    );
+    if (!slider) throw new Error("missing attack overlay slider");
+    slider.value = "70";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+      }),
+    )
+    .toBeGreaterThan(0);
+
+  await page.selectOption("#board-select", "LatticeHex");
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+      }),
+    )
+    .toBe(0);
+
+  await page.click("#step-button");
+  await expect(page.locator("#status-line")).toContainText("1 placements");
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+      }),
+    )
+    .toBeGreaterThan(0);
+  await page.selectOption("#army-preset-select", "PrimeKnight");
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) => {
+        return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+      }),
+    )
+    .toBe(0);
 });
 
 test("full png, regular png, and jpeg export buttons produce downloads", async ({
@@ -1147,10 +1238,10 @@ test("higher radius commits without clearing the visible generation", async ({
   const beforeLog = await page.locator("#placement-log").textContent();
   expect(beforeLog).toContain("placements logged:");
 
-  await page.fill("#radius-input", "180");
+  await page.fill("#radius-input", "240");
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
   await page.waitForTimeout(2_300);
-  await expect(page.locator("#radius-input")).toHaveValue("180");
+  await expect(page.locator("#radius-input")).toHaveValue("240");
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
   await expect(page.locator("#status-line")).not.toContainText("0 placements");
 });

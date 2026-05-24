@@ -8,7 +8,7 @@ Spiral Pattern Generator is a deterministic Rust/WASM simulation app. It places 
 
 Required stack:
 
-- Rust `1.96.0-beta.6`
+- Rust `1.96.0-beta.9`
 - Target `wasm32-unknown-unknown`
 - Trunk for browser build and local serving
 - `wasm-bindgen`, `web-sys`, and `js-sys` for browser APIs
@@ -29,7 +29,7 @@ Do not introduce React, Yew, npm build tooling, or a heavy UI framework. Playwri
 
 The mathematical engine must run in the worker. The main thread owns UI, worker control, rendering, and downloads.
 
-Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices. The main thread appends vertex ranges and uploads them with `bufferSubData` into fixed-size WebGL pages; full vertex replacements are reserved for recoloring or reset events.
+Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices; the worker does not keep a second protocol-placement history beside the engine's compact placement state. The main thread appends vertex ranges and uploads them with `bufferSubData` into fixed-size WebGL pages; full vertex replacements are reserved for recoloring or reset events.
 
 The visual run loop is a bounded pull loop: the main thread asks for one worker batch, handles the reply, coalesces drawing onto `requestAnimationFrame`, and only then requests more work. Do not reintroduce an unbounded worker-push loop.
 
@@ -132,8 +132,10 @@ Lattice boards use occupied-cell and attacked-cell maps keyed by board coordinat
 Continuous body overlap:
 
 ```text
-center_distance < 2 * piece_radius - EPS
+center_distance < 2 * piece_radius - 0.005 * (2 * piece_radius) - EPS
 ```
+
+That tiny continuous-only allowance keeps the configured unit-chord Archimedean spot stream from creating visual empty holes at cross-turn near-tangencies. Lattice occupancy and continuous attack-hit predicates do not use this allowance.
 
 Continuous attacks:
 
@@ -152,7 +154,7 @@ Custom mode is current-piece spot search. The army is an ordered cyclic list of 
 
 Each custom row has its own search cursor. On that row's turn, the row's current piece scans forward in the selected search order until it finds a valid unoccupied spot under passive and optional proactive rules. After placement, that row's cursor advances past the placed spot and priority moves to the next row. The row does not revisit earlier empty spots on later turns.
 
-In `SpiralPath`, each row cursor scans the chronological spiral. In `CenterDistance`, each row cursor scans spots by Euclidean distance from the spiral origin. This is intentionally a different simulation policy.
+In `SpiralPath`, each row cursor scans the chronological spiral. Lattice SpiralPath spots are computed directly from their spiral index instead of caching the full spot list, so high-radius finite-board runs do not hit a spot-cache capacity cliff. In `CenterDistance`, each row cursor scans spots by Euclidean distance from the spiral origin. This is intentionally a different simulation policy.
 
 For lattice boards, `CenterDistance` streams spots from the requested board bound in Euclidean center-distance order with spiral index as the tie-breaker. It must not prebuild and sort the entire radius before emitting the first placement; high-radius runs still progress through bounded worker batches. Square, hex, and triangle corners are valid outer-bound spots, but they appear late in live generation because they are farther from the origin than most interior spots.
 
@@ -214,7 +216,7 @@ Fit Screen maps the requested radius and board-specific bounds to the viewport. 
 
 Pieces render on one HTML5 canvas through WebGL point sprites. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
 
-Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`. Placement vertices are stored in fixed-size WebGL pages so large radius runs do not hit a single-buffer reallocation cliff.
+Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`. Placement vertices are stored in fixed-size CPU/WebGL pages so large radius runs do not hit a single-buffer reallocation cliff; image export flattens those pages only when an export is requested.
 
 Render shapes:
 
@@ -228,7 +230,7 @@ Shape changes and lattice Piece Radius changes are render-only and must not rese
 
 Spiral Track is render-only. Lattice track geometry is a connected WebGL line strip through the exact turn points of the Square, Hex, and Triangle spiral paths, so high-radius previews keep the true spiral shape without compression or sampled cross-board shortcuts. Continuous track geometry is sampled by step size and point count while still including the requested end radius. When a board change stages a new generation while the old placement snapshot remains dimmed, the track and view bounds still follow the currently selected board and radius, while old pieces keep their original board render shape and piece radius until the next generation starts.
 
-Attack Spots is a render-only overlay. Lattice boards draw placed-piece attack target spots in `#F7F7F7`; when proactive attacking is enabled, they also draw empty candidate-origin shadows that would be rejected because the candidate could attack an existing enemy. Occupied attacked spots get a half-strength overlay so the placed piece visually mixes with the attack color. Continuous boards draw thin `#F7F7F7` attack circles over placed pieces as visualization only; these circles are not intended to be a pixel-perfect representation of the algebraic hit predicate. Attack radii beyond `4 * Radius` are ignored by attack checks and overlays because they cannot affect the visible generation surface under the current bound. Large or dense runs can generate many attack markers, so overlay data is built and delivered in worker chunks to avoid a single long blocking rebuild. Lattice proactive overlays are also rebuilt through that chunked path as placements advance, because candidate-origin shadows are not safely append-only when the active placing piece changes. Opacity changes reuse existing overlay buffers instead of clearing and rebuilding them; Continuous attack circles are transferred as small quad primitives and rendered procedurally by the overlay shader.
+Attack Spots is a render-only overlay. Lattice boards draw placed-piece attack target spots in `#F7F7F7`; when proactive attacking is enabled, they also draw empty candidate-origin shadows that would be rejected because the candidate could attack an existing enemy. Occupied attacked spots get a half-strength overlay so the placed piece visually mixes with the attack color. Continuous boards draw thin `#F7F7F7` attack circles over placed pieces as visualization only; these circles are not intended to be a pixel-perfect representation of the algebraic hit predicate. Attack radii beyond `4 * Radius` are ignored by attack checks and overlays because they cannot affect the visible generation surface under the current bound. Large or dense runs can generate many attack markers, so overlay data is built and delivered in worker chunks to avoid a single long blocking rebuild. Lattice proactive overlays are also rebuilt through that chunked path as placements advance, because candidate-origin shadows are not safely append-only when the active placing piece changes. Opacity changes reuse existing overlay buffers instead of clearing and rebuilding them; board changes, attack-setting changes, army changes, search changes, and continuous piece-radius changes clear stale overlay buffers. Continuous attack circles are transferred as small quad primitives and rendered procedurally by the overlay shader.
 
 When Spiral Track opacity is `off`, the renderer draws a single View / Generation Radius border line for the current board. Square uses the square generation bound, Hex uses the hex cube-radius boundary, Triangle follows the triangular shell boundary, and Continuous uses a circle at the exact requested radius. The border is hidden whenever Spiral Track is visible. It is also hidden after a true `Complete` run when the worker has reached the requested edge, and it returns immediately when settings change or a new run is staged.
 
@@ -285,7 +287,7 @@ Default settings:
 - Enemy mode: Color
 - Placement Search: Spiral Path
 - Piece Radius: `0.50`
-- Radius: `150`
+- Radius: `200`
 - Speed: Fastest
 - Visual Progress: enabled
 - Spiral Track: `10%`
@@ -308,7 +310,11 @@ Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highl
 
 Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path.
 
-Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `4`, and populates the custom army from a session-local random pool. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show names and moves but no order color swatches. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
+Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, and populates the custom army from a session-local random pool. A vertical divider separates Add from Random. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show names and moves but no order color swatches. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
+
+The Prime Knight `Modulo Divisor (colors)` control is hidden for Custom Finite and Prime Gapper. Color anchors remain available because custom rows and prime color gradients use them.
+
+The panel body is the scroll container and reserves scrollbar gutter space so the scrollbar does not overlap controls. Focused dropdown controls close on a quick second pointer click instead of swallowing that click.
 
 ## Colors
 

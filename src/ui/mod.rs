@@ -10,9 +10,10 @@ use web_sys::{
 };
 
 use crate::protocol::{
-    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DisplayMode, EnemyMode,
-    EngineSettings, EngineStats, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
-    VertexBufferUpdate, WorkerToApp, normalize_prime_modulo_divisor, rainbow_color,
+    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DEFAULT_RADIUS,
+    DisplayMode, EnemyMode, EngineSettings, EngineStats, Placement, PlacementSearchMode, ShapeKind,
+    SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp, normalize_prime_modulo_divisor,
+    rainbow_color,
 };
 use crate::render::{CanvasRenderer, ExportKind};
 
@@ -1426,36 +1427,52 @@ fn install_select_quick_close_handlers(
     ] {
         let select = select(document, select_id)?;
         let id = select.id();
-        let document = document.clone();
         let state = Rc::clone(&state);
-        let recent_select = Rc::clone(&recent_select);
+        let pointer_recent_select = Rc::clone(&recent_select);
         let closure_select = select.clone();
-        let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        let pointer_closure = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
             let now = js_sys::Date::now();
-            let active_same_select = document
-                .active_element()
-                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
-                .is_some_and(|active| active.id() == id);
-            let recent_same_select = recent_select
+            let recent_same_select = pointer_recent_select
                 .borrow()
                 .as_ref()
                 .is_some_and(|(recent_id, time)| recent_id == &id && now - *time <= 1_000.0);
 
-            if active_same_select && recent_same_select {
+            if recent_same_select {
                 event.prevent_default();
+                event.stop_propagation();
                 if id == "board-select" {
                     state.borrow_mut().board_select_pointer_value = None;
                 }
                 if let Err(error) = closure_select.blur() {
                     log_error(&error);
                 }
-                *recent_select.borrow_mut() = None;
+                *pointer_recent_select.borrow_mut() = None;
             } else {
-                *recent_select.borrow_mut() = Some((id.clone(), now));
+                *pointer_recent_select.borrow_mut() = Some((id.clone(), now));
             }
         });
-        select.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
-        closure.forget();
+        select.add_event_listener_with_callback_and_bool(
+            "pointerdown",
+            pointer_closure.as_ref().unchecked_ref(),
+            true,
+        )?;
+        pointer_closure.forget();
+
+        let id = select.id();
+        let focus_recent_select = Rc::clone(&recent_select);
+        let focus_closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+            *focus_recent_select.borrow_mut() = Some((id.clone(), js_sys::Date::now()));
+        });
+        select.add_event_listener_with_callback("focus", focus_closure.as_ref().unchecked_ref())?;
+        focus_closure.forget();
+
+        let change_recent_select = Rc::clone(&recent_select);
+        let change_closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+            *change_recent_select.borrow_mut() = None;
+        });
+        select
+            .add_event_listener_with_callback("change", change_closure.as_ref().unchecked_ref())?;
+        change_closure.forget();
     }
 
     Ok(())
@@ -1545,7 +1562,7 @@ fn install_random_piece_handler(
         let count = input_value(&document, "random-count-input")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(4)
+            .unwrap_or(3)
             .min(10_000);
 
         let previous_settings = {
@@ -2854,7 +2871,7 @@ fn read_settings(
     Ok(EngineSettings {
         board,
         shape,
-        radius: parse_finite_f64(&input_value(document, "radius-input")?, 150.0).max(1.0),
+        radius: parse_finite_f64(&input_value(document, "radius-input")?, DEFAULT_RADIUS).max(1.0),
         piece_radius: parse_finite_f64(&input_value(document, "piece-radius-slider")?, 0.5)
             .clamp(0.05, 0.5),
         visual_progress: input_checked(document, "visual-progress-toggle")?,
@@ -2862,7 +2879,7 @@ fn read_settings(
         display_mode,
         zoom: input_value(document, "zoom-slider")?
             .parse::<u8>()
-            .unwrap_or(4)
+            .unwrap_or(1)
             .clamp(1, 32),
         track_opacity: parse_finite_f64(&input_value(document, "track-opacity-slider")?, 0.0)
             .clamp(0.0, 100.0) as f32
@@ -2992,10 +3009,19 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
         .style()
         .set_property("display", custom_display)?;
 
-    let prime_display = "grid";
     html_element(document, "prime-color-controls")?
         .style()
-        .set_property("display", prime_display)?;
+        .set_property("display", "grid")?;
+    html_element(document, "prime-divisor-label")?
+        .style()
+        .set_property(
+            "display",
+            if settings.army_preset == ArmyPreset::PrimeKnight {
+                "grid"
+            } else {
+                "none"
+            },
+        )?;
     button(document, "add-piece-button")?
         .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
     button(document, "random-piece-button")?
@@ -3430,7 +3456,6 @@ fn html_element(document: &Document, id: &str) -> Result<HtmlElement, JsValue> {
         .dyn_into::<HtmlElement>()?)
 }
 
-#[allow(dead_code)]
 fn element(document: &Document, id: &str) -> Result<Element, JsValue> {
     document
         .get_element_by_id(id)

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_ANCHOR_A: &str = "#ff7800";
 pub const DEFAULT_ANCHOR_B: &str = "#ff0006";
+pub const DEFAULT_RADIUS: f64 = 200.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BoardKind {
@@ -320,7 +321,7 @@ impl Default for EngineSettings {
         Self {
             board: BoardKind::LatticeSquare,
             shape: ShapeKind::Square,
-            radius: 150.0,
+            radius: DEFAULT_RADIUS,
             piece_radius: 0.5,
             visual_progress: true,
             speed: SpeedMode::Fastest,

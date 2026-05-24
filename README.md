@@ -12,7 +12,7 @@ The detailed source of truth is [MANUAL.md](MANUAL.md). It documents the board m
 
 ## Stack
 
-- Rust `1.96.0-beta.6`
+- Rust `1.96.0-beta.9`
 - Target `wasm32-unknown-unknown`
 - Trunk
 - `wasm-bindgen`, `web-sys`, `js-sys`

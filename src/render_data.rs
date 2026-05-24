@@ -300,13 +300,28 @@ impl AttackOverlayBuildJob {
         placements: &[Placement],
         chunk_size: usize,
     ) -> (AttackOverlayUpdate, bool) {
-        let limit = self.placement_limit.min(placements.len());
+        self.process_chunk_from(placements.len(), chunk_size, |start, end| {
+            placements[start..end].to_vec()
+        })
+    }
+
+    pub fn process_chunk_from<F>(
+        &mut self,
+        placement_count: usize,
+        chunk_size: usize,
+        mut placements_in_range: F,
+    ) -> (AttackOverlayUpdate, bool)
+    where
+        F: FnMut(usize, usize) -> Vec<Placement>,
+    {
+        let limit = self.placement_limit.min(placement_count);
         let chunk_size = chunk_size.max(1);
 
         match self.stage {
             AttackOverlayBuildStage::Occupied => {
                 let end = self.next_index.saturating_add(chunk_size).min(limit);
-                for placement in &placements[self.next_index..end] {
+                let chunk = placements_in_range(self.next_index, end);
+                for placement in &chunk {
                     if let Some(coord) = lattice_coord(placement) {
                         self.cache.occupied.insert(coord);
                     }
@@ -325,18 +340,17 @@ impl AttackOverlayBuildJob {
             AttackOverlayBuildStage::Attacks => {
                 let end = self.next_index.saturating_add(chunk_size).min(limit);
                 let mut buffers = AttackOverlayBuffers::default();
+                let chunk = placements_in_range(self.next_index, end);
                 if self.cache.settings.board == BoardKind::ContinuousArchimedean {
-                    buffers.circles = continuous_attack_circle_vertices(
-                        &placements[self.next_index..end],
-                        &self.cache.settings,
-                    );
+                    buffers.circles =
+                        continuous_attack_circle_vertices(&chunk, &self.cache.settings);
                 } else {
                     let candidates = if self.cache.settings.proactive_attacking {
                         overlay_candidates(&self.cache.settings, self.cache.placement_count)
                     } else {
                         Vec::new()
                     };
-                    for placement in &placements[self.next_index..end] {
+                    for placement in &chunk {
                         self.cache.append_lattice_placement_overlay(
                             placement,
                             &mut buffers,
