@@ -34,395 +34,422 @@
       </header>
 
       <div class="panel-body">
-
-      <section class="control-section">
-        <div class="two-column-row separated-row render-settings-row">
-          <label for="board-select"
-            ><span class="label-row"
-              >Board Type
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Choose the coordinate system used by the worker: triangle, square, axial hex, or exact continuous Archimedean spots."
-                >i</span
-              ></span
-            >
-            <select id="board-select">
-              <option value="LatticeTriangle">Triangle Lattice</option>
-              <option value="LatticeSquare" selected>Square Lattice</option>
-              <option value="LatticeHex">Hex Lattice</option>
-              <option value="ContinuousArchimedean">Continuous Spiral</option>
-            </select>
-          </label>
-
-          <label for="shape-select"
-            ><span class="label-row"
-              >Piece Shape
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Render-only on lattice boards. Continuous bodies stay circular because their collision and attack math is circle-based."
-                >i</span
-              ></span
-            >
-            <select id="shape-select">
-              <option id="shape-option-square" value="Square">Square</option>
-              <option value="Circle">Circle</option>
-              <option id="shape-option-hex" value="Hex">Hex</option>
-              <option id="shape-option-triangle" value="Triangle" disabled>
-                Triangle
-              </option>
-            </select>
-          </label>
-        </div>
-      </section>
-
-      <section class="control-section">
-        <div class="radius-row">
-          <label for="radius-input"
-            ><span class="label-row"
-              >View / Generation Radius
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Radius controls both Fit Screen bounds and where the worker stops generating. Edits preview immediately and commit after a short delay."
-                >i</span
-              ></span
-            >
-            <input
-              id="radius-input"
-              type="text"
-              value="150"
-              inputmode="decimal"
-              autocomplete="off"
-            />
-          </label>
-          <label class="inline-control visual-progress" for="visual-progress-toggle">
-            <input id="visual-progress-toggle" type="checkbox" checked />
-            Visual Progress
-          </label>
-        </div>
-
-        <div class="two-column-row separated-row">
-          <label for="piece-radius-slider"
-            ><span class="label-row"
-              >Piece Radius <output id="piece-radius-output">0.50</output>
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="On lattice boards this only changes rendering. On the continuous board it changes physical body overlap and attack hits, so generation resets."
-                >i</span
-              ></span
-            >
-            <input
-              id="piece-radius-slider"
-              type="range"
-              min="0.05"
-              max="0.50"
-              step="0.01"
-              value="0.50"
-            />
-          </label>
-
-          <label id="continuous-offset-group" for="continuous-offset-input"
-            ><span class="label-row"
-              >Continuous Offset
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Initial arc-length offset from the origin. Valid values are 0..1 with up to 12 decimal places; more precision is below the solver tolerance."
-                >i</span
-              ></span
-            >
-            <span id="continuous-offset-input-wrap" class="offset-input-wrap">
-              <input
-                id="continuous-offset-input"
-                type="text"
-                inputmode="decimal"
-                autocomplete="off"
-                value="0"
-              />
-              <span
-                id="continuous-offset-highlight"
-                class="offset-input-highlight"
-                aria-hidden="true"
-              ></span>
-            </span>
-          </label>
-        </div>
-
-        <div class="inline-setting-row">
-          <label for="speed-slider"
-            ><span class="label-row"
-              >Speed <output id="speed-output">250/s</output>
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Fastest uses bounded worker batches. Slower rates are useful when inspecting exact placement order."
-                >i</span
-              ></span
-            >
-            <input
-              id="speed-slider"
-              type="range"
-              min="1"
-              max="1000"
-              step="1"
-              value="250"
-            />
-          </label>
-          <label class="inline-control" for="fastest-toggle">
-            <input id="fastest-toggle" type="checkbox" checked />
-            Fastest
-          </label>
-        </div>
-
-      </section>
-
-      <section class="control-section">
-        <div class="two-column-row separated-row render-settings-row">
-          <label for="display-mode-select"
-            ><span class="label-row"
-              >Display Mode
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Fit Screen locks the view to Radius. Free Zoom enables panning and wheel zoom around the cursor."
-                >i</span
-              ></span
-            >
-            <select id="display-mode-select">
-              <option value="FitScreen">Fit Screen</option>
-              <option value="PixelOneToOne">Free Zoom</option>
-            </select>
-          </label>
-
-          <div class="stacked-render-sliders">
-            <label for="track-opacity-slider"
+        <section class="control-section">
+          <div class="two-column-row separated-row render-settings-row">
+            <label for="board-select"
               ><span class="label-row"
-                >Spiral Track <output id="track-opacity-output">10%</output>
+                >Board Type
                 <span
                   class="info-icon"
                   tabindex="0"
-                  data-tip="Draws the board's underlying spiral path behind pieces. This is render-only and does not reset the worker."
+                  data-tip="Choose the coordinate system used by the worker: triangle, square, axial hex, or exact continuous Archimedean spots."
                   >i</span
                 ></span
               >
-              <input
-                id="track-opacity-slider"
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value="10"
-              />
+              <select id="board-select">
+                <option value="LatticeTriangle">Triangle Lattice</option>
+                <option value="LatticeSquare" selected>Square Lattice</option>
+                <option value="LatticeHex">Hex Lattice</option>
+                <option value="ContinuousArchimedean">Continuous Spiral</option>
+              </select>
             </label>
-            <label for="attack-overlay-opacity-slider"
+
+            <label for="shape-select"
               ><span class="label-row"
-                >Attack Spots <output id="attack-overlay-opacity-output">Off</output>
+                >Piece Shape
                 <span
                   class="info-icon"
                   tabindex="0"
-                  data-tip="Draws placed pieces' attack spots, proactive attack-rule shadows, or continuous attack circles. This is visual only and can be slower on dense high-radius runs."
+                  data-tip="Render-only on lattice boards. Continuous bodies stay circular because their collision and attack math is circle-based."
                   >i</span
                 ></span
               >
-              <input
-                id="attack-overlay-opacity-slider"
-                type="range"
-                min="0"
-                max="100"
-                step="1"
-                value="0"
-              />
+              <select id="shape-select">
+                <option id="shape-option-square" value="Square">Square</option>
+                <option value="Circle">Circle</option>
+                <option id="shape-option-hex" value="Hex">Hex</option>
+                <option id="shape-option-triangle" value="Triangle" disabled>
+                  Triangle
+                </option>
+              </select>
             </label>
           </div>
-        </div>
+        </section>
 
-        <div id="zoom-row">
-          <label for="zoom-slider"
+        <section class="control-section">
+          <div class="radius-row">
+            <label for="radius-input"
+              ><span class="label-row"
+                >View / Generation Radius
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Radius controls both Fit Screen bounds and where the worker stops generating. Edits preview immediately and commit after a short delay."
+                  >i</span
+                ></span
+              >
+              <input
+                id="radius-input"
+                type="text"
+                value="150"
+                inputmode="decimal"
+                autocomplete="off"
+              />
+            </label>
+            <label
+              class="inline-control visual-progress"
+              for="visual-progress-toggle"
+            >
+              <input id="visual-progress-toggle" type="checkbox" checked />
+              Visual Progress
+            </label>
+          </div>
+
+          <div class="two-column-row separated-row">
+            <label for="piece-radius-slider"
+              ><span class="label-row"
+                >Piece Radius <output id="piece-radius-output">0.50</output>
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="On lattice boards this only changes rendering. On the continuous board it changes physical body overlap and attack hits, so generation resets."
+                  >i</span
+                ></span
+              >
+              <input
+                id="piece-radius-slider"
+                type="range"
+                min="0.05"
+                max="0.50"
+                step="0.01"
+                value="0.50"
+              />
+            </label>
+
+            <label id="continuous-offset-group" for="continuous-offset-input"
+              ><span class="label-row"
+                >Continuous Offset
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Initial arc-length offset from the origin. Valid values are 0..1 with up to 12 decimal places; more precision is below the solver tolerance."
+                  >i</span
+                ></span
+              >
+              <span id="continuous-offset-input-wrap" class="offset-input-wrap">
+                <input
+                  id="continuous-offset-input"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  value="0"
+                />
+                <span
+                  id="continuous-offset-highlight"
+                  class="offset-input-highlight"
+                  aria-hidden="true"
+                ></span>
+              </span>
+            </label>
+          </div>
+
+          <div class="inline-setting-row">
+            <label for="speed-slider"
+              ><span class="label-row"
+                >Speed <output id="speed-output">250/s</output>
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Fastest uses bounded worker batches. Slower rates are useful when inspecting exact placement order."
+                  >i</span
+                ></span
+              >
+              <input
+                id="speed-slider"
+                type="range"
+                min="1"
+                max="1000"
+                step="1"
+                value="250"
+              />
+            </label>
+            <label class="inline-control" for="fastest-toggle">
+              <input id="fastest-toggle" type="checkbox" checked />
+              Fastest
+            </label>
+          </div>
+        </section>
+
+        <section class="control-section">
+          <div class="two-column-row separated-row render-settings-row">
+            <label for="display-mode-select"
+              ><span class="label-row"
+                >Display Mode
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Fit Screen locks the view to Radius. Free Camera enables panning and wheel zoom around the cursor."
+                  >i</span
+                ></span
+              >
+              <select id="display-mode-select">
+                <option value="FitScreen">Fit Screen</option>
+                <option value="PixelOneToOne">Free Camera</option>
+              </select>
+            </label>
+
+            <div class="stacked-render-sliders">
+              <label for="track-opacity-slider"
+                ><span class="label-row"
+                  >Spiral Track <output id="track-opacity-output">10%</output>
+                  <span
+                    class="info-icon"
+                    tabindex="0"
+                    data-tip="Draws the board's underlying spiral path behind pieces. This is render-only and does not reset the worker."
+                    >i</span
+                  ></span
+                >
+                <input
+                  id="track-opacity-slider"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value="10"
+                />
+              </label>
+              <label for="attack-overlay-opacity-slider"
+                ><span class="label-row"
+                  >Attack Spots
+                  <output id="attack-overlay-opacity-output">Off</output>
+                  <span
+                    class="info-icon"
+                    tabindex="0"
+                    data-tip="Draws placed pieces' attack spots, proactive attack-rule shadows, or continuous attack circles. This is visual only and can be slower on dense high-radius runs."
+                    >i</span
+                  ></span
+                >
+                <input
+                  id="attack-overlay-opacity-slider"
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="1"
+                  value="0"
+                />
+              </label>
+            </div>
+          </div>
+
+          <div id="zoom-row">
+            <label for="zoom-slider"
+              ><span class="label-row"
+                >Zoom <output id="zoom-output">x1</output></span
+              ></label
+            >
+            <input
+              id="zoom-slider"
+              type="range"
+              min="1"
+              max="32"
+              step="1"
+              value="1"
+            />
+          </div>
+        </section>
+
+        <section class="control-section">
+          <label
+            class="inline-setting-row compact-setting-row"
+            for="placement-search-select"
             ><span class="label-row"
-              >Zoom <output id="zoom-output">x4</output></span
-            ></label
-          >
-          <input
-            id="zoom-slider"
-            type="range"
-            min="1"
-            max="32"
-            step="1"
-            value="4"
-          />
-        </div>
-      </section>
-
-      <section class="control-section">
-        <label class="inline-setting-row compact-setting-row" for="placement-search-select"
-          ><span class="label-row"
-            >Placement Search
-            <span
-              class="info-icon"
-              tabindex="0"
-              data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
-              >i</span
-            ></span
-          >
-          <select id="placement-search-select">
-            <option value="SpiralPath" selected>Spiral Path</option>
-            <option value="CenterDistance">Center Distance</option>
-          </select>
-        </label>
-
-        <div class="split-setting-row">
-          <label class="setting-pair" for="enemy-mode-select"
-            ><span class="label-row"
-              >Ally / Enemy Condition
+              >Placement Search
               <span
                 class="info-icon"
                 tabindex="0"
-                data-tip="Attack-set treats different normalized attack jumps as enemies. Color treats different color groups as enemies. Color-Attack-set applies both."
+                data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
                 >i</span
               ></span
             >
-            <select id="enemy-mode-select">
-              <option value="AttackSet">Attack-set</option>
-              <option value="Color" selected>Color</option>
-              <option value="ColorAttackSet">Color-Attack-set</option>
+            <select id="placement-search-select">
+              <option value="SpiralPath" selected>Spiral Path</option>
+              <option value="CenterDistance">Center Distance</option>
             </select>
           </label>
 
-          <span class="row-divider" aria-hidden="true"></span>
+          <div class="split-setting-row">
+            <label class="setting-pair" for="enemy-mode-select"
+              ><span class="label-row"
+                >Ally / Enemy Condition
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Attack-set treats different normalized attack jumps as enemies. Color treats different color groups as enemies. Color-Attack-set applies both."
+                  >i</span
+                ></span
+              >
+              <select id="enemy-mode-select">
+                <option value="AttackSet">Attack-set</option>
+                <option value="Color" selected>Color</option>
+                <option value="ColorAttackSet">Color-Attack-set</option>
+              </select>
+            </label>
 
-          <label class="setting-pair checkbox-pair" for="attacking-toggle">
-            <span class="label-row"
-              >Proactive Attack Rule
+            <span class="row-divider" aria-hidden="true"></span>
+
+            <label class="setting-pair checkbox-pair" for="attacking-toggle">
+              <span class="label-row"
+                >Proactive Attack Rule
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="When enabled, a candidate is rejected if it would attack an existing enemy piece. Status shows active rejection counts."
+                  >i</span
+                ></span
+              >
+              <span class="inline-control">
+                <input id="attacking-toggle" type="checkbox" />
+                Enabled
+              </span>
+            </label>
+          </div>
+        </section>
+
+        <section class="control-section">
+          <label
+            class="inline-setting-row compact-setting-row"
+            for="army-preset-select"
+            ><span class="label-row"
+              >Army Preset
               <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="When enabled, a candidate is rejected if it would attack an existing enemy piece. Status shows active rejection counts."
-                >i</span
-              ></span
-            >
-            <span class="inline-control">
-              <input id="attacking-toggle" type="checkbox" />
-              Enabled
-            </span>
-          </label>
-        </div>
-      </section>
-
-      <section class="control-section">
-        <label class="inline-setting-row compact-setting-row" for="army-preset-select"
-          ><span class="label-row"
-            >Army Preset
-            <span
                 class="info-icon"
                 tabindex="0"
                 data-tip="Custom Finite cycles rows, and each row remembers its own search cursor. Prime presets keep one current prime piece until it finds a valid spot."
                 >i</span
               ></span
             >
-          <select id="army-preset-select">
-            <option value="CustomFinite">Custom Finite</option>
-            <option value="PrimeKnight">Prime Knight</option>
-            <option value="PrimeGapper">Prime Gapper</option>
-          </select>
-        </label>
-
-        <div id="custom-army-editor">
-          <div class="piece-add-row">
-            <label for="piece-a-input"
-              >Primary Move
-              <input id="piece-a-input" type="number" step="1" value="2" />
-            </label>
-            <label for="piece-b-input"
-              >Turn Move
-              <input id="piece-b-input" type="number" step="1" value="1" />
-            </label>
-            <button id="add-piece-button" type="button">Add</button>
-          </div>
-          <div id="army-list" class="army-list"></div>
-        </div>
-
-        <div id="prime-color-controls">
-          <label
-            id="prime-divisor-label"
-            class="inline-setting-row"
-            for="prime-divisor-input"
-            ><span class="label-row"
-              >Modulo Divisor (colors)
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Prime Knight colors bounce through modulo buckets between Anchor A and Anchor B. Values commit on Enter or blur, then normalize to the nearest multiple of 6."
-                >i</span
-              ></span
-            >
-            <input
-              id="prime-divisor-input"
-              type="number"
-              min="6"
-              step="6"
-              value="12"
-            />
+            <select id="army-preset-select">
+              <option value="CustomFinite">Custom Finite</option>
+              <option value="PrimeKnight">Prime Knight</option>
+              <option value="PrimeGapper">Prime Gapper</option>
+            </select>
           </label>
-          <div class="anchor-row">
-            <div class="color-setting">
-              <span id="anchor-a-label" class="label-row"
-                >Start Color
-                <span
-                  class="info-icon"
-                  tabindex="0"
-                  data-tip="First custom row and low prime color values use this anchor."
-                  >i</span
-                ></span
-              >
-              <input
-                id="anchor-a-input"
-                type="color"
-                value="#ff7800"
-                aria-labelledby="anchor-a-label"
-              />
+
+          <div id="custom-army-editor">
+            <div class="piece-add-row">
+              <label for="piece-a-input"
+                >Primary Move
+                <input id="piece-a-input" type="number" step="1" value="2" />
+              </label>
+              <label for="piece-b-input"
+                >Turn Move
+                <input id="piece-b-input" type="number" step="1" value="1" />
+              </label>
+              <div class="piece-action-row">
+                <button id="add-piece-button" type="button">Add</button>
+                <button id="random-piece-button" type="button">Random</button>
+                <input
+                  id="random-count-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value="3"
+                  title="Random piece count"
+                  aria-label="Random piece count"
+                />
+                <button
+                  id="random-pool-toggle-button"
+                  class="square-icon-button"
+                  type="button"
+                  title="Edit random pool"
+                  aria-pressed="false"
+                >
+                  &#9998;
+                </button>
+              </div>
             </div>
-            <div class="color-setting">
-              <span id="anchor-b-label" class="label-row"
-                >End Color
+            <div id="army-list" class="army-list"></div>
+          </div>
+
+          <div id="prime-color-controls">
+            <label
+              id="prime-divisor-label"
+              class="inline-setting-row"
+              for="prime-divisor-input"
+              ><span class="label-row"
+                >Modulo Divisor (colors)
                 <span
                   class="info-icon"
                   tabindex="0"
-                  data-tip="Last custom row and high prime-gap values use this anchor. Intermediate colors follow a hue path."
+                  data-tip="Prime Knight colors bounce through modulo buckets between Anchor A and Anchor B. Values commit on Enter or blur, then normalize to the nearest multiple of 6."
                   >i</span
                 ></span
               >
               <input
-                id="anchor-b-input"
-                type="color"
-                value="#ff0006"
-                aria-labelledby="anchor-b-label"
+                id="prime-divisor-input"
+                type="number"
+                min="6"
+                step="6"
+                value="12"
               />
+            </label>
+            <div class="anchor-row">
+              <div class="color-setting">
+                <span id="anchor-a-label" class="label-row"
+                  >Start Color
+                  <span
+                    class="info-icon"
+                    tabindex="0"
+                    data-tip="First custom row and low prime color values use this anchor."
+                    >i</span
+                  ></span
+                >
+                <input
+                  id="anchor-a-input"
+                  type="color"
+                  value="#ff7800"
+                  aria-labelledby="anchor-a-label"
+                />
+              </div>
+              <div class="color-setting">
+                <span id="anchor-b-label" class="label-row"
+                  >End Color
+                  <span
+                    class="info-icon"
+                    tabindex="0"
+                    data-tip="Last custom row and high prime-gap values use this anchor. Intermediate colors follow a hue path."
+                    >i</span
+                  ></span
+                >
+                <input
+                  id="anchor-b-input"
+                  type="color"
+                  value="#ff0006"
+                  aria-labelledby="anchor-b-label"
+                />
+              </div>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section class="button-row">
-        <button id="start-button" type="button">Start</button>
-        <button id="pause-button" type="button">Pause</button>
-        <button id="step-button" type="button">Step</button>
-        <button id="refresh-button" type="button">Refresh</button>
-      </section>
+        <section class="button-row">
+          <button id="start-button" type="button">Start</button>
+          <button id="pause-button" type="button">Pause</button>
+          <button id="step-button" type="button">Step</button>
+          <button id="refresh-button" type="button">Refresh</button>
+        </section>
 
-      <section class="button-row">
-        <button id="download-full-png-button" type="button">Full PNG</button>
-        <button id="download-png-button" type="button">PNG</button>
-        <button id="download-jpeg-button" type="button">JPEG 1/2</button>
-        <button id="download-log-button" type="button">Log</button>
-      </section>
+        <section class="button-row">
+          <button id="download-full-png-button" type="button">Full PNG</button>
+          <button id="download-png-button" type="button">PNG</button>
+          <button id="download-jpeg-button" type="button">Half JPEG</button>
+          <button id="download-log-button" type="button">Log</button>
+        </section>
 
-      <section class="control-section log-section">
-        <label for="placement-log">Placement Log</label>
-        <pre id="placement-log">No placements yet.</pre>
-      </section>
+        <section class="control-section log-section">
+          <label for="placement-log">Placement Log</label>
+          <pre id="placement-log">No placements yet.</pre>
+        </section>
       </div>
     </aside>
 
@@ -469,12 +496,13 @@
           icon.addEventListener("blur", hide);
         });
 
-        const panel = document.querySelector(".panel");
-        if (panel) {
-          panel.addEventListener("scroll", () => {
-            tooltip.classList.remove("visible");
+        document
+          .querySelectorAll(".panel, .panel-body")
+          .forEach((scrollRoot) => {
+            scrollRoot.addEventListener("scroll", () => {
+              tooltip.classList.remove("visible");
+            });
           });
-        }
       });
     </script>
   </body>

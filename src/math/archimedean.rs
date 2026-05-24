@@ -127,15 +127,14 @@ impl ArchimedeanSpiral {
         }
 
         let target = distance * distance;
-        let mut low = theta0;
-        let mut high = Self::initial_high(theta0, distance);
-        let mut high_value = Self::squared_distance(theta0, high) - target;
+        let mut low_delta = 0.0;
+        let mut high_delta = Self::initial_high(theta0, distance) - theta0;
+        let mut high_value = Self::squared_distance(theta0, theta0 + high_delta) - target;
         let mut expansions = 0;
 
         while high_value < 0.0 && expansions < 96 {
-            let width = high - low;
-            high += width.max(1.0e-9);
-            high_value = Self::squared_distance(theta0, high) - target;
+            high_delta += high_delta.max(1.0e-9);
+            high_value = Self::squared_distance(theta0, theta0 + high_delta) - target;
             expansions += 1;
         }
 
@@ -143,74 +142,91 @@ impl ArchimedeanSpiral {
             return Err(SolverError::BracketFailed);
         }
 
-        let mut theta = theta0 + (high - theta0).min(Self::local_step_estimate(theta0, distance));
-        theta = theta.clamp(low, high);
-        if theta <= low || theta >= high {
-            theta = 0.5 * (low + high);
+        let mut delta = high_delta.min(Self::local_step_estimate(theta0, distance));
+        delta = delta.clamp(low_delta, high_delta);
+        if delta <= low_delta || delta >= high_delta {
+            delta = 0.5 * (low_delta + high_delta);
         }
 
-        let mut best_theta = theta;
+        let mut best_delta = delta;
         let mut best_error = f64::INFINITY;
+        let mut best_nonoverlap_delta = high_delta;
+        let mut best_nonoverlap_error = high_value.abs();
 
         for _ in 0..MAX_NEWTON_ITERS {
+            let theta = theta0 + delta;
             let value = Self::squared_distance(theta0, theta) - target;
             let error = value.abs();
             if error < best_error {
                 best_error = error;
-                best_theta = theta;
+                best_delta = delta;
+            }
+            if value >= 0.0 && error < best_nonoverlap_error {
+                best_nonoverlap_error = error;
+                best_nonoverlap_delta = delta;
             }
             if error <= SOLVER_EPS * target.max(1.0) {
                 return Ok(theta);
             }
 
             if value > 0.0 {
-                high = theta;
+                high_delta = delta;
             } else {
-                low = theta;
+                low_delta = delta;
             }
 
             let derivative = Self::squared_distance_derivative(theta0, theta);
             let candidate = if derivative.abs() > f64::EPSILON && derivative.is_finite() {
-                theta - value / derivative
+                delta - value / derivative
             } else {
                 f64::NAN
             };
 
-            theta = if candidate.is_finite() && candidate > low && candidate < high {
+            delta = if candidate.is_finite() && candidate > low_delta && candidate < high_delta {
                 candidate
             } else {
-                0.5 * (low + high)
+                0.5 * (low_delta + high_delta)
             };
         }
 
         for _ in 0..MAX_BISECTION_ITERS {
-            theta = 0.5 * (low + high);
-            if theta <= low || theta >= high {
-                return Ok(best_theta);
+            delta = 0.5 * (low_delta + high_delta);
+            if delta <= low_delta || delta >= high_delta {
+                return Ok(theta0 + best_nonoverlap_delta);
             }
 
+            let theta = theta0 + delta;
             let value = Self::squared_distance(theta0, theta) - target;
             let error = value.abs();
             if error < best_error {
                 best_error = error;
-                best_theta = theta;
+                best_delta = delta;
+            }
+            if value >= 0.0 && error < best_nonoverlap_error {
+                best_nonoverlap_error = error;
+                best_nonoverlap_delta = delta;
             }
 
             if error <= SOLVER_EPS * target.max(1.0) {
                 return Ok(theta);
             }
-            if (high - low).abs() <= f64::EPSILON * high.abs().max(1.0) {
-                return Ok(best_theta);
+            if (high_delta - low_delta).abs() <= f64::EPSILON * high_delta.abs().max(1.0) {
+                return Ok(theta0 + best_nonoverlap_delta);
             }
 
             if value > 0.0 {
-                high = theta;
+                high_delta = delta;
             } else {
-                low = theta;
+                low_delta = delta;
             }
         }
 
-        Ok(best_theta)
+        let best_value = Self::squared_distance(theta0, theta0 + best_delta) - target;
+        if best_value >= -SOLVER_EPS * target.max(1.0) {
+            Ok(theta0 + best_delta)
+        } else {
+            Ok(theta0 + best_nonoverlap_delta)
+        }
     }
 
     #[must_use]
@@ -282,6 +298,7 @@ impl Iterator for ArchimedeanSpots {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::GEOM_EPS;
 
     #[test]
     fn archimedean_one_turn_radial_spacing_is_one() {
@@ -324,6 +341,10 @@ mod tests {
             let distance = ArchimedeanSpiral::squared_distance(theta0, theta1).sqrt();
             assert!(
                 (distance - UNIT_TOUCH_DISTANCE).abs() <= 2.0e-8,
+                "radius={radius}, theta0={theta0}, theta1={theta1}, distance={distance}"
+            );
+            assert!(
+                distance >= UNIT_TOUCH_DISTANCE - GEOM_EPS,
                 "radius={radius}, theta0={theta0}, theta1={theta1}, distance={distance}"
             );
         }

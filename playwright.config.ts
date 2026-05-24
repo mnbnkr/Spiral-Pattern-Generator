@@ -26,7 +26,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `trunk serve --port 8081 --no-autoreload --public-url ${appBasePath}`,
+    command: `trunk serve --release --port 8081 --no-autoreload --dist target/playwright/dist --public-url ${appBasePath}`,
     url: `${appOrigin}${appBasePath}`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

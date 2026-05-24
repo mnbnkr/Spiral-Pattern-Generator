@@ -56,6 +56,12 @@ async function statusPlacementCount(page) {
   return match ? Number(match[1]) : 0;
 }
 
+async function canvasPlacementPages(page) {
+  return page.locator("#sim-canvas").evaluate((canvas) => {
+    return Number(canvas.getAttribute("data-placement-pages") ?? "0");
+  });
+}
+
 async function lightPixelCount(page) {
   return page.locator("#sim-canvas").evaluate((canvas) => {
     const source = canvas as HTMLCanvasElement;
@@ -101,6 +107,37 @@ async function continuousSpotsForSearch(page, search: string) {
     .map((match) => Number(match[1]));
 }
 
+test("high-radius rendering crosses the previous multi-million buffer cliff", async ({
+  page,
+}) => {
+  test.setTimeout(160_000);
+  await pauseIfRunning(page);
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "0";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.fill("#radius-input", "1500");
+  await page.selectOption("#placement-search-select", "SpiralPath");
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+
+  await expect
+    .poll(() => statusPlacementCount(page), {
+      timeout: 140_000,
+      intervals: [1_000, 2_000, 5_000],
+    })
+    .toBeGreaterThan(4_250_000);
+  await expect
+    .poll(() => canvasPlacementPages(page), { timeout: 10_000 })
+    .toBeGreaterThanOrEqual(5);
+  expect(await renderedPixelCount(page)).toBeGreaterThan(0);
+  await pauseIfRunning(page);
+});
+
 test("default simulation auto-runs", async ({ page }) => {
   expect(
     await page.evaluate(() => new URL(document.baseURI).pathname),
@@ -118,6 +155,7 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect(page.locator("#radius-input")).toHaveValue("150");
   await expect(page.locator("#track-opacity-output")).toHaveText("10%");
   await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
+  await expect(page.locator("#download-jpeg-button")).toHaveText("Half JPEG");
   await page.waitForFunction(
     () => {
       const text = document.querySelector("#status-line")?.textContent ?? "";
@@ -129,6 +167,7 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect
     .poll(() => renderedPixelCount(page), { timeout: 10_000 })
     .toBeGreaterThan(0);
+  await pauseIfRunning(page);
 });
 
 test("radius border renders with track off and subpath-loaded app is nonblank", async ({
@@ -297,6 +336,85 @@ test("custom rows use order labels and can be deleted to an empty placeholder", 
   await expect(page.locator(".army-empty-row")).toBeVisible();
 });
 
+test("panel header remains visible while the control body scrolls", async ({
+  page,
+}) => {
+  const before = await page.locator("#panel-toggle-button").boundingBox();
+  expect(before).not.toBeNull();
+
+  await page.locator(".panel-body").evaluate((body) => {
+    body.scrollTop = body.scrollHeight;
+    body.dispatchEvent(new Event("scroll"));
+  });
+
+  await expect(page.locator("#panel-toggle-button")).toBeVisible();
+  const after = await page.locator("#panel-toggle-button").boundingBox();
+  expect(after).not.toBeNull();
+  expect(Math.abs((after?.y ?? 0) - (before?.y ?? 0))).toBeLessThanOrEqual(1);
+});
+
+test("quick second click closes an already focused select", async ({ page }) => {
+  await page.click("#enemy-mode-select");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        return document.activeElement?.id ?? "";
+      }),
+    )
+    .toBe("enemy-mode-select");
+
+  await page.dispatchEvent("#enemy-mode-select", "mousedown", {
+    bubbles: true,
+    button: 0,
+  });
+
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        return document.activeElement?.id ?? "";
+      }),
+    )
+    .not.toBe("enemy-mode-select");
+});
+
+test("random custom army controls populate and edit the random pool", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expect(page.locator("#random-count-input")).toHaveValue("4");
+  await expect(page.locator("#random-piece-button")).toBeEnabled();
+
+  await page.click("#random-pool-toggle-button");
+  await expect(page.locator("#random-pool-toggle-button")).toHaveAttribute(
+    "aria-pressed",
+    "true",
+  );
+  await expect(page.locator(".random-pool-row")).toHaveCount(11);
+  await expect(page.locator("#army-list")).toContainText("Knight");
+  await expect(page.locator("#army-list")).toContainText("(2, 1)");
+  await expect(page.locator(".random-pool-row .army-swatch")).toHaveCount(0);
+
+  await page.fill("#piece-a-input", "7");
+  await page.fill("#piece-b-input", "4");
+  await page.click("#add-piece-button");
+  await expect(page.locator(".random-pool-row")).toHaveCount(12);
+  await expect(page.locator("#army-list")).toContainText("Custom (7, 4)");
+
+  await page.fill("#random-count-input", "4");
+  await page.click("#random-piece-button");
+  await expect(page.locator("#random-pool-toggle-button")).toHaveAttribute(
+    "aria-pressed",
+    "false",
+  );
+  await expect(page.locator(".random-pool-row")).toHaveCount(0);
+  await expect(page.locator(".army-row")).toHaveCount(4);
+
+  await page.selectOption("#army-preset-select", "PrimeKnight");
+  await expect(page.locator("#random-piece-button")).toBeDisabled();
+  await expect(page.locator("#random-count-input")).toBeDisabled();
+  await expect(page.locator("#random-pool-toggle-button")).toBeDisabled();
+});
+
 test("custom row edits stage without clearing the visible snapshot", async ({
   page,
 }) => {
@@ -367,7 +485,7 @@ test("complete runs hide the radius border until settings change", async ({
   );
 });
 
-test("canvas cursor and wheel activate Free Zoom panning", async ({
+test("canvas cursor and wheel activate Free Camera panning", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -382,6 +500,11 @@ test("canvas cursor and wheel activate Free Zoom panning", async ({
   await page.mouse.move(500, 360);
   await page.mouse.wheel(0, -120);
   await expect(page.locator("#display-mode-select")).toHaveValue("PixelOneToOne");
+  await expect(page.locator("#display-mode-select option[value='PixelOneToOne']")).toHaveText(
+    "Free Camera",
+  );
+  await expect(page.locator("#zoom-slider")).toHaveValue("2");
+  await expect(page.locator("#zoom-output")).toHaveText("x2");
   await page.selectOption("#display-mode-select", "PixelOneToOne");
   await expect
     .poll(() =>
@@ -489,6 +612,23 @@ test("hex shape, spiral track, and compressed export stay wired", async ({
       }),
     )
     .toBeGreaterThan(0);
+  const attackSpotCount = await page.locator("#sim-canvas").evaluate((canvas) => {
+    return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+  });
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#attack-overlay-opacity-slider",
+    );
+    if (!slider) throw new Error("missing attack overlay slider");
+    slider.value = "0";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
+  expect(
+    await page.locator("#sim-canvas").evaluate((canvas) => {
+      return Number(canvas.getAttribute("data-attack-spots") ?? "0");
+    }),
+  ).toBe(attackSpotCount);
 
   const download = page.waitForEvent("download");
   await page.click("#download-jpeg-button");
@@ -1000,14 +1140,9 @@ test("high-radius center distance starts without a full-radius prebuild", async 
 test("higher radius commits without clearing the visible generation", async ({
   page,
 }) => {
-  await page.waitForFunction(
-    () => {
-      const text = document.querySelector("#status-line")?.textContent ?? "";
-      return /^[1-9]\d* placements/.test(text);
-    },
-    null,
-    { timeout: 15_000 },
-  );
+  await expect
+    .poll(() => statusPlacementCount(page), { timeout: 15_000 })
+    .toBeGreaterThan(0);
 
   const beforeLog = await page.locator("#placement-log").textContent();
   expect(beforeLog).toContain("placements logged:");

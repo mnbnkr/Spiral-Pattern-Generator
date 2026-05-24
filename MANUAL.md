@@ -29,7 +29,7 @@ Do not introduce React, Yew, npm build tooling, or a heavy UI framework. Playwri
 
 The mathematical engine must run in the worker. The main thread owns UI, worker control, rendering, and downloads.
 
-Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices. The main thread appends vertex ranges and uploads them with `bufferSubData`; full vertex replacements are reserved for recoloring or reset events.
+Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices. The main thread appends vertex ranges and uploads them with `bufferSubData` into fixed-size WebGL pages; full vertex replacements are reserved for recoloring or reset events.
 
 The visual run loop is a bounded pull loop: the main thread asks for one worker batch, handles the reply, coalesces drawing onto `requestAnimationFrame`, and only then requests more work. Do not reintroduce an unbounded worker-push loop.
 
@@ -214,7 +214,7 @@ Fit Screen maps the requested radius and board-specific bounds to the viewport. 
 
 Pieces render on one HTML5 canvas through WebGL point sprites. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
 
-Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`.
+Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`. Placement vertices are stored in fixed-size WebGL pages so large radius runs do not hit a single-buffer reallocation cliff.
 
 Render shapes:
 
@@ -228,7 +228,7 @@ Shape changes and lattice Piece Radius changes are render-only and must not rese
 
 Spiral Track is render-only. Lattice track geometry is a connected WebGL line strip through the exact turn points of the Square, Hex, and Triangle spiral paths, so high-radius previews keep the true spiral shape without compression or sampled cross-board shortcuts. Continuous track geometry is sampled by step size and point count while still including the requested end radius. When a board change stages a new generation while the old placement snapshot remains dimmed, the track and view bounds still follow the currently selected board and radius, while old pieces keep their original board render shape and piece radius until the next generation starts.
 
-Attack Spots is a render-only overlay. Lattice boards draw placed-piece attack target spots in `#F7F7F7`; when proactive attacking is enabled, they also draw empty candidate-origin shadows that would be rejected because the candidate could attack an existing enemy. Occupied attacked spots get a half-strength overlay so the placed piece visually mixes with the attack color. Continuous boards draw thin `#F7F7F7` attack circles over placed pieces as visualization only; these circles are not intended to be a pixel-perfect representation of the algebraic hit predicate. Attack radii beyond `4 * Radius` are ignored by attack checks and overlays because they cannot affect the visible generation surface under the current bound. Large or dense runs can generate many attack markers, so overlay data is built and delivered in worker chunks to avoid a single long blocking rebuild. Lattice proactive overlays are also rebuilt through that chunked path as placements advance, because candidate-origin shadows are not safely append-only when the active placing piece changes.
+Attack Spots is a render-only overlay. Lattice boards draw placed-piece attack target spots in `#F7F7F7`; when proactive attacking is enabled, they also draw empty candidate-origin shadows that would be rejected because the candidate could attack an existing enemy. Occupied attacked spots get a half-strength overlay so the placed piece visually mixes with the attack color. Continuous boards draw thin `#F7F7F7` attack circles over placed pieces as visualization only; these circles are not intended to be a pixel-perfect representation of the algebraic hit predicate. Attack radii beyond `4 * Radius` are ignored by attack checks and overlays because they cannot affect the visible generation surface under the current bound. Large or dense runs can generate many attack markers, so overlay data is built and delivered in worker chunks to avoid a single long blocking rebuild. Lattice proactive overlays are also rebuilt through that chunked path as placements advance, because candidate-origin shadows are not safely append-only when the active placing piece changes. Opacity changes reuse existing overlay buffers instead of clearing and rebuilding them; Continuous attack circles are transferred as small quad primitives and rendered procedurally by the overlay shader.
 
 When Spiral Track opacity is `off`, the renderer draws a single View / Generation Radius border line for the current board. Square uses the square generation bound, Hex uses the hex cube-radius boundary, Triangle follows the triangular shell boundary, and Continuous uses a circle at the exact requested radius. The border is hidden whenever Spiral Track is visible. It is also hidden after a true `Complete` run when the worker has reached the requested edge, and it returns immediately when settings change or a new run is staged.
 
@@ -238,7 +238,7 @@ Board view/export bounds are board-specific:
 - Hex uses its wider axial x extent and y extent, so side corners are visible and pannable.
 - Triangle uses its asymmetric shell bounds, so Fit Screen and exports do not leave excessive empty space below.
 
-In `Free Zoom`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Zoom and applies the wheel zoom around the cursor. The canvas shows pan cursors and accepts left-drag panning whenever Free Zoom is active, including `x1`.
+In `Free Camera`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Camera and applies the wheel zoom around the cursor. The canvas shows pan cursors and accepts left-drag panning whenever Free Camera is active, including `x1`.
 
 ## Image And Log Export
 
@@ -246,7 +246,7 @@ Image export never copies the visible viewport canvas. It renders deterministic 
 
 - Full PNG preserves strict deterministic scale.
 - PNG keeps square/cell exports at one cell per pixel and caps non-square piece diameter to practical size.
-- JPEG 1/2 intentionally uses half resolution and lossy compression.
+- Half JPEG intentionally uses half resolution and lossy compression.
 - LatticeSquare Square exports use nearest-neighbor one-cell pixels.
 - Non-square, Hex, Triangle, and Continuous exports use smoothed supersampled rasterization.
 - Image exports run in browser-scheduled chunks. Square Lattice Square exports write one cell directly to one output pixel instead of rasterizing every square shape, so large one-cell PNG exports avoid unnecessary per-piece shape loops. While an export is preparing, the clicked image button changes to `Cancel`; clicking it requests cancellation and restores the button when the worker-visible export job stops. Allocation, canvas, encoder failures, and encoder timeouts surface as visible status errors and restore the clicked button so later exports can run.
@@ -276,7 +276,7 @@ Required controls:
 - Custom army editor
 - Start/End color anchors
 - Refresh, Start, Pause, Step
-- Full PNG, PNG, JPEG 1/2, Log downloads
+- Full PNG, PNG, Half JPEG, Log downloads
 
 Default settings:
 
@@ -290,6 +290,7 @@ Default settings:
 - Visual Progress: enabled
 - Spiral Track: `10%`
 - Attack Spots: off
+- Zoom: `x1`
 - Anchor A: `#ff7800`
 - Anchor B: `#ff0006`
 
@@ -306,6 +307,8 @@ Per-second Speed mode schedules worker ticks from the selected rate. `1/s` means
 Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highlighted while editing. On blur, invalid text is restored to the last valid value; an empty invalid field becomes `0`.
 
 Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path.
+
+Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `4`, and populates the custom army from a session-local random pool. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show names and moves but no order color swatches. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
 
 ## Colors
 
@@ -333,7 +336,7 @@ trunk serve --port 8080
 pnpm exec playwright test --project=chromium
 ```
 
-GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install Trunk through Cargo rather than the deprecated Node-based `jetli/trunk-action@v0.5.1`. Playwright CI uses pnpm, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and browser tests, then uploads the HTML report from `target/playwright/report/`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed.
+GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install Trunk through Cargo rather than the deprecated Node-based `jetli/trunk-action@v0.5.1`. Playwright CI uses pnpm, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and release-mode browser tests, then uploads the HTML report from `target/playwright/report/`. Playwright serves its browser-test build from `target/playwright/dist/` so its GitHub Pages public URL does not overwrite the main local `dist/` used by `trunk serve --port 8080`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed.
 
 WASM-only files are guarded with `#[cfg(target_arch = "wasm32")]`. `.vscode/settings.json` sets `rust-analyzer.cargo.target = "wasm32-unknown-unknown"` so app, worker, UI, and renderer modules are analyzed as active.
 

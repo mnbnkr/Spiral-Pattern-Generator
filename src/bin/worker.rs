@@ -101,8 +101,9 @@ fn handle_message(
             let old_settings = runtime.engine.settings().clone();
             let anchor_colors_changed = old_settings.anchor_color_a != settings.anchor_color_a
                 || old_settings.anchor_color_b != settings.anchor_color_b;
-            let overlay_may_need_refresh = old_settings.attack_overlay_opacity > f32::EPSILON
-                || settings.attack_overlay_opacity > f32::EPSILON;
+            let overlay_needs_rebuild =
+                attack_overlay_settings_changed_excluding_opacity(&old_settings, &settings);
+            let overlay_enabled = settings.attack_overlay_opacity > f32::EPSILON;
             let reset = runtime.engine.update_settings(settings);
             if reset {
                 runtime.placements.clear();
@@ -113,24 +114,47 @@ fn handle_message(
                     VertexBufferUpdate::Replace(Vec::new()),
                     AttackOverlayUpdate::replace_empty(),
                 );
-            } else if anchor_colors_changed && !runtime.placements.is_empty() {
-                let vertices = pack_vertices(
-                    &runtime.placements,
-                    runtime.engine.settings(),
-                    runtime.engine.color_state(),
-                );
-                let attack_overlay_update =
-                    attack_overlay_update_for_runtime(&mut runtime, overlay_may_need_refresh);
-                post_stats_with_updates(
-                    &runtime,
-                    VertexBufferUpdate::Replace(vertices),
-                    attack_overlay_update,
-                );
-            } else if overlay_may_need_refresh {
-                let attack_overlay_update = attack_overlay_update_for_runtime(&mut runtime, true);
-                post_stats_with_updates(&runtime, VertexBufferUpdate::None, attack_overlay_update);
             } else {
-                post_stats(&runtime);
+                if overlay_needs_rebuild && !overlay_enabled {
+                    runtime.attack_overlay_cache = None;
+                    runtime.attack_overlay_job = None;
+                }
+
+                if !overlay_enabled {
+                    runtime.attack_overlay_job = None;
+                }
+
+                let attack_overlay_update = if overlay_needs_rebuild && overlay_enabled {
+                    attack_overlay_update_for_runtime(&mut runtime, true)
+                } else if overlay_enabled
+                    && runtime.placements.len() > attack_overlay_synced_placement_count(&runtime)
+                    && runtime.attack_overlay_job.is_none()
+                {
+                    attack_overlay_update_for_missing_placements(&mut runtime)
+                } else {
+                    AttackOverlayUpdate::none()
+                };
+
+                if anchor_colors_changed && !runtime.placements.is_empty() {
+                    let vertices = pack_vertices(
+                        &runtime.placements,
+                        runtime.engine.settings(),
+                        runtime.engine.color_state(),
+                    );
+                    post_stats_with_updates(
+                        &runtime,
+                        VertexBufferUpdate::Replace(vertices),
+                        attack_overlay_update,
+                    );
+                } else if !attack_overlay_update_is_none(&attack_overlay_update) {
+                    post_stats_with_updates(
+                        &runtime,
+                        VertexBufferUpdate::None,
+                        attack_overlay_update,
+                    );
+                } else {
+                    post_stats(&runtime);
+                }
             }
         }
         AppToWorker::Start { epoch } => {
@@ -340,8 +364,6 @@ fn attack_overlay_update_for_runtime(
     force_clear_when_disabled: bool,
 ) -> AttackOverlayUpdate {
     if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
-        runtime.attack_overlay_cache = None;
-        runtime.attack_overlay_job = None;
         return if force_clear_when_disabled {
             AttackOverlayUpdate::replace_empty()
         } else {
@@ -363,7 +385,6 @@ fn attack_overlay_update_for_new_placements(
     placements: &[Placement],
 ) -> AttackOverlayUpdate {
     if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
-        runtime.attack_overlay_cache = None;
         runtime.attack_overlay_job = None;
         return AttackOverlayUpdate::none();
     }
@@ -402,15 +423,46 @@ fn attack_overlay_update_for_new_placements(
 }
 
 #[cfg(target_arch = "wasm32")]
+fn attack_overlay_update_for_missing_placements(
+    runtime: &mut WorkerRuntime,
+) -> AttackOverlayUpdate {
+    if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
+        runtime.attack_overlay_job = None;
+        return AttackOverlayUpdate::none();
+    }
+    if runtime.attack_overlay_job.is_some() {
+        return AttackOverlayUpdate::none();
+    }
+
+    let synced = attack_overlay_synced_placement_count(runtime);
+    if synced >= runtime.placements.len() {
+        return AttackOverlayUpdate::none();
+    }
+
+    if attack_overlay_requires_full_rebuild_for_new_placements(runtime.engine.settings())
+        || runtime.attack_overlay_cache.is_none()
+    {
+        runtime.attack_overlay_cache = None;
+        runtime.attack_overlay_job = Some(AttackOverlayBuildJob::new(
+            runtime.engine.settings().clone(),
+            runtime.placements.len(),
+        ));
+        return AttackOverlayUpdate::replace_empty();
+    }
+
+    runtime
+        .attack_overlay_cache
+        .as_mut()
+        .map_or_else(AttackOverlayUpdate::none, |cache| {
+            cache.append_placements(&runtime.placements[synced..])
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
 fn post_attack_overlay_build_chunk(runtime: &mut WorkerRuntime) {
     if runtime.engine.settings().attack_overlay_opacity <= f32::EPSILON {
-        runtime.attack_overlay_cache = None;
         runtime.attack_overlay_job = None;
-        post_stats_with_updates(
-            runtime,
-            VertexBufferUpdate::None,
-            AttackOverlayUpdate::replace_empty(),
-        );
+        post_stats(runtime);
         return;
     }
 
@@ -452,6 +504,36 @@ fn attack_overlay_pending(runtime: &WorkerRuntime) -> bool {
 }
 
 #[cfg(target_arch = "wasm32")]
+fn attack_overlay_update_is_none(update: &AttackOverlayUpdate) -> bool {
+    matches!(update.spots, VertexBufferUpdate::None)
+        && matches!(update.hits, VertexBufferUpdate::None)
+        && matches!(update.circles, VertexBufferUpdate::None)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn attack_overlay_synced_placement_count(runtime: &WorkerRuntime) -> usize {
+    runtime
+        .attack_overlay_cache
+        .as_ref()
+        .map_or(0, AttackOverlayCache::placement_count)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn attack_overlay_settings_changed_excluding_opacity(
+    old: &EngineSettings,
+    new: &EngineSettings,
+) -> bool {
+    old.board != new.board
+        || old.radius != new.radius
+        || old.proactive_attacking != new.proactive_attacking
+        || old.enemy_mode != new.enemy_mode
+        || old.army_preset != new.army_preset
+        || old.custom_army != new.custom_army
+        || old.continuous_offset != new.continuous_offset
+        || old.prime_modulo_divisor != new.prime_modulo_divisor
+}
+
+#[cfg(target_arch = "wasm32")]
 fn merge_attack_overlay_updates(
     first: AttackOverlayUpdate,
     second: AttackOverlayUpdate,
@@ -488,7 +570,7 @@ fn batch_parameters(settings: &EngineSettings) -> (u32, u64) {
                 ArmyPreset::PrimeKnight | ArmyPreset::PrimeGapper,
             ) => (64, 200_000),
             (_, ArmyPreset::PrimeKnight | ArmyPreset::PrimeGapper) => (512, 500_000),
-            _ => (4_096, 1_000_000),
+            _ => (65_536, 1_000_000),
         },
         SpeedMode::PerSecond(rate) => {
             let rate = (rate as u32).max(1);

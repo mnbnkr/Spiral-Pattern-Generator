@@ -15,8 +15,11 @@ use crate::protocol::{
 };
 
 const FLOATS_PER_VERTEX: usize = 5;
+const FLOATS_PER_CIRCLE_VERTEX: usize = 8;
+const CIRCLE_VERTICES_PER_QUAD: usize = 6;
 const BYTES_PER_FLOAT: usize = std::mem::size_of::<f32>();
-const INITIAL_VERTEX_CAPACITY: usize = 16_384;
+const PLACEMENT_VERTEX_PAGE_VERTICES: usize = 1_048_576;
+const PLACEMENT_VERTEX_PAGE_FLOATS: usize = PLACEMENT_VERTEX_PAGE_VERTICES * FLOATS_PER_VERTEX;
 const MAX_TRACK_POINTS: usize = 160_000;
 const MAX_BORDER_POINTS: usize = 4_096;
 const EXPORT_ENCODER_TIMEOUT_MS: i32 = 30_000;
@@ -82,6 +85,63 @@ void main() {
 }
 "#;
 
+const CIRCLE_VERTEX_SHADER: &str = r#"
+attribute vec2 a_position;
+attribute vec2 a_center;
+attribute float a_radius;
+attribute vec3 a_color;
+
+uniform vec2 u_resolution;
+uniform float u_scale;
+uniform vec2 u_pan;
+uniform highp float u_line_width;
+
+varying highp vec2 v_position;
+varying highp vec2 v_center;
+varying highp float v_radius;
+varying vec3 v_color;
+
+void main() {
+    highp vec2 world_position = a_center + a_position * (a_radius + u_line_width);
+    vec2 screen = vec2(
+        u_resolution.x * 0.5 + (world_position.x + u_pan.x) * u_scale,
+        u_resolution.y * 0.5 - (world_position.y + u_pan.y) * u_scale
+    );
+    vec2 clip = vec2(
+        (screen.x / u_resolution.x) * 2.0 - 1.0,
+        1.0 - (screen.y / u_resolution.y) * 2.0
+    );
+
+    gl_Position = vec4(clip, 0.0, 1.0);
+    v_position = world_position;
+    v_center = a_center;
+    v_radius = a_radius;
+    v_color = a_color;
+}
+"#;
+
+const CIRCLE_FRAGMENT_SHADER: &str = r#"
+precision mediump float;
+
+uniform float u_alpha;
+uniform highp float u_line_width;
+
+varying highp vec2 v_position;
+varying highp vec2 v_center;
+varying highp float v_radius;
+varying vec3 v_color;
+
+void main() {
+    highp float delta = abs(distance(v_position, v_center) - v_radius);
+    if (delta > u_line_width) {
+        discard;
+    }
+
+    float coverage = 1.0 - smoothstep(u_line_width * 0.65, u_line_width, delta);
+    gl_FragColor = vec4(v_color, u_alpha * coverage);
+}
+"#;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportKind {
     FullPng,
@@ -93,9 +153,13 @@ pub struct CanvasRenderer {
     canvas: HtmlCanvasElement,
     gl: Gl,
     program: WebGlProgram,
-    buffer: WebGlBuffer,
+    circle_program: WebGlProgram,
     position_attrib: u32,
     color_attrib: u32,
+    circle_position_attrib: u32,
+    circle_center_attrib: u32,
+    circle_radius_attrib: u32,
+    circle_color_attrib: u32,
     resolution_uniform: WebGlUniformLocation,
     scale_uniform: WebGlUniformLocation,
     point_size_uniform: WebGlUniformLocation,
@@ -103,6 +167,11 @@ pub struct CanvasRenderer {
     shape_uniform: WebGlUniformLocation,
     alpha_uniform: WebGlUniformLocation,
     saturation_uniform: WebGlUniformLocation,
+    circle_resolution_uniform: WebGlUniformLocation,
+    circle_scale_uniform: WebGlUniformLocation,
+    circle_pan_uniform: WebGlUniformLocation,
+    circle_alpha_uniform: WebGlUniformLocation,
+    circle_line_width_uniform: WebGlUniformLocation,
     vertices: Vec<f32>,
     attack_spot_vertices: Vec<f32>,
     attack_hit_vertices: Vec<f32>,
@@ -115,7 +184,7 @@ pub struct CanvasRenderer {
     attack_circle_upload_pending: bool,
     track_upload_pending: bool,
     border_upload_pending: bool,
-    gpu_capacity_floats: usize,
+    placement_pages: Vec<VertexPage>,
     attack_spot_buffer: WebGlBuffer,
     attack_hit_buffer: WebGlBuffer,
     attack_circle_buffer: WebGlBuffer,
@@ -152,11 +221,13 @@ impl CanvasRenderer {
             &compile_shader(&gl, Gl::VERTEX_SHADER, VERTEX_SHADER)?,
             &compile_shader(&gl, Gl::FRAGMENT_SHADER, FRAGMENT_SHADER)?,
         )?;
+        let circle_program = link_program(
+            &gl,
+            &compile_shader(&gl, Gl::VERTEX_SHADER, CIRCLE_VERTEX_SHADER)?,
+            &compile_shader(&gl, Gl::FRAGMENT_SHADER, CIRCLE_FRAGMENT_SHADER)?,
+        )?;
         gl.use_program(Some(&program));
 
-        let buffer = gl
-            .create_buffer()
-            .ok_or_else(|| JsValue::from_str("failed to create WebGL buffer"))?;
         let position_attrib = attrib_location(&gl, &program, "a_position")?;
         let color_attrib = attrib_location(&gl, &program, "a_color")?;
         let resolution_uniform = uniform_location(&gl, &program, "u_resolution")?;
@@ -166,6 +237,15 @@ impl CanvasRenderer {
         let shape_uniform = uniform_location(&gl, &program, "u_shape")?;
         let alpha_uniform = uniform_location(&gl, &program, "u_alpha")?;
         let saturation_uniform = uniform_location(&gl, &program, "u_saturation")?;
+        let circle_position_attrib = attrib_location(&gl, &circle_program, "a_position")?;
+        let circle_center_attrib = attrib_location(&gl, &circle_program, "a_center")?;
+        let circle_radius_attrib = attrib_location(&gl, &circle_program, "a_radius")?;
+        let circle_color_attrib = attrib_location(&gl, &circle_program, "a_color")?;
+        let circle_resolution_uniform = uniform_location(&gl, &circle_program, "u_resolution")?;
+        let circle_scale_uniform = uniform_location(&gl, &circle_program, "u_scale")?;
+        let circle_pan_uniform = uniform_location(&gl, &circle_program, "u_pan")?;
+        let circle_alpha_uniform = uniform_location(&gl, &circle_program, "u_alpha")?;
+        let circle_line_width_uniform = uniform_location(&gl, &circle_program, "u_line_width")?;
         let track_buffer = gl
             .create_buffer()
             .ok_or_else(|| JsValue::from_str("failed to create WebGL track buffer"))?;
@@ -191,9 +271,13 @@ impl CanvasRenderer {
             canvas,
             gl,
             program,
-            buffer,
+            circle_program,
             position_attrib,
             color_attrib,
+            circle_position_attrib,
+            circle_center_attrib,
+            circle_radius_attrib,
+            circle_color_attrib,
             resolution_uniform,
             scale_uniform,
             point_size_uniform,
@@ -201,6 +285,11 @@ impl CanvasRenderer {
             shape_uniform,
             alpha_uniform,
             saturation_uniform,
+            circle_resolution_uniform,
+            circle_scale_uniform,
+            circle_pan_uniform,
+            circle_alpha_uniform,
+            circle_line_width_uniform,
             vertices: Vec::new(),
             attack_spot_vertices: Vec::new(),
             attack_hit_vertices: Vec::new(),
@@ -213,7 +302,7 @@ impl CanvasRenderer {
             attack_circle_upload_pending: true,
             track_upload_pending: true,
             border_upload_pending: true,
-            gpu_capacity_floats: 0,
+            placement_pages: Vec::new(),
             attack_spot_buffer,
             attack_hit_buffer,
             attack_circle_buffer,
@@ -426,7 +515,25 @@ impl CanvasRenderer {
         )?;
         self.canvas.set_attribute(
             "data-attack-circles",
-            &(self.attack_circle_vertices.len() / FLOATS_PER_VERTEX).to_string(),
+            &(self.attack_circle_vertices.len()
+                / (FLOATS_PER_CIRCLE_VERTEX * CIRCLE_VERTICES_PER_QUAD))
+                .to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn sync_placement_attributes(&self) -> Result<(), JsValue> {
+        self.canvas.set_attribute(
+            "data-placements",
+            &(self.vertices.len() / FLOATS_PER_VERTEX).to_string(),
+        )?;
+        self.canvas.set_attribute(
+            "data-placement-pages",
+            &self
+                .vertices
+                .len()
+                .div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS)
+                .to_string(),
         )?;
         Ok(())
     }
@@ -486,12 +593,12 @@ impl CanvasRenderer {
 
         if self.vertices.is_empty() {
             self.pending_upload = PendingUpload::None;
+            self.sync_placement_attributes()?;
             return Ok(());
         }
 
-        self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&self.buffer));
         self.sync_gpu_buffer()?;
-        self.configure_vertex_attribs();
+        self.sync_placement_attributes()?;
         self.gl
             .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
         self.gl
@@ -501,11 +608,7 @@ impl CanvasRenderer {
             Some(&self.saturation_uniform),
             self.color_saturation.clamp(0.0, 1.0),
         );
-        self.gl.draw_arrays(
-            Gl::POINTS,
-            0,
-            (self.vertices.len() / FLOATS_PER_VERTEX) as i32,
-        );
+        self.draw_placement_pages()?;
 
         if self.settings.attack_overlay_opacity > f32::EPSILON {
             if !self.attack_hit_vertices.is_empty() {
@@ -576,19 +679,38 @@ impl CanvasRenderer {
             &self.attack_circle_vertices,
             &mut self.attack_circle_upload_pending,
         );
-        self.configure_vertex_attribs();
-        self.gl.uniform1f(Some(&self.point_size_uniform), 1.0);
-        self.gl.uniform1i(Some(&self.shape_uniform), 0);
+        let width = self.canvas.width();
+        let height = self.canvas.height();
+        let render_state = self.render_state(width, height);
+
+        self.gl.use_program(Some(&self.circle_program));
+        self.gl.uniform2f(
+            Some(&self.circle_resolution_uniform),
+            width as f32,
+            height as f32,
+        );
+        self.gl
+            .uniform1f(Some(&self.circle_scale_uniform), render_state.scale);
+        self.gl.uniform2f(
+            Some(&self.circle_pan_uniform),
+            (self.pan_x - render_state.center_x) as f32,
+            (self.pan_y - render_state.center_y) as f32,
+        );
         self.gl.uniform1f(
-            Some(&self.alpha_uniform),
+            Some(&self.circle_alpha_uniform),
             self.settings.attack_overlay_opacity.clamp(0.0, 1.0),
         );
-        self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
-        self.gl.draw_arrays(
-            Gl::LINES,
-            0,
-            (self.attack_circle_vertices.len() / FLOATS_PER_VERTEX) as i32,
+        self.gl.uniform1f(
+            Some(&self.circle_line_width_uniform),
+            1.25_f32 / render_state.scale.max(f32::EPSILON),
         );
+        self.configure_circle_vertex_attribs();
+        self.gl.draw_arrays(
+            Gl::TRIANGLES,
+            0,
+            (self.attack_circle_vertices.len() / FLOATS_PER_CIRCLE_VERTEX) as i32,
+        );
+        self.gl.use_program(Some(&self.program));
         Ok(())
     }
 
@@ -673,6 +795,49 @@ impl CanvasRenderer {
         );
     }
 
+    fn configure_circle_vertex_attribs(&self) {
+        let stride = (FLOATS_PER_CIRCLE_VERTEX * std::mem::size_of::<f32>()) as i32;
+        self.gl
+            .enable_vertex_attrib_array(self.circle_position_attrib);
+        self.gl.vertex_attrib_pointer_with_i32(
+            self.circle_position_attrib,
+            2,
+            Gl::FLOAT,
+            false,
+            stride,
+            0,
+        );
+        self.gl
+            .enable_vertex_attrib_array(self.circle_center_attrib);
+        self.gl.vertex_attrib_pointer_with_i32(
+            self.circle_center_attrib,
+            2,
+            Gl::FLOAT,
+            false,
+            stride,
+            (2 * BYTES_PER_FLOAT) as i32,
+        );
+        self.gl
+            .enable_vertex_attrib_array(self.circle_radius_attrib);
+        self.gl.vertex_attrib_pointer_with_i32(
+            self.circle_radius_attrib,
+            1,
+            Gl::FLOAT,
+            false,
+            stride,
+            (4 * BYTES_PER_FLOAT) as i32,
+        );
+        self.gl.enable_vertex_attrib_array(self.circle_color_attrib);
+        self.gl.vertex_attrib_pointer_with_i32(
+            self.circle_color_attrib,
+            3,
+            Gl::FLOAT,
+            false,
+            stride,
+            (5 * BYTES_PER_FLOAT) as i32,
+        );
+    }
+
     pub fn download_image(
         &self,
         mime_type: &str,
@@ -694,7 +859,7 @@ impl CanvasRenderer {
         match self.pending_upload {
             PendingUpload::None => Ok(()),
             PendingUpload::Full => {
-                self.ensure_gpu_capacity(self.vertices.len())?;
+                self.reset_placement_page_uploads();
                 self.upload_vertex_range(0, self.vertices.len())?;
                 self.pending_upload = PendingUpload::None;
                 Ok(())
@@ -702,56 +867,102 @@ impl CanvasRenderer {
             PendingUpload::Append { start_float } => {
                 let total = self.vertices.len();
                 let start_float = start_float.min(total);
-                let capacity_grew = self.ensure_gpu_capacity(total)?;
-                if capacity_grew {
-                    self.upload_vertex_range(0, total)?;
-                } else {
-                    self.upload_vertex_range(start_float, total)?;
-                }
+                self.upload_vertex_range(start_float, total)?;
                 self.pending_upload = PendingUpload::None;
                 Ok(())
             }
         }
     }
 
-    fn ensure_gpu_capacity(&mut self, required_floats: usize) -> Result<bool, JsValue> {
-        if required_floats <= self.gpu_capacity_floats {
-            return Ok(false);
+    fn ensure_placement_pages(&mut self, required_floats: usize) -> Result<(), JsValue> {
+        let required_pages = required_floats.div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS);
+        while self.placement_pages.len() < required_pages {
+            self.placement_pages.push(VertexPage {
+                buffer: self
+                    .gl
+                    .create_buffer()
+                    .ok_or_else(|| JsValue::from_str("failed to create WebGL placement buffer"))?,
+                allocated: false,
+                uploaded_floats: 0,
+            });
         }
-
-        let required_vertices = required_floats.div_ceil(FLOATS_PER_VERTEX);
-        let capacity_vertices = required_vertices
-            .next_power_of_two()
-            .max(INITIAL_VERTEX_CAPACITY);
-        let capacity_floats = capacity_vertices * FLOATS_PER_VERTEX;
-        let capacity_bytes = capacity_floats
-            .checked_mul(BYTES_PER_FLOAT)
-            .and_then(|bytes| i32::try_from(bytes).ok())
-            .ok_or_else(|| JsValue::from_str("WebGL vertex buffer is too large"))?;
-
-        self.gl
-            .buffer_data_with_i32(Gl::ARRAY_BUFFER, capacity_bytes, Gl::DYNAMIC_DRAW);
-        self.gpu_capacity_floats = capacity_floats;
-        Ok(true)
+        Ok(())
     }
 
-    fn upload_vertex_range(&self, start_float: usize, end_float: usize) -> Result<(), JsValue> {
+    fn reset_placement_page_uploads(&mut self) {
+        for page in &mut self.placement_pages {
+            page.uploaded_floats = 0;
+        }
+    }
+
+    fn upload_vertex_range(&mut self, start_float: usize, end_float: usize) -> Result<(), JsValue> {
         if start_float >= end_float {
             return Ok(());
         }
 
-        let offset_bytes = start_float
+        self.ensure_placement_pages(end_float)?;
+        let page_bytes = PLACEMENT_VERTEX_PAGE_FLOATS
             .checked_mul(BYTES_PER_FLOAT)
             .and_then(|bytes| i32::try_from(bytes).ok())
-            .ok_or_else(|| JsValue::from_str("WebGL vertex upload offset is too large"))?;
+            .ok_or_else(|| JsValue::from_str("WebGL placement page is too large"))?;
+        let first_page = start_float / PLACEMENT_VERTEX_PAGE_FLOATS;
+        let last_page = (end_float - 1) / PLACEMENT_VERTEX_PAGE_FLOATS;
 
-        unsafe {
-            let view = js_sys::Float32Array::view(&self.vertices[start_float..end_float]);
-            self.gl.buffer_sub_data_with_i32_and_array_buffer_view(
-                Gl::ARRAY_BUFFER,
-                offset_bytes,
-                &view,
-            );
+        for page_index in first_page..=last_page {
+            let page_start = page_index * PLACEMENT_VERTEX_PAGE_FLOATS;
+            let local_start = start_float.saturating_sub(page_start);
+            let local_end = (end_float - page_start).min(PLACEMENT_VERTEX_PAGE_FLOATS);
+            if local_start >= local_end {
+                continue;
+            }
+
+            let page = &mut self.placement_pages[page_index];
+            self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page.buffer));
+            if !page.allocated {
+                self.gl
+                    .buffer_data_with_i32(Gl::ARRAY_BUFFER, page_bytes, Gl::DYNAMIC_DRAW);
+                page.allocated = true;
+            }
+
+            let offset_bytes = local_start
+                .checked_mul(BYTES_PER_FLOAT)
+                .and_then(|bytes| i32::try_from(bytes).ok())
+                .ok_or_else(|| JsValue::from_str("WebGL vertex upload offset is too large"))?;
+            let global_start = page_start + local_start;
+            let global_end = page_start + local_end;
+
+            unsafe {
+                let view = js_sys::Float32Array::view(&self.vertices[global_start..global_end]);
+                self.gl.buffer_sub_data_with_i32_and_array_buffer_view(
+                    Gl::ARRAY_BUFFER,
+                    offset_bytes,
+                    &view,
+                );
+            }
+            page.uploaded_floats = page.uploaded_floats.max(local_end);
+        }
+
+        Ok(())
+    }
+
+    fn draw_placement_pages(&self) -> Result<(), JsValue> {
+        let total = self.vertices.len();
+        let page_count = total.div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS);
+        for page_index in 0..page_count {
+            let Some(page) = self.placement_pages.get(page_index) else {
+                continue;
+            };
+            let start = page_index * PLACEMENT_VERTEX_PAGE_FLOATS;
+            let end = (start + PLACEMENT_VERTEX_PAGE_FLOATS).min(total);
+            let draw_floats = end.saturating_sub(start).min(page.uploaded_floats);
+            if draw_floats < FLOATS_PER_VERTEX {
+                continue;
+            }
+
+            self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page.buffer));
+            self.configure_vertex_attribs();
+            self.gl
+                .draw_arrays(Gl::POINTS, 0, (draw_floats / FLOATS_PER_VERTEX) as i32);
         }
         Ok(())
     }
@@ -851,6 +1062,12 @@ enum PendingUpload {
     None,
     Append { start_float: usize },
     Full,
+}
+
+struct VertexPage {
+    buffer: WebGlBuffer,
+    allocated: bool,
+    uploaded_floats: usize,
 }
 
 fn apply_static_vertex_update(

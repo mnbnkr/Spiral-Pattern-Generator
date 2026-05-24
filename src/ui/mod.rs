@@ -35,6 +35,8 @@ struct AppState {
     running: bool,
     has_run: bool,
     dragging_army_index: Option<usize>,
+    random_pool: Vec<RandomPoolPiece>,
+    random_pool_editing: bool,
     first_log_lines: Vec<String>,
     recent_log_lines: Vec<String>,
     total_logged: u64,
@@ -56,6 +58,13 @@ struct AppState {
     active_export_cancel: Option<Rc<Cell<bool>>>,
     active_export_button_id: Option<String>,
     active_export_button_text: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RandomPoolPiece {
+    name: String,
+    a: i32,
+    b: i32,
 }
 
 #[derive(Clone)]
@@ -108,6 +117,8 @@ pub fn boot_app() -> Result<(), JsValue> {
         running: false,
         has_run: false,
         dragging_army_index: None,
+        random_pool: default_random_pool(),
+        random_pool_editing: false,
         first_log_lines: Vec::new(),
         recent_log_lines: Vec::new(),
         total_logged: 0,
@@ -1059,10 +1070,13 @@ fn install_control_handlers(
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::UpdateWorker)?;
     }
     install_same_board_refresh_handler(document, Rc::clone(&state))?;
+    install_select_quick_close_handlers(document, Rc::clone(&state))?;
     install_continuous_offset_blur_handler(document, Rc::clone(&state))?;
     install_prime_divisor_commit_handlers(document, Rc::clone(&state))?;
 
     install_add_piece_handler(document, Rc::clone(&state))?;
+    install_random_piece_handler(document, Rc::clone(&state))?;
+    install_random_pool_toggle_handler(document, Rc::clone(&state))?;
     install_button(document, "start-button", Rc::clone(&state), |state| {
         let document = current_document()?;
         sync_state_from_controls(&document, state, true)?;
@@ -1397,6 +1411,56 @@ fn install_same_board_refresh_handler(
     Ok(())
 }
 
+fn install_select_quick_close_handlers(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let recent_select = Rc::new(RefCell::new(None::<(String, f64)>));
+    for select_id in [
+        "board-select",
+        "shape-select",
+        "display-mode-select",
+        "enemy-mode-select",
+        "placement-search-select",
+        "army-preset-select",
+    ] {
+        let select = select(document, select_id)?;
+        let id = select.id();
+        let document = document.clone();
+        let state = Rc::clone(&state);
+        let recent_select = Rc::clone(&recent_select);
+        let closure_select = select.clone();
+        let closure = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+            let now = js_sys::Date::now();
+            let active_same_select = document
+                .active_element()
+                .and_then(|element| element.dyn_into::<HtmlSelectElement>().ok())
+                .is_some_and(|active| active.id() == id);
+            let recent_same_select = recent_select
+                .borrow()
+                .as_ref()
+                .is_some_and(|(recent_id, time)| recent_id == &id && now - *time <= 1_000.0);
+
+            if active_same_select && recent_same_select {
+                event.prevent_default();
+                if id == "board-select" {
+                    state.borrow_mut().board_select_pointer_value = None;
+                }
+                if let Err(error) = closure_select.blur() {
+                    log_error(&error);
+                }
+                *recent_select.borrow_mut() = None;
+            } else {
+                *recent_select.borrow_mut() = Some((id.clone(), now));
+            }
+        });
+        select.add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())?;
+        closure.forget();
+    }
+
+    Ok(())
+}
+
 fn is_form_control_blur_target(value: &JsValue) -> bool {
     let Some(element) = value.dyn_ref::<Element>() else {
         return false;
@@ -1432,6 +1496,22 @@ fn install_add_piece_handler(
             .unwrap_or(1);
         let piece = CustomPiece::with_auto_color(a, b);
 
+        if state.borrow().random_pool_editing {
+            {
+                let mut state = state.borrow_mut();
+                state.random_pool.push(RandomPoolPiece {
+                    name: random_pool_piece_name(a, b)
+                        .map_or_else(|| format!("Custom ({a}, {b})"), str::to_string),
+                    a,
+                    b,
+                });
+            }
+            if let Err(error) = render_army_list(&document, Rc::clone(&state)) {
+                log_error(&error);
+            }
+            return;
+        }
+
         let previous_settings = {
             let mut state = state.borrow_mut();
             let previous_settings = state.settings.clone();
@@ -1446,6 +1526,78 @@ fn install_add_piece_handler(
             previous_settings,
             false,
         ) {
+            log_error(&error);
+        }
+    });
+
+    button.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+fn install_random_piece_handler(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let document = document.clone();
+    let button = button(&document, "random-piece-button")?;
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let count = input_value(&document, "random-count-input")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(4)
+            .min(10_000);
+
+        let previous_settings = {
+            let mut state = state.borrow_mut();
+            if state.settings.army_preset != ArmyPreset::CustomFinite {
+                return;
+            }
+            if let Err(error) = sync_state_from_controls(&document, &mut state, true) {
+                log_error(&error);
+                return;
+            }
+            let previous_settings = state.settings.clone();
+            state.settings.custom_army = random_army_from_pool(&state.random_pool, count);
+            state.random_pool_editing = false;
+            previous_settings
+        };
+
+        if let Err(error) = sync_settings_with_previous(
+            &document,
+            Rc::clone(&state),
+            SyncAction::ResetWorker,
+            previous_settings,
+            false,
+        ) {
+            log_error(&error);
+        }
+    });
+
+    button.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+fn install_random_pool_toggle_handler(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let document = document.clone();
+    let button = button(&document, "random-pool-toggle-button")?;
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        {
+            let mut state = state.borrow_mut();
+            if state.settings.army_preset != ArmyPreset::CustomFinite {
+                state.random_pool_editing = false;
+            } else {
+                state.random_pool_editing = !state.random_pool_editing;
+            }
+        }
+        if let Err(error) = render_army_list(&document, Rc::clone(&state)) {
+            log_error(&error);
+        }
+        if let Err(error) = update_outputs(&document, &state.borrow().settings) {
             log_error(&error);
         }
     });
@@ -1799,6 +1951,21 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         .get_element_by_id("army-list")
         .ok_or_else(|| JsValue::from_str("missing army-list"))?;
     list.set_inner_html("");
+    let random_pool_editing = state.borrow().random_pool_editing;
+    list.set_attribute(
+        "data-random-pool-editing",
+        if random_pool_editing { "true" } else { "false" },
+    )?;
+    if let Ok(toggle) = button(document, "random-pool-toggle-button") {
+        toggle.set_attribute(
+            "aria-pressed",
+            if random_pool_editing { "true" } else { "false" },
+        )?;
+    }
+
+    if random_pool_editing {
+        return render_random_pool_list(document, state, &list);
+    }
 
     let settings = state.borrow().settings.clone();
     let army = settings.custom_army.clone();
@@ -1854,6 +2021,67 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         install_piece_action(&remove, document.clone(), Rc::clone(&state), move |army| {
             if index < army.len() {
                 army.remove(index);
+            }
+        })?;
+        row.append_child(&remove)?;
+
+        list.append_child(&row)?;
+    }
+
+    Ok(())
+}
+
+fn render_random_pool_list(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+    list: &Element,
+) -> Result<(), JsValue> {
+    let pool = state.borrow().random_pool.clone();
+    if pool.is_empty() {
+        let row = document.create_element("div")?;
+        row.set_class_name("army-empty-row");
+        row.set_text_content(Some("Random pool is empty."));
+        list.append_child(&row)?;
+        return Ok(());
+    }
+
+    for (index, piece) in pool.iter().enumerate() {
+        let row = document.create_element("div")?;
+        row.set_class_name("army-row random-pool-row");
+        row.set_attribute("draggable", "true")?;
+        install_random_pool_drag_handlers(&row, document.clone(), Rc::clone(&state), index)?;
+
+        let label = document.create_element("span")?;
+        let name = document.create_element("span")?;
+        name.set_class_name("pool-piece-name");
+        name.set_text_content(Some(&piece.name));
+        let mov = document.create_element("span")?;
+        mov.set_class_name("pool-piece-move");
+        mov.set_text_content(Some(&format!("({}, {})", piece.a, piece.b)));
+        label.append_child(&name)?;
+        label.append_child(&mov)?;
+        row.append_child(&label)?;
+
+        let up = small_button(document, "▲", "Move up")?;
+        install_random_pool_action(&up, document.clone(), Rc::clone(&state), move |pool| {
+            if index > 0 {
+                pool.swap(index, index - 1);
+            }
+        })?;
+        row.append_child(&up)?;
+
+        let down = small_button(document, "▼", "Move down")?;
+        install_random_pool_action(&down, document.clone(), Rc::clone(&state), move |pool| {
+            if index + 1 < pool.len() {
+                pool.swap(index, index + 1);
+            }
+        })?;
+        row.append_child(&down)?;
+
+        let remove = small_button(document, "Del", "Delete")?;
+        install_random_pool_action(&remove, document.clone(), Rc::clone(&state), move |pool| {
+            if index < pool.len() {
+                pool.remove(index);
             }
         })?;
         row.append_child(&remove)?;
@@ -1961,6 +2189,88 @@ fn install_piece_drag_handlers(
     Ok(())
 }
 
+fn install_random_pool_drag_handlers(
+    row: &Element,
+    document: Document,
+    state: Rc<RefCell<AppState>>,
+    index: usize,
+) -> Result<(), JsValue> {
+    let drag_state = Rc::clone(&state);
+    let drag_row = row.clone();
+    let drag_start = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        drag_state.borrow_mut().dragging_army_index = Some(index);
+        if let Err(error) = drag_row.class_list().add_1("drag-source") {
+            log_error(&error);
+        }
+        if let Some(data_transfer) = event.data_transfer() {
+            data_transfer.set_effect_allowed("move");
+            let _ = data_transfer.set_data("text/plain", &index.to_string());
+        }
+    });
+    row.add_event_listener_with_callback("dragstart", drag_start.as_ref().unchecked_ref())?;
+    drag_start.forget();
+
+    let over_row = row.clone();
+    let drag_over = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.prevent_default();
+        if let Err(error) = over_row.class_list().add_1("drag-over") {
+            log_error(&error);
+        }
+        if let Some(data_transfer) = event.data_transfer() {
+            data_transfer.set_drop_effect("move");
+        }
+    });
+    row.add_event_listener_with_callback("dragover", drag_over.as_ref().unchecked_ref())?;
+    drag_over.forget();
+
+    let leave_row = row.clone();
+    let drag_leave = Closure::<dyn FnMut(DragEvent)>::new(move |_event: DragEvent| {
+        if let Err(error) = leave_row.class_list().remove_1("drag-over") {
+            log_error(&error);
+        }
+    });
+    row.add_event_listener_with_callback("dragleave", drag_leave.as_ref().unchecked_ref())?;
+    drag_leave.forget();
+
+    let drop_document = document.clone();
+    let drop_state = Rc::clone(&state);
+    let drop_row = row.clone();
+    let drop = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.prevent_default();
+        if let Err(error) = drop_row.class_list().remove_1("drag-over") {
+            log_error(&error);
+        }
+        let changed = {
+            let mut state = drop_state.borrow_mut();
+            let Some(from) = state.dragging_army_index.take() else {
+                return;
+            };
+            move_random_pool_piece(&mut state.random_pool, from, index)
+        };
+        if changed && let Err(error) = render_army_list(&drop_document, Rc::clone(&drop_state)) {
+            log_error(&error);
+        }
+    });
+    row.add_event_listener_with_callback("drop", drop.as_ref().unchecked_ref())?;
+    drop.forget();
+
+    let end_state = state;
+    let end_row = row.clone();
+    let drag_end = Closure::<dyn FnMut(DragEvent)>::new(move |_event: DragEvent| {
+        end_state.borrow_mut().dragging_army_index = None;
+        if let Err(error) = end_row.class_list().remove_1("drag-source") {
+            log_error(&error);
+        }
+        if let Err(error) = end_row.class_list().remove_1("drag-over") {
+            log_error(&error);
+        }
+    });
+    row.add_event_listener_with_callback("dragend", drag_end.as_ref().unchecked_ref())?;
+    drag_end.forget();
+
+    Ok(())
+}
+
 fn move_custom_piece(army: &mut Vec<CustomPiece>, from: usize, to: usize) -> bool {
     if from == to || from >= army.len() || to >= army.len() {
         return false;
@@ -1969,6 +2279,17 @@ fn move_custom_piece(army: &mut Vec<CustomPiece>, from: usize, to: usize) -> boo
     let piece = army.remove(from);
     let adjusted_to = if from < to { to } else { to.min(army.len()) };
     army.insert(adjusted_to, piece);
+    true
+}
+
+fn move_random_pool_piece(pool: &mut Vec<RandomPoolPiece>, from: usize, to: usize) -> bool {
+    if from == to || from >= pool.len() || to >= pool.len() {
+        return false;
+    }
+
+    let piece = pool.remove(from);
+    let adjusted_to = if from < to { to } else { to.min(pool.len()) };
+    pool.insert(adjusted_to, piece);
     true
 }
 
@@ -2000,6 +2321,33 @@ where
             previous_settings,
             false,
         ) {
+            log_error(&error);
+        }
+    });
+
+    button.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+fn install_random_pool_action<F>(
+    button: &HtmlButtonElement,
+    document: Document,
+    state: Rc<RefCell<AppState>>,
+    action: F,
+) -> Result<(), JsValue>
+where
+    F: Fn(&mut Vec<RandomPoolPiece>) + 'static,
+{
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let changed = {
+            let mut state = state.borrow_mut();
+            let before = state.random_pool.clone();
+            action(&mut state.random_pool);
+            before != state.random_pool
+        };
+
+        if changed && let Err(error) = render_army_list(&document, Rc::clone(&state)) {
             log_error(&error);
         }
     });
@@ -2064,6 +2412,9 @@ fn apply_synced_settings(
 ) -> Result<(), JsValue> {
     let action = resolve_sync_action(action, &previous_settings, &settings);
 
+    if settings.army_preset != ArmyPreset::CustomFinite {
+        state.borrow_mut().random_pool_editing = false;
+    }
     render_army_list(document, Rc::clone(&state))?;
 
     match action {
@@ -2647,6 +2998,20 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
         .set_property("display", prime_display)?;
     button(document, "add-piece-button")?
         .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
+    button(document, "random-piece-button")?
+        .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
+    input(document, "random-count-input")?
+        .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
+    let random_pool_toggle = button(document, "random-pool-toggle-button")?;
+    random_pool_toggle.set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
+    let random_pool_editing = document
+        .get_element_by_id("army-list")
+        .and_then(|list| list.get_attribute("data-random-pool-editing"))
+        .is_some_and(|value| value == "true");
+    random_pool_toggle.set_attribute(
+        "aria-pressed",
+        if random_pool_editing { "true" } else { "false" },
+    )?;
     input(document, "prime-divisor-input")?
         .set_disabled(settings.army_preset != ArmyPreset::PrimeKnight);
     set_disabled_class(
@@ -2886,6 +3251,74 @@ fn normalize_custom_army(army: Vec<CustomPiece>) -> Vec<CustomPiece> {
     army.into_iter()
         .map(|piece| CustomPiece::with_auto_color(piece.a, piece.b))
         .collect()
+}
+
+fn default_random_pool() -> Vec<RandomPoolPiece> {
+    [
+        ("Knight", 2, 1),
+        ("Fers", 1, 1),
+        ("Vazir", 1, 0),
+        ("Camel", 3, 1),
+        ("Zebra", 3, 2),
+        ("Antelope", 4, 3),
+        ("Eland", 5, 3),
+        ("Satrap", 2, 0),
+        ("Aspbad", 2, 2),
+        ("Spehbed", 3, 0),
+        ("Marzban", 3, 3),
+    ]
+    .into_iter()
+    .map(|(name, a, b)| RandomPoolPiece {
+        name: name.to_string(),
+        a,
+        b,
+    })
+    .collect()
+}
+
+fn random_pool_piece_name(a: i32, b: i32) -> Option<&'static str> {
+    [
+        ("Knight", 2, 1),
+        ("Fers", 1, 1),
+        ("Vazir", 1, 0),
+        ("Camel", 3, 1),
+        ("Zebra", 3, 2),
+        ("Antelope", 4, 3),
+        ("Eland", 5, 3),
+        ("Satrap", 2, 0),
+        ("Aspbad", 2, 2),
+        ("Spehbed", 3, 0),
+        ("Marzban", 3, 3),
+    ]
+    .into_iter()
+    .find_map(|(name, piece_a, piece_b)| (a == piece_a && b == piece_b).then_some(name))
+}
+
+fn random_army_from_pool(pool: &[RandomPoolPiece], count: usize) -> Vec<CustomPiece> {
+    if pool.is_empty() || count == 0 {
+        return Vec::new();
+    }
+
+    let mut bag = Vec::<usize>::new();
+    let mut out = Vec::with_capacity(count);
+    while out.len() < count {
+        if bag.is_empty() {
+            bag.extend(0..pool.len());
+            shuffle_indices(&mut bag);
+        }
+        if let Some(index) = bag.pop() {
+            let piece = &pool[index];
+            out.push(CustomPiece::with_auto_color(piece.a, piece.b));
+        }
+    }
+    out
+}
+
+fn shuffle_indices(indices: &mut [usize]) {
+    for i in (1..indices.len()).rev() {
+        let j = (js_sys::Math::random() * (i + 1) as f64).floor() as usize;
+        indices.swap(i, j.min(i));
+    }
 }
 
 fn send_to_worker(worker: &Worker, msg: &AppToWorker) -> Result<(), JsValue> {

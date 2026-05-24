@@ -13,7 +13,8 @@ const ATTACK_OVERLAY_COLOR: RgbColor = RgbColor::new(
     247.0_f32 / 255.0_f32,
     247.0_f32 / 255.0_f32,
 );
-const CONTINUOUS_ATTACK_CIRCLE_SEGMENTS: usize = 96;
+const CONTINUOUS_ATTACK_CIRCLE_VERTICES: usize = 6;
+const FLOATS_PER_CONTINUOUS_ATTACK_CIRCLE_VERTEX: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorAnchors {
@@ -500,18 +501,46 @@ fn continuous_attack_circle_vertices(
             continue;
         }
 
-        circles.reserve(CONTINUOUS_ATTACK_CIRCLE_SEGMENTS * 2 * 5);
-        for segment in 0..CONTINUOUS_ATTACK_CIRCLE_SEGMENTS {
-            let a0 =
-                segment as f64 / CONTINUOUS_ATTACK_CIRCLE_SEGMENTS as f64 * std::f64::consts::TAU;
-            let a1 = (segment + 1) as f64 / CONTINUOUS_ATTACK_CIRCLE_SEGMENTS as f64
-                * std::f64::consts::TAU;
-            push_attack_vertex(&mut circles, x + radius * a0.cos(), y + radius * a0.sin());
-            push_attack_vertex(&mut circles, x + radius * a1.cos(), y + radius * a1.sin());
-        }
+        circles.reserve(
+            CONTINUOUS_ATTACK_CIRCLE_VERTICES * FLOATS_PER_CONTINUOUS_ATTACK_CIRCLE_VERTEX,
+        );
+        append_attack_circle_quad(&mut circles, x, y, radius);
     }
 
     circles
+}
+
+fn append_attack_circle_quad(vertices: &mut Vec<f32>, x: f64, y: f64, radius: f64) {
+    for (corner_x, corner_y) in [
+        (-1.0, -1.0),
+        (1.0, -1.0),
+        (1.0, 1.0),
+        (-1.0, -1.0),
+        (1.0, 1.0),
+        (-1.0, 1.0),
+    ] {
+        push_attack_circle_vertex(vertices, corner_x, corner_y, x, y, radius);
+    }
+}
+
+fn push_attack_circle_vertex(
+    vertices: &mut Vec<f32>,
+    x: f64,
+    y: f64,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+) {
+    vertices.extend_from_slice(&[
+        x as f32,
+        y as f32,
+        center_x as f32,
+        center_y as f32,
+        radius as f32,
+        ATTACK_OVERLAY_COLOR.r,
+        ATTACK_OVERLAY_COLOR.g,
+        ATTACK_OVERLAY_COLOR.b,
+    ]);
 }
 
 fn attack_overlay_update_from_buffers(buffers: AttackOverlayBuffers) -> AttackOverlayUpdate {
@@ -916,6 +945,45 @@ mod tests {
         let continuous_overlay =
             pack_attack_overlay_buffers(&continuous_placements, &continuous_settings);
         assert!(continuous_overlay.circles.is_empty());
+    }
+
+    #[test]
+    fn continuous_attack_overlay_packs_one_quad_per_circle() {
+        let settings = EngineSettings {
+            board: crate::protocol::BoardKind::ContinuousArchimedean,
+            shape: ShapeKind::Circle,
+            radius: 8.0,
+            ..EngineSettings::default()
+        };
+        let placements = vec![Placement {
+            id: 0,
+            spot_index: 0,
+            coord: SpotCoord::Continuous {
+                x: 3.0,
+                y: -2.0,
+                theta: 0.0,
+            },
+            piece: PieceSignature::new(1, 0),
+            color: PieceColor {
+                rule: ColorRule::Fixed,
+                fixed_css: "#ffffff".to_string(),
+                key: ColorKey {
+                    group: 0,
+                    gradient_value: 0.0,
+                },
+            },
+            shape: ShapeKind::Circle,
+        }];
+
+        let overlay = pack_attack_overlay_buffers(&placements, &settings);
+        assert_eq!(overlay.circles.len(), 6 * 8);
+        for vertex in overlay.circles.chunks_exact(8) {
+            assert!(vertex[0] == -1.0 || vertex[0] == 1.0);
+            assert!(vertex[1] == -1.0 || vertex[1] == 1.0);
+            assert_eq!(vertex[2], 3.0);
+            assert_eq!(vertex[3], -2.0);
+            assert_eq!(vertex[4], 1.0);
+        }
     }
 
     #[test]

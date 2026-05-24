@@ -325,7 +325,7 @@ impl Default for EngineSettings {
             visual_progress: true,
             speed: SpeedMode::Fastest,
             display_mode: DisplayMode::FitScreen,
-            zoom: 4,
+            zoom: 1,
             track_opacity: 0.1,
             attack_overlay_opacity: 0.0,
             proactive_attacking: false,
