@@ -57,6 +57,7 @@ pub struct CustomPiece {
     pub a: i32,
     pub b: i32,
     pub color: String,
+    pub color_override: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -103,6 +104,7 @@ impl CustomPiece {
             a,
             b,
             color: color.into(),
+            color_override: None,
         }
     }
 
@@ -110,6 +112,108 @@ impl CustomPiece {
     pub fn with_auto_color(a: i32, b: i32) -> Self {
         Self::new(a, b, auto_piece_color(a, b))
     }
+
+    #[must_use]
+    pub fn with_color_override(a: i32, b: i32, color_override: impl Into<String>) -> Self {
+        let mut piece = Self::with_auto_color(a, b);
+        piece.color_override = Some(color_override.into());
+        piece
+    }
+}
+
+#[must_use]
+pub fn custom_army_moves_match(left: &[CustomPiece], right: &[CustomPiece]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.a == right.a && left.b == right.b)
+}
+
+#[must_use]
+pub fn custom_army_color_overrides_match(left: &[CustomPiece], right: &[CustomPiece]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| left.color_override == right.color_override)
+}
+
+#[must_use]
+pub fn custom_piece_order_color(
+    settings: &EngineSettings,
+    index: usize,
+    army_len: usize,
+) -> String {
+    let color_t = if army_len <= 1 {
+        0.0
+    } else {
+        index as f64 / (army_len - 1) as f64
+    };
+    rainbow_color(&settings.anchor_color_a, &settings.anchor_color_b, color_t)
+}
+
+#[must_use]
+pub fn custom_piece_effective_color(settings: &EngineSettings, index: usize) -> String {
+    let army_len = settings.custom_army.len();
+    settings
+        .custom_army
+        .get(index)
+        .and_then(|piece| {
+            piece
+                .color_override
+                .as_deref()
+                .and_then(parse_hex_rgb)
+                .map(RgbColor::to_css_hex)
+        })
+        .unwrap_or_else(|| custom_piece_order_color(settings, index, army_len))
+}
+
+#[must_use]
+pub fn custom_army_effective_color_groups(settings: &EngineSettings) -> Vec<u64> {
+    let colors = settings
+        .custom_army
+        .iter()
+        .enumerate()
+        .map(|(index, _)| custom_piece_effective_color(settings, index))
+        .collect::<Vec<_>>();
+
+    colors
+        .iter()
+        .enumerate()
+        .map(|(index, color)| {
+            colors
+                .iter()
+                .position(|candidate| candidate == color)
+                .unwrap_or(index) as u64
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn custom_army_effective_color_groups_match(
+    left: &EngineSettings,
+    right: &EngineSettings,
+) -> bool {
+    custom_army_effective_color_groups(left) == custom_army_effective_color_groups(right)
+}
+
+#[must_use]
+pub fn custom_color_groups_affect_generation(settings: &EngineSettings) -> bool {
+    settings.army_preset == ArmyPreset::CustomFinite
+        && matches!(
+            settings.enemy_mode,
+            EnemyMode::Color | EnemyMode::ColorAttackSet
+        )
+}
+
+#[must_use]
+pub fn custom_color_group_change_affects_generation(
+    left: &EngineSettings,
+    right: &EngineSettings,
+) -> bool {
+    (custom_color_groups_affect_generation(left) || custom_color_groups_affect_generation(right))
+        && !custom_army_effective_color_groups_match(left, right)
 }
 
 #[must_use]
@@ -552,6 +656,28 @@ mod tests {
     fn default_anchor_colors_match_requested_rgb_values() {
         assert_eq!(EngineSettings::default().anchor_color_a, "#ff7800");
         assert_eq!(EngineSettings::default().anchor_color_b, "#ff0006");
+    }
+
+    #[test]
+    fn custom_color_overrides_share_effective_enemy_groups_without_changing_order() {
+        let settings = EngineSettings {
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_color_override(3, 1, "#ff7800"),
+                CustomPiece::with_auto_color(4, 1),
+            ],
+            ..EngineSettings::default()
+        };
+
+        assert_ne!(
+            custom_piece_order_color(&settings, 1, 3),
+            custom_piece_effective_color(&settings, 1)
+        );
+        assert_eq!(
+            custom_piece_effective_color(&settings, 1),
+            custom_piece_order_color(&settings, 0, 3)
+        );
+        assert_eq!(custom_army_effective_color_groups(&settings), vec![0, 0, 2]);
     }
 
     #[test]

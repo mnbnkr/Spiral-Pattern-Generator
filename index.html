@@ -77,7 +77,7 @@
         </section>
 
         <section class="control-section">
-          <div class="radius-row">
+          <div class="two-column-row separated-row radius-settings-row">
             <label for="radius-input"
               ><span class="label-row"
                 >View / Generation Radius
@@ -96,16 +96,6 @@
                 autocomplete="off"
               />
             </label>
-            <label
-              class="inline-control visual-progress"
-              for="visual-progress-toggle"
-            >
-              <input id="visual-progress-toggle" type="checkbox" checked />
-              Visual Progress
-            </label>
-          </div>
-
-          <div class="two-column-row separated-row">
             <label for="piece-radius-slider"
               ><span class="label-row"
                 >Piece Radius <output id="piece-radius-output">0.50</output>
@@ -124,32 +114,6 @@
                 step="0.01"
                 value="0.50"
               />
-            </label>
-
-            <label id="continuous-offset-group" for="continuous-offset-input"
-              ><span class="label-row"
-                >Continuous Offset
-                <span
-                  class="info-icon"
-                  tabindex="0"
-                  data-tip="Initial arc-length offset from the origin. Valid values are 0..1 with up to 12 decimal places; more precision is below the solver tolerance."
-                  >i</span
-                ></span
-              >
-              <span id="continuous-offset-input-wrap" class="offset-input-wrap">
-                <input
-                  id="continuous-offset-input"
-                  type="text"
-                  inputmode="decimal"
-                  autocomplete="off"
-                  value="0"
-                />
-                <span
-                  id="continuous-offset-highlight"
-                  class="offset-input-highlight"
-                  aria-hidden="true"
-                ></span>
-              </span>
             </label>
           </div>
 
@@ -181,22 +145,31 @@
         </section>
 
         <section class="control-section">
-          <div class="two-column-row separated-row render-settings-row">
-            <label for="display-mode-select"
-              ><span class="label-row"
-                >Display Mode
-                <span
-                  class="info-icon"
-                  tabindex="0"
-                  data-tip="Fit Screen locks the view to Radius. Free Camera enables panning and wheel zoom around the cursor."
-                  >i</span
-                ></span
+          <div class="two-column-row separated-row display-settings-row">
+            <div class="stacked-display-controls">
+              <label for="display-mode-select"
+                ><span class="label-row"
+                  >Display Mode
+                  <span
+                    class="info-icon"
+                    tabindex="0"
+                    data-tip="Fit Screen locks the view to Radius. Free Camera enables panning and wheel zoom around the cursor."
+                    >i</span
+                  ></span
+                >
+                <select id="display-mode-select">
+                  <option value="FitScreen">Fit Screen</option>
+                  <option value="PixelOneToOne">Free Camera</option>
+                </select>
+              </label>
+              <label
+                class="inline-control visual-progress"
+                for="visual-progress-toggle"
               >
-              <select id="display-mode-select">
-                <option value="FitScreen">Fit Screen</option>
-                <option value="PixelOneToOne">Free Camera</option>
-              </select>
-            </label>
+                <input id="visual-progress-toggle" type="checkbox" checked />
+                Visual Progress
+              </label>
+            </div>
 
             <div class="stacked-render-sliders">
               <label for="track-opacity-slider"
@@ -259,26 +232,24 @@
         </section>
 
         <section class="control-section">
-          <label
-            class="inline-setting-row compact-setting-row"
-            for="placement-search-select"
-            ><span class="label-row"
-              >Placement Search
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
-                >i</span
-              ></span
-            >
-            <select id="placement-search-select">
-              <option value="SpiralPath" selected>Spiral Path</option>
-              <option value="CenterDistance">Center Distance</option>
-            </select>
-          </label>
+          <div class="two-column-row separated-row search-enemy-row">
+            <label for="placement-search-select"
+              ><span class="label-row"
+                >Placement Search
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
+                  >i</span
+                ></span
+              >
+              <select id="placement-search-select">
+                <option value="SpiralPath" selected>Spiral Path</option>
+                <option value="CenterDistance">Center Distance</option>
+              </select>
+            </label>
 
-          <div class="split-setting-row">
-            <label class="setting-pair" for="enemy-mode-select"
+            <label for="enemy-mode-select"
               ><span class="label-row"
                 >Ally / Enemy Condition
                 <span
@@ -294,10 +265,10 @@
                 <option value="ColorAttackSet">Color-Attack-set</option>
               </select>
             </label>
+          </div>
 
-            <span class="row-divider" aria-hidden="true"></span>
-
-            <label class="setting-pair checkbox-pair" for="attacking-toggle">
+          <div class="two-column-row separated-row attack-offset-row">
+            <label class="checkbox-pair" for="attacking-toggle">
               <span class="label-row"
                 >Proactive Attack Rule
                 <span
@@ -312,62 +283,101 @@
                 Enabled
               </span>
             </label>
+
+            <label id="continuous-offset-group" for="continuous-offset-input"
+              ><span class="label-row"
+                >Continuous Offset
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Initial arc-length offset from the origin. Valid values are 0..1 with up to 12 decimal places; more precision is below the solver tolerance."
+                  >i</span
+                ></span
+              >
+              <span id="continuous-offset-input-wrap" class="offset-input-wrap">
+                <input
+                  id="continuous-offset-input"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  value="0"
+                />
+                <span
+                  id="continuous-offset-highlight"
+                  class="offset-input-highlight"
+                  aria-hidden="true"
+                ></span>
+              </span>
+            </label>
           </div>
         </section>
 
         <section class="control-section">
-          <label
-            class="inline-setting-row compact-setting-row"
-            for="army-preset-select"
-            ><span class="label-row"
-              >Army Preset
-              <span
-                class="info-icon"
-                tabindex="0"
-                data-tip="Custom Finite cycles rows, and each row remembers its own search cursor. Prime presets keep one current prime piece until it finds a valid spot."
-                >i</span
-              ></span
-            >
-            <select id="army-preset-select">
-              <option value="CustomFinite">Custom Finite</option>
-              <option value="PrimeKnight">Prime Knight</option>
-              <option value="PrimeGapper">Prime Gapper</option>
-            </select>
-          </label>
+          <div id="preset-move-row" class="preset-move-row custom-finite">
+            <label for="army-preset-select"
+              ><span class="label-row"
+                >Army Preset
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Piece preset. Custom Finite cycles rows, and each row remembers its own search cursor. Prime presets keep one current prime piece until it finds a valid spot."
+                  >i</span
+                ></span
+              >
+              <select id="army-preset-select">
+                <option value="CustomFinite">Custom Finite</option>
+                <option value="PrimeKnight">Prime Knight</option>
+                <option value="PrimeGapper">Prime Gapper</option>
+              </select>
+            </label>
+            <span id="preset-move-divider" class="row-divider" aria-hidden="true"></span>
+            <label id="piece-a-label" for="piece-a-input">
+              First Move
+              <input id="piece-a-input" type="number" step="1" value="2" />
+            </label>
+            <label id="piece-b-label" for="piece-b-input">
+              Turn Move
+              <input id="piece-b-input" type="number" step="1" value="1" />
+            </label>
+          </div>
 
           <div id="custom-army-editor">
-            <div class="piece-add-row">
-              <label for="piece-a-input"
-                >Primary Move
-                <input id="piece-a-input" type="number" step="1" value="2" />
-              </label>
-              <label for="piece-b-input"
-                >Turn Move
-                <input id="piece-b-input" type="number" step="1" value="1" />
-              </label>
-              <div class="piece-action-row">
-                <button id="add-piece-button" type="button">Add</button>
-                <span class="piece-action-divider" aria-hidden="true"></span>
-                <button id="random-piece-button" type="button">Random</button>
-                <input
-                  id="random-count-input"
-                  type="number"
-                  min="0"
-                  step="1"
-                  value="3"
-                  title="Random piece count"
-                  aria-label="Random piece count"
-                />
-                <button
-                  id="random-pool-toggle-button"
-                  class="square-icon-button"
-                  type="button"
-                  title="Edit random pool"
-                  aria-pressed="false"
+            <div class="piece-action-row">
+              <button id="add-piece-button" type="button">
+                <span>Add</span>
+                <span
+                  class="info-icon button-info"
+                  data-tip="Adds the First/Turn move as a new custom row. Drag rows to reorder; drag a color swatch onto another swatch to copy it, and click a swatch to reset it."
+                  >i</span
                 >
-                  <span class="mirrored-icon" aria-hidden="true">&#9998;</span>
-                </button>
-              </div>
+              </button>
+              <span class="piece-action-divider" aria-hidden="true"></span>
+              <button id="random-piece-button" type="button">
+                <span>Random</span>
+                <span
+                  class="info-icon button-info"
+                  data-tip="Replaces the custom army with the requested count sampled from the editable random pool. The pencil button edits that pool without changing the current army."
+                  >i</span
+                >
+              </button>
+              <input
+                id="random-count-input"
+                type="number"
+                min="0"
+                step="1"
+                value="3"
+                title="Random piece count"
+                aria-label="Random piece count"
+              />
+              <button
+                id="random-pool-toggle-button"
+                class="square-icon-button"
+                type="button"
+                title="Edit random pool"
+                aria-pressed="false"
+              >
+                <span class="mirrored-icon" aria-hidden="true">&#9998;</span>
+              </button>
             </div>
             <div id="army-list" class="army-list"></div>
           </div>

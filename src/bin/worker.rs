@@ -8,11 +8,12 @@ use spiral_pattern_generator::engine::SimulationEngine;
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, ColorState, EngineSettings, Placement,
-    SpeedMode, VertexBufferUpdate, WorkerToApp,
+    SpeedMode, VertexBufferUpdate, WorkerToApp, custom_army_color_overrides_match,
+    custom_army_moves_match, custom_color_group_change_affects_generation,
 };
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::render_data::{
-    AttackOverlayBuildJob, AttackOverlayCache, ColorAnchors, append_vertices,
+    AttackOverlayBuildJob, AttackOverlayCache, ColorContext, append_vertices,
     attack_overlay_requires_full_rebuild_for_new_placements, pack_vertices,
 };
 #[cfg(target_arch = "wasm32")]
@@ -96,8 +97,12 @@ fn handle_message(
                 return Ok(());
             }
             let old_settings = runtime.engine.settings().clone();
-            let anchor_colors_changed = old_settings.anchor_color_a != settings.anchor_color_a
-                || old_settings.anchor_color_b != settings.anchor_color_b;
+            let visual_colors_changed = old_settings.anchor_color_a != settings.anchor_color_a
+                || old_settings.anchor_color_b != settings.anchor_color_b
+                || !custom_army_color_overrides_match(
+                    &old_settings.custom_army,
+                    &settings.custom_army,
+                );
             let overlay_needs_rebuild =
                 attack_overlay_settings_changed_excluding_opacity(&old_settings, &settings);
             let overlay_enabled = settings.attack_overlay_opacity > f32::EPSILON;
@@ -132,7 +137,7 @@ fn handle_message(
                     AttackOverlayUpdate::none()
                 };
 
-                if anchor_colors_changed && runtime.engine.placement_count() > 0 {
+                if visual_colors_changed && runtime.engine.placement_count() > 0 {
                     let vertices =
                         pack_vertices_for_runtime(&runtime, runtime.engine.color_state());
                     post_stats_with_updates(
@@ -523,7 +528,8 @@ fn attack_overlay_settings_changed_excluding_opacity(
         || old.proactive_attacking != new.proactive_attacking
         || old.enemy_mode != new.enemy_mode
         || old.army_preset != new.army_preset
-        || old.custom_army != new.custom_army
+        || !custom_army_moves_match(&old.custom_army, &new.custom_army)
+        || custom_color_group_change_affects_generation(old, new)
         || old.continuous_offset != new.continuous_offset
         || old.prime_modulo_divisor != new.prime_modulo_divisor
 }
@@ -580,13 +586,13 @@ fn pack_vertices_for_runtime(runtime: &WorkerRuntime, color_state: ColorState) -
     const PACK_CHUNK: usize = 65_536;
 
     let placement_count = runtime.engine.placement_count();
-    let anchors = ColorAnchors::from_settings(runtime.engine.settings());
+    let context = ColorContext::from_settings(runtime.engine.settings());
     let mut vertices = Vec::with_capacity(placement_count.saturating_mul(5));
     let mut start = 0;
     while start < placement_count {
         let end = start.saturating_add(PACK_CHUNK).min(placement_count);
         let placements = runtime.engine.placements_in_range(start, end);
-        append_vertices(&mut vertices, &placements, anchors, color_state);
+        append_vertices(&mut vertices, &placements, &context, color_state);
         start = end;
     }
     vertices

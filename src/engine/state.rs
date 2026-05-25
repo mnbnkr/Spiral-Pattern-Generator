@@ -12,7 +12,8 @@ use crate::math::{
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
     EngineStats, PieceColor, PieceSignature, Placement, PlacementSearchMode, ShapeKind, SpotCoord,
-    normalize_prime_modulo_divisor,
+    custom_army_effective_color_groups, custom_army_moves_match,
+    custom_color_group_change_affects_generation, normalize_prime_modulo_divisor,
 };
 
 const CONTINUOUS_CENTER_STREAMS: usize = 1;
@@ -44,6 +45,7 @@ struct CandidatePiece {
     color: PieceColor,
     move_group: (i32, i32),
     color_group: u64,
+    enemy_color_group: u64,
     attack_radius: f64,
 }
 
@@ -55,6 +57,7 @@ struct PlacedPiece {
     color_rule: ColorRule,
     fixed_color: StoredFixedColor,
     color_key: ColorKey,
+    enemy_color_group: u64,
     attack_radius: f64,
 }
 
@@ -317,6 +320,7 @@ pub struct SimulationEngine {
     next_prime_candidate_index: usize,
     shared_prime_spot_order_index: u64,
     prime_color_spot_order_indices: FxHashMap<u64, u64>,
+    custom_enemy_color_groups: Vec<u64>,
     spots: Vec<BoardSpot>,
     spots_exhausted: bool,
     first_out_of_radius_spot: Option<BoardSpot>,
@@ -353,6 +357,7 @@ impl SimulationEngine {
             }
             let _ = placed.try_reserve_exact(capacity);
         }
+        let custom_enemy_color_groups = custom_army_effective_color_groups(&settings);
         Self {
             settings,
             mode,
@@ -363,6 +368,7 @@ impl SimulationEngine {
             next_prime_candidate_index: 0,
             shared_prime_spot_order_index: 0,
             prime_color_spot_order_indices: FxHashMap::default(),
+            custom_enemy_color_groups,
             spots,
             spots_exhausted: false,
             first_out_of_radius_spot: None,
@@ -427,6 +433,7 @@ impl SimulationEngine {
             true
         } else {
             self.settings = settings;
+            self.custom_enemy_color_groups = custom_army_effective_color_groups(&self.settings);
             if radius_increased {
                 self.reopen_spiral_path_radius_bound();
             }
@@ -564,6 +571,7 @@ impl SimulationEngine {
         let fixed_color = StoredFixedColor::from_color(&piece.color);
         let color_rule = piece.color.rule;
         let color_key = piece.color.key;
+        let enemy_color_group = piece.enemy_color_group;
         let location = lattice_coord.map_or(
             PlacedLocation::Continuous {
                 center,
@@ -579,6 +587,7 @@ impl SimulationEngine {
             color_rule,
             fixed_color,
             color_key,
+            enemy_color_group,
             attack_radius: piece.attack_radius,
         };
 
@@ -771,7 +780,8 @@ impl SimulationEngine {
     }
 
     fn are_enemies(&self, existing: &PlacedPiece, candidate: &CandidatePiece) -> bool {
-        if self.enemy_mode_uses_color() && existing.color_key.group != candidate.color_group {
+        if self.enemy_mode_uses_color() && existing.enemy_color_group != candidate.enemy_color_group
+        {
             return true;
         }
 
@@ -838,7 +848,8 @@ impl SimulationEngine {
             || current.enemy_mode != next.enemy_mode
             || current.placement_search != next.placement_search
             || current.army_preset != next.army_preset
-            || current.custom_army != next.custom_army
+            || !custom_army_moves_match(&current.custom_army, &next.custom_army)
+            || custom_color_group_change_affects_generation(current, next)
             || current.continuous_offset != next.continuous_offset
             || current.prime_modulo_divisor != next.prime_modulo_divisor
     }
@@ -863,6 +874,11 @@ impl SimulationEngine {
             index as f64 / (army_len - 1) as f64
         };
         let color_group = index as u64;
+        let enemy_color_group = self
+            .custom_enemy_color_groups
+            .get(index)
+            .copied()
+            .unwrap_or(color_group);
 
         CandidatePiece {
             signature,
@@ -876,6 +892,7 @@ impl SimulationEngine {
             },
             move_group: move_group(signature),
             color_group,
+            enemy_color_group,
             attack_radius: attack_radius_from_move(signature.a, signature.b),
         }
     }
@@ -898,6 +915,7 @@ impl SimulationEngine {
                         },
                         move_group: move_group(signature),
                         color_group: SPECIAL_PRIME_COLOR_GROUP,
+                        enemy_color_group: SPECIAL_PRIME_COLOR_GROUP,
                         attack_radius: attack_radius_from_move(signature.a, signature.b),
                     };
                 }
@@ -920,6 +938,7 @@ impl SimulationEngine {
                     },
                     move_group: move_group(signature),
                     color_group,
+                    enemy_color_group: color_group,
                     attack_radius: attack_radius_from_move(signature.a, signature.b),
                 }
             }
@@ -940,6 +959,7 @@ impl SimulationEngine {
                         },
                         move_group: move_group(signature),
                         color_group: SPECIAL_PRIME_COLOR_GROUP,
+                        enemy_color_group: SPECIAL_PRIME_COLOR_GROUP,
                         attack_radius: attack_radius_from_move(signature.a, signature.b),
                     };
                 }
@@ -958,6 +978,7 @@ impl SimulationEngine {
                     },
                     move_group: move_group(signature),
                     color_group: gap as u64,
+                    enemy_color_group: gap as u64,
                     attack_radius: attack_radius_from_move(signature.a, signature.b),
                 }
             }
@@ -1856,6 +1877,95 @@ mod tests {
         assert_eq!(batch[1].color.key.group, 1);
         assert_eq!(batch[0].color.key.gradient_value, 0.0);
         assert_eq!(batch[1].color.key.gradient_value, 1.0);
+    }
+
+    #[test]
+    fn custom_color_overrides_do_not_change_automatic_order_groups() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            enemy_mode: EnemyMode::AttackSet,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(3, 1),
+            ],
+            ..EngineSettings::default()
+        });
+        let first = engine.step_batch(4);
+        let mut next_settings = engine.settings().clone();
+        next_settings.custom_army[1].color_override = Some("#55a7ff".to_string());
+
+        assert!(!engine.update_settings(next_settings));
+        assert_eq!(engine.stats().placements, first.len() as u64);
+
+        let next = engine.step_batch(2);
+        assert_eq!(next[0].color.rule, ColorRule::OrderRainbow);
+        assert_eq!(next[0].color.key.group, 0);
+        assert_eq!(next[1].color.rule, ColorRule::OrderRainbow);
+        assert_eq!(next[1].color.key.group, 1);
+    }
+
+    #[test]
+    fn custom_color_override_changes_color_enemy_identity() {
+        for enemy_mode in [EnemyMode::Color, EnemyMode::ColorAttackSet] {
+            let settings = EngineSettings {
+                board: BoardKind::LatticeSquare,
+                placement_search: PlacementSearchMode::SpiralPath,
+                enemy_mode,
+                custom_army: vec![
+                    CustomPiece::with_auto_color(2, 1),
+                    CustomPiece::with_color_override(2, 1, "#ff7800"),
+                ],
+                ..EngineSettings::default()
+            };
+            let enemy_groups = custom_army_effective_color_groups(&settings);
+            assert_eq!(enemy_groups, vec![0, 0]);
+
+            let mut engine = SimulationEngine::new(settings);
+            let batch = engine.step_budget(24, 1_000_000);
+            let mut earlier: Vec<&Placement> = Vec::new();
+            let mut allowed_copied_color_attack = false;
+
+            for placement in &batch {
+                for attacker in &earlier {
+                    let automatic_groups_differ =
+                        attacker.color.key.group != placement.color.key.group;
+                    if automatic_groups_differ
+                        && move_group(attacker.piece) == move_group(placement.piece)
+                        && placement_attacks(attacker, placement, BoardKind::LatticeSquare, 0.5)
+                    {
+                        allowed_copied_color_attack = true;
+                    }
+                }
+                earlier.push(placement);
+            }
+
+            assert!(
+                allowed_copied_color_attack,
+                "enemy_mode={enemy_mode:?} did not allow same visible-color allies"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_color_override_identity_change_requires_reset_in_color_modes() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            enemy_mode: EnemyMode::Color,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(2, 1),
+            ],
+            ..EngineSettings::default()
+        });
+        let first = engine.step_batch(4);
+        let mut next_settings = engine.settings().clone();
+        next_settings.custom_army[1].color_override = Some("#ff7800".to_string());
+
+        assert!(engine.update_settings(next_settings));
+        assert_eq!(engine.stats().placements, 0);
+
+        let next = engine.step_batch(2);
+        assert_eq!(first[0].color.key.group, next[0].color.key.group);
+        assert_eq!(next[0].color.key.group, 0);
+        assert_eq!(next[1].color.key.group, 1);
     }
 
     #[test]

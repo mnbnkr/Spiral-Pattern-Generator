@@ -5,7 +5,7 @@ use crate::math::{AxialCoord, Point2, SquareCoord, TriangleCoord, attack_radius_
 use crate::protocol::{
     ArmyPreset, AttackOverlayUpdate, BoardKind, ColorRule, ColorState, CustomPiece, EnemyMode,
     EngineSettings, PieceSignature, Placement, RgbColor, SpotCoord, VertexBufferUpdate,
-    normalize_prime_modulo_divisor, parse_hex_rgb, rainbow_rgb,
+    custom_army_effective_color_groups, normalize_prime_modulo_divisor, parse_hex_rgb, rainbow_rgb,
 };
 
 const ATTACK_OVERLAY_COLOR: RgbColor = RgbColor::new(
@@ -34,6 +34,34 @@ impl ColorAnchors {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ColorContext {
+    pub anchors: ColorAnchors,
+    custom_overrides: Vec<Option<RgbColor>>,
+}
+
+impl ColorContext {
+    #[must_use]
+    pub fn from_settings(settings: &EngineSettings) -> Self {
+        Self {
+            anchors: ColorAnchors::from_settings(settings),
+            custom_overrides: settings
+                .custom_army
+                .iter()
+                .map(|piece| piece.color_override.as_deref().and_then(parse_hex_rgb))
+                .collect(),
+        }
+    }
+
+    fn custom_override(&self, group: u64) -> Option<RgbColor> {
+        usize::try_from(group)
+            .ok()
+            .and_then(|index| self.custom_overrides.get(index))
+            .copied()
+            .flatten()
+    }
+}
+
 #[must_use]
 pub fn placement_center(placement: &Placement) -> Point2 {
     match placement.coord {
@@ -47,21 +75,32 @@ pub fn placement_center(placement: &Placement) -> Point2 {
 #[must_use]
 pub fn color_for_placement_rgb(
     placement: &Placement,
-    anchors: ColorAnchors,
+    context: &ColorContext,
     color_state: ColorState,
 ) -> RgbColor {
     match placement.color.rule {
         ColorRule::Fixed => parse_hex_rgb(&placement.color.fixed_css)
             .unwrap_or_else(|| RgbColor::new(238.0 / 255.0, 241.0 / 255.0, 244.0 / 255.0)),
-        ColorRule::OrderRainbow | ColorRule::PrimeKnightModulo => {
-            rainbow_rgb(anchors.a, anchors.b, placement.color.key.gradient_value)
-        }
+        ColorRule::OrderRainbow => context
+            .custom_override(placement.color.key.group)
+            .unwrap_or_else(|| {
+                rainbow_rgb(
+                    context.anchors.a,
+                    context.anchors.b,
+                    placement.color.key.gradient_value,
+                )
+            }),
+        ColorRule::PrimeKnightModulo => rainbow_rgb(
+            context.anchors.a,
+            context.anchors.b,
+            placement.color.key.gradient_value,
+        ),
         ColorRule::PrimeGapperBounds => {
             let min_gap = color_state.min_gap;
             let max_gap = color_state.max_gap.max(min_gap + 1.0);
             let t = ((placement.color.key.gradient_value - min_gap) / (max_gap - min_gap))
                 .clamp(0.0, 1.0);
-            rainbow_rgb(anchors.a, anchors.b, t)
+            rainbow_rgb(context.anchors.a, context.anchors.b, t)
         }
     }
 }
@@ -72,23 +111,23 @@ pub fn pack_vertices(
     settings: &EngineSettings,
     color_state: ColorState,
 ) -> Vec<f32> {
-    let anchors = ColorAnchors::from_settings(settings);
+    let context = ColorContext::from_settings(settings);
     let mut vertices = Vec::with_capacity(placements.len() * 5);
-    append_vertices(&mut vertices, placements, anchors, color_state);
+    append_vertices(&mut vertices, placements, &context, color_state);
     vertices
 }
 
 pub fn append_vertices(
     vertices: &mut Vec<f32>,
     placements: &[Placement],
-    anchors: ColorAnchors,
+    context: &ColorContext,
     color_state: ColorState,
 ) {
     vertices.reserve(placements.len() * 5);
 
     for placement in placements {
         let center = placement_center(placement);
-        let color = color_for_placement_rgb(placement, anchors, color_state);
+        let color = color_for_placement_rgb(placement, context, color_state);
         vertices.extend_from_slice(&[center.x as f32, center.y as f32, color.r, color.g, color.b]);
     }
 }
@@ -111,7 +150,7 @@ enum AttackOverlayBuildStage {
 struct OverlayCandidate {
     signature: PieceSignature,
     move_group: (i32, i32),
-    color_group: u64,
+    enemy_color_group: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -193,8 +232,14 @@ impl AttackOverlayCache {
         } else {
             Vec::new()
         };
+        let enemy_color_groups = custom_army_effective_color_groups(&self.settings);
         for placement in placements {
-            self.append_lattice_placement_overlay(placement, &mut buffers, &candidates);
+            self.append_lattice_placement_overlay(
+                placement,
+                &mut buffers,
+                &candidates,
+                &enemy_color_groups,
+            );
         }
 
         attack_overlay_update_from_buffers(buffers)
@@ -205,6 +250,7 @@ impl AttackOverlayCache {
         placement: &Placement,
         buffers: &mut AttackOverlayBuffers,
         candidates: &[OverlayCandidate],
+        enemy_color_groups: &[u64],
     ) {
         let Some(origin) = lattice_coord(placement) else {
             return;
@@ -230,7 +276,8 @@ impl AttackOverlayCache {
             ) {
                 continue;
             }
-            if !overlay_candidate_is_enemy(&self.settings, placement, candidate) {
+            if !overlay_candidate_is_enemy(&self.settings, placement, candidate, enemy_color_groups)
+            {
                 continue;
             }
             for offset in lattice_attack_targets(self.settings.board, (0, 0), candidate.signature) {
@@ -350,11 +397,14 @@ impl AttackOverlayBuildJob {
                     } else {
                         Vec::new()
                     };
+                    let enemy_color_groups =
+                        custom_army_effective_color_groups(&self.cache.settings);
                     for placement in &chunk {
                         self.cache.append_lattice_placement_overlay(
                             placement,
                             &mut buffers,
                             &candidates,
+                            &enemy_color_groups,
                         );
                     }
                 }
@@ -428,6 +478,7 @@ fn pack_lattice_attack_overlay_buffers(
     } else {
         Vec::new()
     };
+    let enemy_color_groups = custom_army_effective_color_groups(settings);
     for placement in placements {
         let Some(origin) = lattice_coord(placement) else {
             continue;
@@ -453,7 +504,8 @@ fn pack_lattice_attack_overlay_buffers(
                 ) {
                     continue;
                 }
-                if !overlay_candidate_is_enemy(settings, placement, candidate) {
+                if !overlay_candidate_is_enemy(settings, placement, candidate, &enemy_color_groups)
+                {
                     continue;
                 }
                 for offset in lattice_attack_targets(settings.board, (0, 0), candidate.signature) {
@@ -584,12 +636,23 @@ fn lattice_coord(placement: &Placement) -> Option<(i64, i64)> {
 
 fn overlay_candidates(settings: &EngineSettings, placement_count: usize) -> Vec<OverlayCandidate> {
     match settings.army_preset {
-        ArmyPreset::CustomFinite => settings
-            .custom_army
-            .iter()
-            .enumerate()
-            .map(|(index, piece)| overlay_candidate_for_custom_piece(index, piece))
-            .collect(),
+        ArmyPreset::CustomFinite => {
+            let enemy_color_groups = custom_army_effective_color_groups(settings);
+            settings
+                .custom_army
+                .iter()
+                .enumerate()
+                .map(|(index, piece)| {
+                    overlay_candidate_for_custom_piece(
+                        piece,
+                        enemy_color_groups
+                            .get(index)
+                            .copied()
+                            .unwrap_or(index as u64),
+                    )
+                })
+                .collect()
+        }
         ArmyPreset::PrimeKnight => {
             vec![overlay_candidate_for_prime_knight(
                 placement_count,
@@ -600,12 +663,15 @@ fn overlay_candidates(settings: &EngineSettings, placement_count: usize) -> Vec<
     }
 }
 
-fn overlay_candidate_for_custom_piece(index: usize, piece: &CustomPiece) -> OverlayCandidate {
+fn overlay_candidate_for_custom_piece(
+    piece: &CustomPiece,
+    enemy_color_group: u64,
+) -> OverlayCandidate {
     let signature = PieceSignature::new(piece.a, piece.b);
     OverlayCandidate {
         signature,
         move_group: normalized_move_group(signature),
-        color_group: index as u64,
+        enemy_color_group,
     }
 }
 
@@ -621,7 +687,7 @@ fn overlay_candidate_for_prime_knight(index: usize, divisor: u32) -> OverlayCand
     OverlayCandidate {
         signature,
         move_group: normalized_move_group(signature),
-        color_group,
+        enemy_color_group: color_group,
     }
 }
 
@@ -637,7 +703,7 @@ fn overlay_candidate_for_prime_gapper(index: usize) -> OverlayCandidate {
     OverlayCandidate {
         signature,
         move_group: normalized_move_group(signature),
-        color_group,
+        enemy_color_group: color_group,
     }
 }
 
@@ -645,11 +711,13 @@ fn overlay_candidate_is_enemy(
     settings: &EngineSettings,
     placement: &Placement,
     candidate: OverlayCandidate,
+    enemy_color_groups: &[u64],
 ) -> bool {
     if matches!(
         settings.enemy_mode,
         EnemyMode::Color | EnemyMode::ColorAttackSet
-    ) && placement.color.key.group != candidate.color_group
+    ) && placement_enemy_color_group(settings, placement, enemy_color_groups)
+        != candidate.enemy_color_group
     {
         return true;
     }
@@ -658,6 +726,23 @@ fn overlay_candidate_is_enemy(
         settings.enemy_mode,
         EnemyMode::AttackSet | EnemyMode::ColorAttackSet
     ) && normalized_move_group(placement.piece) != candidate.move_group
+}
+
+fn placement_enemy_color_group(
+    settings: &EngineSettings,
+    placement: &Placement,
+    enemy_color_groups: &[u64],
+) -> u64 {
+    if settings.army_preset != ArmyPreset::CustomFinite
+        || placement.color.rule != ColorRule::OrderRainbow
+    {
+        return placement.color.key.group;
+    }
+
+    usize::try_from(placement.color.key.group)
+        .ok()
+        .and_then(|index| enemy_color_groups.get(index).copied())
+        .unwrap_or(placement.color.key.group)
 }
 
 fn normalized_move_group(piece: PieceSignature) -> (i32, i32) {
@@ -784,6 +869,34 @@ mod tests {
         assert_eq!(vertices.len(), 5);
         assert_eq!(&vertices[0..2], &[2.0, -3.0]);
         assert_eq!(&vertices[2..5], &[1.0, 120.0 / 255.0, 0.0]);
+    }
+
+    #[test]
+    fn custom_color_override_recolors_order_rainbow_without_changing_group() {
+        let settings = EngineSettings {
+            custom_army: vec![CustomPiece::with_color_override(2, 1, "#55a7ff")],
+            ..EngineSettings::default()
+        };
+        let placements = vec![Placement {
+            id: 0,
+            spot_index: 0,
+            coord: SpotCoord::Square { x: 0, y: 0 },
+            piece: PieceSignature::new(2, 1),
+            color: PieceColor {
+                rule: ColorRule::OrderRainbow,
+                fixed_css: String::new(),
+                key: ColorKey {
+                    group: 0,
+                    gradient_value: 0.0,
+                },
+            },
+            shape: ShapeKind::Square,
+        }];
+
+        let vertices = pack_vertices(&placements, &settings, ColorState::default());
+
+        assert_eq!(&vertices[2..5], &[85.0 / 255.0, 167.0 / 255.0, 1.0]);
+        assert_eq!(placements[0].color.key.group, 0);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use web_sys::{
 use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
 use crate::protocol::{
     AttackOverlayUpdate, BoardKind, ColorState, DisplayMode, EngineSettings, ShapeKind,
-    VertexBufferUpdate,
+    VertexBufferUpdate, custom_color_group_change_affects_generation,
 };
 
 const FLOATS_PER_VERTEX: usize = 5;
@@ -1539,6 +1539,7 @@ fn attack_overlay_cache_compatible(a: &EngineSettings, b: &EngineSettings) -> bo
         && a.placement_search == b.placement_search
         && a.army_preset == b.army_preset
         && a.custom_army == b.custom_army
+        && !custom_color_group_change_affects_generation(a, b)
         && a.continuous_offset == b.continuous_offset
         && a.prime_modulo_divisor == b.prime_modulo_divisor
         && continuous_piece_radius_overlay_compatible(a, b)

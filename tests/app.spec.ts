@@ -188,6 +188,82 @@ test("default simulation auto-runs", async ({ page }) => {
   await pauseIfRunning(page);
 });
 
+test("custom finite panel layout and color swatch overrides work", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+
+  const layout = await page.evaluate(() => {
+    const rect = (id: string) => document.getElementById(id)?.getBoundingClientRect();
+    return {
+      panelWidth: document.querySelector("#control-panel")?.getBoundingClientRect()
+        .width,
+      radiusRightOfRadius:
+        (rect("piece-radius-slider")?.left ?? 0) >
+        (rect("radius-input")?.left ?? 0),
+      displayModeLeftOfTrack:
+        (rect("display-mode-select")?.left ?? 0) <
+        (rect("track-opacity-slider")?.left ?? 0),
+      visualBelowDisplay:
+        (rect("visual-progress-toggle")?.top ?? 0) >
+        (rect("display-mode-select")?.top ?? 0),
+      enemyRightOfSearch:
+        (rect("enemy-mode-select")?.left ?? 0) >
+        (rect("placement-search-select")?.left ?? 0),
+      offsetRightOfAttack:
+        (rect("continuous-offset-input")?.left ?? 0) >
+        (rect("attacking-toggle")?.left ?? 0),
+      presetMoveOrder: [
+        rect("army-preset-select")?.left ?? 0,
+        rect("piece-a-input")?.left ?? 0,
+        rect("piece-b-input")?.left ?? 0,
+      ],
+      checkboxAccent: getComputedStyle(
+        document.querySelector("#visual-progress-toggle")!,
+      ).accentColor,
+    };
+  });
+
+  expect(layout.panelWidth).toBeGreaterThanOrEqual(455);
+  expect(layout.radiusRightOfRadius).toBe(true);
+  expect(layout.displayModeLeftOfTrack).toBe(true);
+  expect(layout.visualBelowDisplay).toBe(true);
+  expect(layout.enemyRightOfSearch).toBe(true);
+  expect(layout.offsetRightOfAttack).toBe(true);
+  expect(layout.presetMoveOrder[0]).toBeLessThan(layout.presetMoveOrder[1]);
+  expect(layout.presetMoveOrder[1]).toBeLessThan(layout.presetMoveOrder[2]);
+  expect(layout.checkboxAccent).toBe("rgb(85, 167, 255)");
+  await expect(page.locator('label[for="army-preset-select"] .label-row')).toContainText(
+    "Army Preset",
+  );
+  await expect(page.locator("#piece-a-label")).toContainText("First Move");
+  await expect(page.locator("#piece-b-label")).toContainText("Turn Move");
+
+  await page.locator(".army-swatch").first().dragTo(page.locator(".army-swatch").nth(1));
+  const copied = await page.locator(".army-swatch").evaluateAll((swatches) =>
+    swatches.map((swatch) => ({
+      color: getComputedStyle(swatch).backgroundColor,
+      override: swatch.classList.contains("custom-color-override"),
+    })),
+  );
+  expect(copied[1]).toEqual({ color: copied[0].color, override: true });
+
+  await page.locator(".army-swatch").nth(1).click();
+  const reset = await page.locator(".army-swatch").evaluateAll((swatches) =>
+    swatches.map((swatch) => ({
+      color: getComputedStyle(swatch).backgroundColor,
+      override: swatch.classList.contains("custom-color-override"),
+    })),
+  );
+  expect(reset[1].override).toBe(false);
+  expect(reset[1].color).not.toBe(reset[0].color);
+
+  await page.locator("#random-pool-toggle-button").click();
+  await expect(page.locator(".random-pool-row").first()).toContainText(
+    "(2, 1) Knight",
+  );
+});
+
 test("radius border renders with track off and subpath-loaded app is nonblank", async ({
   page,
 }) => {
@@ -570,21 +646,41 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
     .toBe("grab");
 });
 
-test("display mode row is vertically centered against render sliders", async ({
+test("display mode stack is left and top-aligned against render sliders", async ({
   page,
 }) => {
-  const delta = await page.locator("#display-mode-select").evaluate((select) => {
-    const label = select.closest("label");
-    const stack = label?.nextElementSibling;
-    if (!label || !stack) throw new Error("missing display mode row");
-    const labelRect = label.getBoundingClientRect();
-    const stackRect = stack.getBoundingClientRect();
-    return Math.abs(
-      labelRect.top + labelRect.height / 2 - (stackRect.top + stackRect.height / 2),
-    );
+  const layout = await page.locator(".display-settings-row").evaluate((row) => {
+    const displayStack = row.querySelector(".stacked-display-controls");
+    const renderStack = row.querySelector(".stacked-render-sliders");
+    const displaySelect = row.querySelector("#display-mode-select");
+    const visualToggle = row.querySelector("#visual-progress-toggle");
+    const trackSlider = row.querySelector("#track-opacity-slider");
+    if (
+      !displayStack ||
+      !renderStack ||
+      !displaySelect ||
+      !visualToggle ||
+      !trackSlider
+    ) {
+      throw new Error("missing display settings controls");
+    }
+    const displayRect = displayStack.getBoundingClientRect();
+    const renderRect = renderStack.getBoundingClientRect();
+    const selectRect = displaySelect.getBoundingClientRect();
+    const visualRect = visualToggle.getBoundingClientRect();
+    const trackRect = trackSlider.getBoundingClientRect();
+    return {
+      displayLeftOfRender: displayRect.left < renderRect.left,
+      topDelta: Math.abs(displayRect.top - renderRect.top),
+      visualBelowDisplay: visualRect.top > selectRect.top,
+      trackRightOfDisplay: trackRect.left > selectRect.left,
+    };
   });
 
-  expect(delta).toBeLessThanOrEqual(2);
+  expect(layout.displayLeftOfRender).toBe(true);
+  expect(layout.topDelta).toBeLessThanOrEqual(2);
+  expect(layout.visualBelowDisplay).toBe(true);
+  expect(layout.trackRightOfDisplay).toBe(true);
 });
 
 test("color labels do not open broad clickable color targets", async ({

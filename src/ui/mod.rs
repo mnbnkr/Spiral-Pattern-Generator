@@ -12,8 +12,9 @@ use web_sys::{
 use crate::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DEFAULT_RADIUS,
     DisplayMode, EnemyMode, EngineSettings, EngineStats, Placement, PlacementSearchMode, ShapeKind,
-    SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp, normalize_prime_modulo_divisor,
-    rainbow_color,
+    SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp, custom_army_moves_match,
+    custom_color_group_change_affects_generation, custom_piece_order_color,
+    normalize_prime_modulo_divisor, parse_hex_rgb,
 };
 use crate::render::{CanvasRenderer, ExportKind};
 
@@ -36,6 +37,8 @@ struct AppState {
     running: bool,
     has_run: bool,
     dragging_army_index: Option<usize>,
+    dragging_custom_color: Option<(usize, String)>,
+    suppress_color_click_until_ms: f64,
     random_pool: Vec<RandomPoolPiece>,
     random_pool_editing: bool,
     first_log_lines: Vec<String>,
@@ -118,6 +121,8 @@ pub fn boot_app() -> Result<(), JsValue> {
         running: false,
         has_run: false,
         dragging_army_index: None,
+        dragging_custom_color: None,
+        suppress_color_click_until_ms: 0.0,
         random_pool: default_random_pool(),
         random_pool_editing: false,
         first_log_lines: Vec::new(),
@@ -2006,16 +2011,23 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
 
         let swatch = document.create_element("span")?.dyn_into::<HtmlElement>()?;
         swatch.set_class_name("army-swatch");
-        let color_t = if army_len <= 1 {
-            0.0
-        } else {
-            index as f64 / (army_len - 1) as f64
-        };
-        swatch.style().set_property(
-            "background",
-            &rainbow_color(&settings.anchor_color_a, &settings.anchor_color_b, color_t),
+        if piece.color_override.is_some() {
+            swatch.class_list().add_1("custom-color-override")?;
+        }
+        let display_color = custom_piece_display_color(&settings, index, piece, army_len);
+        swatch.style().set_property("background", &display_color)?;
+        swatch.set_title(&format!(
+            "Order color {}. Drag onto another color to copy; click to reset this row to automatic color.",
+            index + 1
+        ));
+        swatch.set_attribute("draggable", "true")?;
+        install_piece_color_handlers(
+            &swatch,
+            document.clone(),
+            Rc::clone(&state),
+            index,
+            display_color,
         )?;
-        swatch.set_title(&format!("Order color {}", index + 1));
         row.append_child(&swatch)?;
 
         let up = small_button(document, "▲", "Move up")?;
@@ -2069,14 +2081,14 @@ fn render_random_pool_list(
         install_random_pool_drag_handlers(&row, document.clone(), Rc::clone(&state), index)?;
 
         let label = document.create_element("span")?;
+        let mov = document.create_element("span")?;
+        mov.set_class_name("pool-piece-move");
+        mov.set_text_content(Some(&format!("({}, {}) ", piece.a, piece.b)));
         let name = document.create_element("span")?;
         name.set_class_name("pool-piece-name");
         name.set_text_content(Some(&piece.name));
-        let mov = document.create_element("span")?;
-        mov.set_class_name("pool-piece-move");
-        mov.set_text_content(Some(&format!("({}, {})", piece.a, piece.b)));
-        label.append_child(&name)?;
         label.append_child(&mov)?;
+        label.append_child(&name)?;
         row.append_child(&label)?;
 
         let up = small_button(document, "▲", "Move up")?;
@@ -2105,6 +2117,201 @@ fn render_random_pool_list(
 
         list.append_child(&row)?;
     }
+
+    Ok(())
+}
+
+fn custom_piece_display_color(
+    settings: &EngineSettings,
+    index: usize,
+    piece: &CustomPiece,
+    army_len: usize,
+) -> String {
+    piece
+        .color_override
+        .as_deref()
+        .and_then(normalize_css_hex_color)
+        .unwrap_or_else(|| custom_piece_auto_color(settings, index, army_len))
+}
+
+fn custom_piece_auto_color(settings: &EngineSettings, index: usize, army_len: usize) -> String {
+    custom_piece_order_color(settings, index, army_len)
+}
+
+fn sync_custom_color_override(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+    index: usize,
+    color: Option<String>,
+) -> Result<(), JsValue> {
+    let next_color = color.and_then(|value| normalize_css_hex_color(&value));
+    let previous_settings = {
+        let mut state = state.borrow_mut();
+        let previous_settings = state.settings.clone();
+        let Some(piece) = state.settings.custom_army.get_mut(index) else {
+            return Ok(());
+        };
+        if piece.color_override == next_color {
+            return Ok(());
+        }
+        piece.color_override = next_color;
+        previous_settings
+    };
+
+    sync_settings_with_previous(
+        document,
+        state,
+        SyncAction::UpdateWorker,
+        previous_settings,
+        false,
+    )
+}
+
+fn install_piece_color_handlers(
+    swatch: &HtmlElement,
+    document: Document,
+    state: Rc<RefCell<AppState>>,
+    index: usize,
+    display_color: String,
+) -> Result<(), JsValue> {
+    let drag_state = Rc::clone(&state);
+    let drag_color = display_color.clone();
+    let drag_start = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.stop_propagation();
+        drag_state.borrow_mut().dragging_custom_color = Some((index, drag_color.clone()));
+        if let Some(data_transfer) = event.data_transfer() {
+            data_transfer.set_effect_allowed("copy");
+            let _ = data_transfer.set_data("text/plain", &drag_color);
+        }
+    });
+    swatch.add_event_listener_with_callback("dragstart", drag_start.as_ref().unchecked_ref())?;
+    drag_start.forget();
+
+    let over_swatch = swatch.clone();
+    let drag_over = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.prevent_default();
+        event.stop_propagation();
+        if let Err(error) = over_swatch.class_list().add_1("color-drag-over") {
+            log_error(&error);
+        }
+        if let Some(data_transfer) = event.data_transfer() {
+            data_transfer.set_drop_effect("copy");
+        }
+    });
+    swatch.add_event_listener_with_callback("dragover", drag_over.as_ref().unchecked_ref())?;
+    drag_over.forget();
+
+    let leave_swatch = swatch.clone();
+    let drag_leave = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.stop_propagation();
+        if let Err(error) = leave_swatch.class_list().remove_1("color-drag-over") {
+            log_error(&error);
+        }
+    });
+    swatch.add_event_listener_with_callback("dragleave", drag_leave.as_ref().unchecked_ref())?;
+    drag_leave.forget();
+
+    let drop_document = document.clone();
+    let drop_state = Rc::clone(&state);
+    let drop_swatch = swatch.clone();
+    let drop = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.prevent_default();
+        event.stop_propagation();
+        if let Err(error) = drop_swatch.class_list().remove_1("color-drag-over") {
+            log_error(&error);
+        }
+
+        let dropped_color = event
+            .data_transfer()
+            .and_then(|transfer| transfer.get_data("text/plain").ok())
+            .and_then(|value| normalize_css_hex_color(&value))
+            .or_else(|| {
+                drop_state
+                    .borrow()
+                    .dragging_custom_color
+                    .as_ref()
+                    .map(|(_, color)| color.clone())
+            });
+        let Some(color) = dropped_color else {
+            return;
+        };
+
+        if let Err(error) =
+            sync_custom_color_override(&drop_document, Rc::clone(&drop_state), index, Some(color))
+        {
+            log_error(&error);
+        }
+    });
+    swatch.add_event_listener_with_callback("drop", drop.as_ref().unchecked_ref())?;
+    drop.forget();
+
+    let end_state = Rc::clone(&state);
+    let end_swatch = swatch.clone();
+    let drag_end = Closure::<dyn FnMut(DragEvent)>::new(move |event: DragEvent| {
+        event.stop_propagation();
+        end_state.borrow_mut().dragging_custom_color = None;
+        if let Err(error) = end_swatch.class_list().remove_1("color-drag-over") {
+            log_error(&error);
+        }
+    });
+    swatch.add_event_listener_with_callback("dragend", drag_end.as_ref().unchecked_ref())?;
+    drag_end.forget();
+
+    let mouse_down_state = Rc::clone(&state);
+    let mouse_down_color = display_color.clone();
+    let mouse_down = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        event.stop_propagation();
+        mouse_down_state.borrow_mut().dragging_custom_color =
+            Some((index, mouse_down_color.clone()));
+    });
+    swatch.add_event_listener_with_callback("mousedown", mouse_down.as_ref().unchecked_ref())?;
+    mouse_down.forget();
+
+    let mouse_up_document = document.clone();
+    let mouse_up_state = Rc::clone(&state);
+    let mouse_up = Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
+        event.stop_propagation();
+        let dragged = mouse_up_state.borrow_mut().dragging_custom_color.take();
+        let Some((from, color)) = dragged else {
+            return;
+        };
+        if from == index {
+            return;
+        }
+        mouse_up_state.borrow_mut().suppress_color_click_until_ms = js_sys::Date::now() + 100.0;
+        if let Err(error) = sync_custom_color_override(
+            &mouse_up_document,
+            Rc::clone(&mouse_up_state),
+            index,
+            Some(color),
+        ) {
+            log_error(&error);
+        }
+    });
+    swatch.add_event_listener_with_callback("mouseup", mouse_up.as_ref().unchecked_ref())?;
+    mouse_up.forget();
+
+    let click_document = document;
+    let click_state = state;
+    let click = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+        event.stop_propagation();
+        {
+            let mut state = click_state.borrow_mut();
+            if js_sys::Date::now() <= state.suppress_color_click_until_ms {
+                state.suppress_color_click_until_ms = 0.0;
+                return;
+            };
+            state.suppress_color_click_until_ms = 0.0;
+        }
+
+        if let Err(error) =
+            sync_custom_color_override(&click_document, Rc::clone(&click_state), index, None)
+        {
+            log_error(&error);
+        }
+    });
+    swatch.add_event_listener_with_callback("click", click.as_ref().unchecked_ref())?;
+    click.forget();
 
     Ok(())
 }
@@ -2662,7 +2869,8 @@ fn radius_increase_can_update_worker(current: &EngineSettings, next: &EngineSett
         && current.proactive_attacking == next.proactive_attacking
         && current.enemy_mode == next.enemy_mode
         && current.army_preset == next.army_preset
-        && current.custom_army == next.custom_army
+        && custom_army_moves_match(&current.custom_army, &next.custom_army)
+        && !custom_color_group_change_affects_generation(current, next)
         && current.continuous_offset == next.continuous_offset
         && current.prime_modulo_divisor == next.prime_modulo_divisor
 }
@@ -2789,7 +2997,7 @@ fn resolve_sync_action(
     previous: &EngineSettings,
     next: &EngineSettings,
 ) -> SyncAction {
-    match action {
+    let resolved = match action {
         SyncAction::AutoControl(id) if id == "shape-select" => SyncAction::RenderOnly,
         SyncAction::AutoControl(id) if id == "radius-input" => SyncAction::DebounceRadius,
         SyncAction::AutoControl(id) if id == "piece-radius-slider" => {
@@ -2802,6 +3010,14 @@ fn resolve_sync_action(
             }
         }
         other => other,
+    };
+
+    if matches!(resolved, SyncAction::UpdateWorker)
+        && custom_color_group_change_affects_generation(previous, next)
+    {
+        SyncAction::ResetWorker
+    } else {
+        resolved
     }
 }
 
@@ -3000,11 +3216,11 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     )?;
     update_canvas_pan_class(document, settings)?;
 
-    let custom_display = if settings.army_preset == ArmyPreset::CustomFinite {
-        "grid"
-    } else {
-        "none"
-    };
+    let custom_selected = settings.army_preset == ArmyPreset::CustomFinite;
+    html_element(document, "preset-move-row")?
+        .class_list()
+        .toggle_with_force("custom-finite", custom_selected)?;
+    let custom_display = if custom_selected { "grid" } else { "none" };
     html_element(document, "custom-army-editor")?
         .style()
         .set_property("display", custom_display)?;
@@ -3022,14 +3238,13 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
                 "none"
             },
         )?;
-    button(document, "add-piece-button")?
-        .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
-    button(document, "random-piece-button")?
-        .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
-    input(document, "random-count-input")?
-        .set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
+    input(document, "piece-a-input")?.set_disabled(!custom_selected);
+    input(document, "piece-b-input")?.set_disabled(!custom_selected);
+    button(document, "add-piece-button")?.set_disabled(!custom_selected);
+    button(document, "random-piece-button")?.set_disabled(!custom_selected);
+    input(document, "random-count-input")?.set_disabled(!custom_selected);
     let random_pool_toggle = button(document, "random-pool-toggle-button")?;
-    random_pool_toggle.set_disabled(settings.army_preset != ArmyPreset::CustomFinite);
+    random_pool_toggle.set_disabled(!custom_selected);
     let random_pool_editing = document
         .get_element_by_id("army-list")
         .and_then(|list| list.get_attribute("data-random-pool-editing"))
@@ -3275,8 +3490,19 @@ fn stats_text(settings: &EngineSettings, stats: EngineStats) -> String {
 
 fn normalize_custom_army(army: Vec<CustomPiece>) -> Vec<CustomPiece> {
     army.into_iter()
-        .map(|piece| CustomPiece::with_auto_color(piece.a, piece.b))
+        .map(|piece| {
+            let mut normalized = CustomPiece::with_auto_color(piece.a, piece.b);
+            normalized.color_override = piece
+                .color_override
+                .as_deref()
+                .and_then(normalize_css_hex_color);
+            normalized
+        })
         .collect()
+}
+
+fn normalize_css_hex_color(value: &str) -> Option<String> {
+    parse_hex_rgb(value).map(|color| color.to_css_hex())
 }
 
 fn default_random_pool() -> Vec<RandomPoolPiece> {
