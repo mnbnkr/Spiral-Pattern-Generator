@@ -25,8 +25,19 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install Trunk
-        working-directory: ${{ runner.temp }}
-        run: cargo install trunk --version 0.21.14
+        env:
+          TRUNK_VERSION: 0.21.14
+          TRUNK_SHA256: f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz" \
+            -o trunk.tar.gz
+          echo "${TRUNK_SHA256}  trunk.tar.gz" | sha256sum -c -
+          tar -xzf trunk.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          install -m 0755 trunk "$HOME/.local/bin/trunk"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/trunk" --version
       - name: Check formatting
         run: cargo fmt --check
       - name: Run Rust tests
