@@ -233,22 +233,6 @@
 
         <section class="control-section">
           <div class="two-column-row separated-row search-enemy-row">
-            <label for="placement-search-select"
-              ><span class="label-row"
-                >Placement Search
-                <span
-                  class="info-icon"
-                  tabindex="0"
-                  data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
-                  >i</span
-                ></span
-              >
-              <select id="placement-search-select">
-                <option value="SpiralPath" selected>Spiral Path</option>
-                <option value="CenterDistance">Center Distance</option>
-              </select>
-            </label>
-
             <label for="enemy-mode-select"
               ><span class="label-row"
                 >Ally / Enemy Condition
@@ -263,6 +247,22 @@
                 <option value="AttackSet">Attack-set</option>
                 <option value="Color" selected>Color</option>
                 <option value="ColorAttackSet">Color-Attack-set</option>
+              </select>
+            </label>
+
+            <label for="placement-search-select"
+              ><span class="label-row"
+                >Placement Search
+                <span
+                  class="info-icon"
+                  tabindex="0"
+                  data-tip="Spiral Path follows the current path position. Center Distance picks the valid spot closest to the spiral center."
+                  >i</span
+                ></span
+              >
+              <select id="placement-search-select">
+                <option value="SpiralPath" selected>Spiral Path</option>
+                <option value="CenterDistance">Center Distance</option>
               </select>
             </label>
           </div>
@@ -314,6 +314,15 @@
 
         <section class="control-section">
           <div id="preset-move-row" class="preset-move-row custom-finite">
+            <label id="piece-a-label" for="piece-a-input">
+              First Move
+              <input id="piece-a-input" type="number" step="1" value="2" />
+            </label>
+            <label id="piece-b-label" for="piece-b-input">
+              Turn Move
+              <input id="piece-b-input" type="number" step="1" value="1" />
+            </label>
+            <span id="preset-move-divider" class="row-divider" aria-hidden="true"></span>
             <label for="army-preset-select"
               ><span class="label-row"
                 >Army Preset
@@ -329,15 +338,6 @@
                 <option value="PrimeKnight">Prime Knight</option>
                 <option value="PrimeGapper">Prime Gapper</option>
               </select>
-            </label>
-            <span id="preset-move-divider" class="row-divider" aria-hidden="true"></span>
-            <label id="piece-a-label" for="piece-a-input">
-              First Move
-              <input id="piece-a-input" type="number" step="1" value="2" />
-            </label>
-            <label id="piece-b-label" for="piece-b-input">
-              Turn Move
-              <input id="piece-b-input" type="number" step="1" value="1" />
             </label>
           </div>
 
@@ -443,10 +443,11 @@
           </div>
         </section>
 
-        <section class="button-row">
+        <section class="button-row run-button-row">
           <button id="start-button" type="button">Start</button>
           <button id="pause-button" type="button">Pause</button>
           <button id="step-button" type="button">Step</button>
+          <span class="button-row-divider" aria-hidden="true"></span>
           <button id="refresh-button" type="button">Refresh</button>
         </section>
 

@@ -317,6 +317,16 @@ input[type="color"] {
   border-top: 1px solid rgb(255 255 255 / 10%);
 }
 
+.run-button-row {
+  grid-template-columns: repeat(3, minmax(0, 1fr)) 1px minmax(0, 1fr);
+}
+
+.button-row-divider {
+  width: 1px;
+  height: 36px;
+  background: rgb(255 255 255 / 12%);
+}
+
 .two-column-row,
 .anchor-row,
 .inline-setting-row,
@@ -530,18 +540,13 @@ input[type="color"] {
 }
 
 .preset-move-row {
-  grid-template-columns: minmax(150px, 1fr) 1px minmax(82px, 0.58fr) minmax(82px, 0.58fr);
+  grid-template-columns: minmax(82px, 0.58fr) minmax(82px, 0.58fr) 1px minmax(150px, 1fr);
   align-items: end;
 }
 
-.preset-move-row:not(.custom-finite) {
-  grid-template-columns: minmax(0, 190px);
-}
-
-.preset-move-row:not(.custom-finite) #preset-move-divider,
 .preset-move-row:not(.custom-finite) #piece-a-label,
 .preset-move-row:not(.custom-finite) #piece-b-label {
-  display: none;
+  color: #7f8994;
 }
 
 #piece-a-label,
@@ -688,7 +693,7 @@ input[type="color"] {
   .radius-settings-row,
   .search-enemy-row,
   .attack-offset-row,
-  .preset-move-row.custom-finite {
+  .preset-move-row {
     grid-template-columns: 1fr;
   }
 

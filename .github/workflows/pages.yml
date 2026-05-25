@@ -28,7 +28,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Trunk
-        run: cargo install trunk --locked --version 0.21.14
+        working-directory: ${{ runner.temp }}
+        run: cargo install trunk --version 0.21.14
 
       - name: Build static assets
         run: |

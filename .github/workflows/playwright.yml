@@ -11,13 +11,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 11
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-          cache: "pnpm"
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.2 --activate
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.96.0-beta.9
@@ -25,7 +25,8 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install Trunk
-        run: cargo install trunk --locked --version 0.21.14
+        working-directory: ${{ runner.temp }}
+        run: cargo install trunk --version 0.21.14
       - name: Check formatting
         run: cargo fmt --check
       - name: Run Rust tests
@@ -35,7 +36,7 @@ jobs:
       - name: Run WASM clippy
         run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
       - name: Install Playwright Browsers
         run: pnpm exec playwright install --with-deps
       - name: Build Web App

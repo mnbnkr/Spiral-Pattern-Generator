@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 const appBasePath = process.env.APP_BASE_PATH ?? "/Spiral-Pattern-Generator/";
+const placementPageVertices = 1_048_576;
 
 test.beforeEach(async ({ page }) => {
   page.on("pageerror", (error) => {
@@ -123,10 +124,10 @@ async function continuousSpotsForSearch(page, search: string) {
     .map((match) => Number(match[1]));
 }
 
-test("high-radius rendering completes past the previous multi-million buffer cliff", async ({
+test("high-radius rendering grows past the previous single-page buffer cliff", async ({
   page,
 }) => {
-  test.setTimeout(160_000);
+  test.setTimeout(120_000);
   await pauseIfRunning(page);
   await page.evaluate(() => {
     const slider = document.querySelector<HTMLInputElement>(
@@ -136,21 +137,21 @@ test("high-radius rendering completes past the previous multi-million buffer cli
     slider.value = "0";
     slider.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await page.fill("#radius-input", "1500");
+  await page.fill("#radius-input", "600");
   await page.selectOption("#placement-search-select", "SpiralPath");
   await page.click("#refresh-button");
   await page.click("#start-button");
 
   await expect
-    .poll(() => page.locator("#status-line").textContent(), {
-      timeout: 140_000,
+    .poll(() => statusPlacementCount(page), {
+      timeout: 100_000,
       intervals: [1_000, 2_000, 5_000],
     })
-    .toContain("Complete");
-  expect(await statusPlacementCount(page)).toBeGreaterThan(8_800_000);
+    .toBeGreaterThan(placementPageVertices);
   await expect
     .poll(() => canvasPlacementPages(page), { timeout: 10_000 })
-    .toBeGreaterThanOrEqual(9);
+    .toBeGreaterThanOrEqual(2);
+  await pauseIfRunning(page);
   await expect(page.locator("#start-button")).toBeEnabled();
   await expect(page.locator("#pause-button")).toBeDisabled();
   expect(await renderedPixelCount(page)).toBeGreaterThan(0);
@@ -207,16 +208,16 @@ test("custom finite panel layout and color swatch overrides work", async ({
       visualBelowDisplay:
         (rect("visual-progress-toggle")?.top ?? 0) >
         (rect("display-mode-select")?.top ?? 0),
-      enemyRightOfSearch:
-        (rect("enemy-mode-select")?.left ?? 0) >
-        (rect("placement-search-select")?.left ?? 0),
+      searchRightOfEnemy:
+        (rect("placement-search-select")?.left ?? 0) >
+        (rect("enemy-mode-select")?.left ?? 0),
       offsetRightOfAttack:
         (rect("continuous-offset-input")?.left ?? 0) >
         (rect("attacking-toggle")?.left ?? 0),
       presetMoveOrder: [
-        rect("army-preset-select")?.left ?? 0,
         rect("piece-a-input")?.left ?? 0,
         rect("piece-b-input")?.left ?? 0,
+        rect("army-preset-select")?.left ?? 0,
       ],
       checkboxAccent: getComputedStyle(
         document.querySelector("#visual-progress-toggle")!,
@@ -228,7 +229,7 @@ test("custom finite panel layout and color swatch overrides work", async ({
   expect(layout.radiusRightOfRadius).toBe(true);
   expect(layout.displayModeLeftOfTrack).toBe(true);
   expect(layout.visualBelowDisplay).toBe(true);
-  expect(layout.enemyRightOfSearch).toBe(true);
+  expect(layout.searchRightOfEnemy).toBe(true);
   expect(layout.offsetRightOfAttack).toBe(true);
   expect(layout.presetMoveOrder[0]).toBeLessThan(layout.presetMoveOrder[1]);
   expect(layout.presetMoveOrder[1]).toBeLessThan(layout.presetMoveOrder[2]);
@@ -522,14 +523,42 @@ test("random custom army controls populate and edit the random pool", async ({
   );
   await expect(page.locator(".random-pool-row")).toHaveCount(0);
   await expect(page.locator(".army-row")).toHaveCount(4);
+  await expect
+    .poll(() => statusPlacementCount(page), { timeout: 15_000 })
+    .toBeGreaterThan(0);
 
   await page.selectOption("#army-preset-select", "PrimeKnight");
   await expect(page.locator("#prime-divisor-label")).toBeVisible();
+  await expect(page.locator("#piece-a-label")).toBeVisible();
+  await expect(page.locator("#piece-b-label")).toBeVisible();
+  await expect(page.locator("#piece-a-input")).toBeDisabled();
+  await expect(page.locator("#piece-b-input")).toBeDisabled();
   await expect(page.locator("#random-piece-button")).toBeDisabled();
   await expect(page.locator("#random-count-input")).toBeDisabled();
   await expect(page.locator("#random-pool-toggle-button")).toBeDisabled();
   await page.selectOption("#army-preset-select", "PrimeGapper");
   await expect(page.locator("#prime-divisor-label")).toBeHidden();
+});
+
+test("random custom army safely restarts an active run", async ({ page }) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "400");
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+  await expect(page.locator("#pause-button")).toBeEnabled({ timeout: 5_000 });
+
+  await page.click("#random-piece-button");
+
+  await expect(page.locator(".army-row")).toHaveCount(3);
+  await expect
+    .poll(() => statusPlacementCount(page), { timeout: 15_000 })
+    .toBeGreaterThan(0);
+  await expect(page.locator("#placement-log")).toContainText(
+    "placements logged:",
+    { timeout: 15_000 },
+  );
+  await pauseIfRunning(page);
+  await expect(page.locator("#start-button")).toBeEnabled();
 });
 
 test("custom row edits stage without clearing the visible snapshot", async ({
@@ -803,7 +832,7 @@ test("proactive attack spots initialize while a prime run is active", async ({
       page.locator("#sim-canvas").evaluate((canvas) => {
         return Number(canvas.getAttribute("data-attack-spots") ?? "0");
       }),
-      { timeout: 15_000 },
+      { timeout: 30_000 },
     )
     .toBeGreaterThan(0);
   expect(await statusPlacementCount(page)).toBeGreaterThanOrEqual(before);

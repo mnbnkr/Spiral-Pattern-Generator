@@ -310,7 +310,8 @@ fn install_worker_handler_on(
                     if let Err(error) = update_renderer_snapshot(&mut state) {
                         log_error(&error);
                     }
-                    if should_refresh_worker_ui(&mut state, exhausted) {
+                    let force_ui_refresh = exhausted || !state.running;
+                    if should_refresh_worker_ui(&mut state, force_ui_refresh) {
                         if let Err(error) = refresh_placement_log(&state) {
                             log_error(&error);
                         }
@@ -829,29 +830,6 @@ fn request_attack_overlay_chunk(state: Rc<RefCell<AppState>>) -> Result<(), JsVa
     )
 }
 
-fn schedule_step_batch(worker: Worker, epoch: u64) -> Result<(), JsValue> {
-    let closure = Closure::<dyn FnMut()>::new(move || {
-        if let Err(error) = send_to_worker(
-            &worker,
-            &AppToWorker::StepBatch {
-                epoch,
-                max_steps: 1,
-            },
-        ) {
-            log_error(&error);
-        }
-    });
-
-    web_sys::window()
-        .ok_or_else(|| JsValue::from_str("window unavailable"))?
-        .set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            500,
-        )?;
-    closure.forget();
-    Ok(())
-}
-
 fn run_delay_ms(speed: &SpeedMode) -> i32 {
     match speed {
         SpeedMode::Fastest => 0,
@@ -1085,26 +1063,7 @@ fn install_control_handlers(
     install_random_pool_toggle_handler(document, Rc::clone(&state))?;
     install_button(document, "start-button", Rc::clone(&state), |state| {
         let document = current_document()?;
-        sync_state_from_controls(&document, state, true)?;
-        commit_pending_radius_change(state, &document, false, true)?;
-        if state.running {
-            return Ok(());
-        }
-        prepare_new_generation_if_staged(state, &document)?;
-        state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
-        state.running = true;
-        state.has_run = true;
-        update_run_buttons(&document, state.running)?;
-        set_status(&running_status_text(&state.settings))?;
-        if !state.worker_ready {
-            state.start_after_worker_ready = true;
-            state.step_after_worker_ready = None;
-            return Ok(());
-        }
-        ensure_worker_initialized(state)?;
-        let epoch = state.worker_epoch;
-        send_to_worker(&state.worker, &AppToWorker::Start { epoch })?;
-        send_to_worker(&state.worker, &AppToWorker::RunTick { epoch })
+        start_generation_from_controls(state, &document)
     })?;
     install_button(document, "pause-button", Rc::clone(&state), |state| {
         let document = current_document()?;
@@ -1144,7 +1103,17 @@ fn install_control_handlers(
             let settings = state.settings.clone();
             reset_worker_with_settings(state, &document, settings, false, true)?;
             set_status("Stepping")?;
-            return schedule_step_batch(state.worker.clone(), state.worker_epoch);
+            if !state.worker_ready {
+                state.step_after_worker_ready = Some(1);
+                return Ok(());
+            }
+            return send_to_worker(
+                &state.worker,
+                &AppToWorker::StepBatch {
+                    epoch: state.worker_epoch,
+                    max_steps: 1,
+                },
+            );
         }
         set_status("Stepping")?;
         send_to_worker(
@@ -1592,6 +1561,15 @@ fn install_random_piece_handler(
             previous_settings,
             false,
         ) {
+            log_error(&error);
+            return;
+        }
+
+        let start_result = {
+            let mut state = state.borrow_mut();
+            start_generation_from_controls(&mut state, &document)
+        };
+        if let Err(error) = start_result {
             log_error(&error);
         }
     });
@@ -3387,6 +3365,32 @@ fn update_run_buttons(document: &Document, running: bool) -> Result<(), JsValue>
     button(document, "pause-button")?.set_disabled(!running);
     button(document, "step-button")?.set_disabled(running);
     Ok(())
+}
+
+fn start_generation_from_controls(
+    state: &mut AppState,
+    document: &Document,
+) -> Result<(), JsValue> {
+    sync_state_from_controls(document, state, true)?;
+    commit_pending_radius_change(state, document, false, true)?;
+    if state.running {
+        return Ok(());
+    }
+    prepare_new_generation_if_staged(state, document)?;
+    state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
+    state.running = true;
+    state.has_run = true;
+    update_run_buttons(document, state.running)?;
+    set_status(&running_status_text(&state.settings))?;
+    if !state.worker_ready {
+        state.start_after_worker_ready = true;
+        state.step_after_worker_ready = None;
+        return Ok(());
+    }
+    ensure_worker_initialized(state)?;
+    let epoch = state.worker_epoch;
+    send_to_worker(&state.worker, &AppToWorker::Start { epoch })?;
+    send_to_worker(&state.worker, &AppToWorker::RunTick { epoch })
 }
 
 fn prepare_new_generation_if_staged(
