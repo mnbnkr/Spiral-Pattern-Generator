@@ -67,6 +67,50 @@ async function renderedPixelCount(page) {
   });
 }
 
+async function canvasViewportMetrics(page) {
+  return page.locator("#sim-canvas").evaluate((canvas) => {
+    const source = canvas as HTMLCanvasElement;
+    const rect = source.getBoundingClientRect();
+    return {
+      cssWidth: rect.width,
+      cssHeight: rect.height,
+      backingWidth: source.width,
+      backingHeight: source.height,
+      inlineWidth: source.style.width,
+      inlineHeight: source.style.height,
+      dpr: window.devicePixelRatio,
+    };
+  });
+}
+
+async function expectCanvasViewport(page, width: number, height: number) {
+  await expect
+    .poll(async () => {
+      const metrics = await canvasViewportMetrics(page);
+      return (
+        Math.abs(metrics.cssWidth - width) <= 1 &&
+        Math.abs(metrics.cssHeight - height) <= 1 &&
+        metrics.inlineWidth === "" &&
+        metrics.inlineHeight === ""
+      );
+    })
+    .toBe(true);
+
+  const metrics = await canvasViewportMetrics(page);
+  expect(metrics.backingWidth).toBeGreaterThanOrEqual(
+    Math.floor(metrics.cssWidth * metrics.dpr) - 1,
+  );
+  expect(metrics.backingWidth).toBeLessThanOrEqual(
+    Math.ceil(metrics.cssWidth * metrics.dpr) + 1,
+  );
+  expect(metrics.backingHeight).toBeGreaterThanOrEqual(
+    Math.floor(metrics.cssHeight * metrics.dpr) - 1,
+  );
+  expect(metrics.backingHeight).toBeLessThanOrEqual(
+    Math.ceil(metrics.cssHeight * metrics.dpr) + 1,
+  );
+}
+
 async function statusPlacementCount(page) {
   const text = await page.locator("#status-line").textContent();
   const match = text?.match(/(\d+) placements/);
@@ -175,6 +219,10 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect(page.locator("#track-opacity-output")).toHaveText("10%");
   await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
   await expect(page.locator("#download-jpeg-button")).toHaveText("Half JPEG");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-webgl-context",
+    "webgl2",
+  );
   await page.waitForFunction(
     () => {
       const text = document.querySelector("#status-line")?.textContent ?? "";
@@ -187,6 +235,41 @@ test("default simulation auto-runs", async ({ page }) => {
     .poll(() => renderedPixelCount(page), { timeout: 10_000 })
     .toBeGreaterThan(0);
   await pauseIfRunning(page);
+});
+
+test("mobile viewport rendering stays nonblank and uses device pixels", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.reload();
+  await expect(page.locator("#status-line")).toContainText("placements", {
+    timeout: 15_000,
+  });
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+
+  await expectCanvasViewport(page, 390, 844);
+  await pauseIfRunning(page);
+});
+
+test("canvas remains viewport-sized and nonblank after browser resize", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expectCanvasViewport(page, 1280, 720);
+
+  await page.setViewportSize({ width: 640, height: 540 });
+  await expectCanvasViewport(page, 640, 540);
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+
+  await page.setViewportSize({ width: 1120, height: 680 });
+  await expectCanvasViewport(page, 1120, 680);
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
 });
 
 test("custom finite panel layout and color swatch overrides work", async ({
@@ -222,6 +305,10 @@ test("custom finite panel layout and color swatch overrides work", async ({
       checkboxAccent: getComputedStyle(
         document.querySelector("#visual-progress-toggle")!,
       ).accentColor,
+      addRandomDividerWidth: document
+        .querySelector(".piece-action-divider")
+        ? getComputedStyle(document.querySelector(".piece-action-divider")!).width
+        : "",
     };
   });
 
@@ -234,11 +321,64 @@ test("custom finite panel layout and color swatch overrides work", async ({
   expect(layout.presetMoveOrder[0]).toBeLessThan(layout.presetMoveOrder[1]);
   expect(layout.presetMoveOrder[1]).toBeLessThan(layout.presetMoveOrder[2]);
   expect(layout.checkboxAccent).toBe("rgb(85, 167, 255)");
+  expect(layout.addRandomDividerWidth).toBe("1px");
   await expect(page.locator('label[for="army-preset-select"] .label-row')).toContainText(
     "Army Preset",
   );
   await expect(page.locator("#piece-a-label")).toContainText("First Move");
   await expect(page.locator("#piece-b-label")).toContainText("Turn Move");
+
+  await expect(page.locator(".army-row").first().locator(".army-piece-move")).toHaveText(
+    "(2, 1)",
+  );
+  await expect(page.locator(".army-row").first().locator(".army-piece-name")).toHaveText(
+    "Knight",
+  );
+  const armyLabelWeights = await page.locator(".army-row").first().evaluate((row) => ({
+    move: getComputedStyle(row.querySelector(".army-piece-move")!).fontWeight,
+    name: getComputedStyle(row.querySelector(".army-piece-name")!).fontWeight,
+    swatchCursor: getComputedStyle(row.querySelector(".army-swatch")!).cursor,
+  }));
+  expect(Number(armyLabelWeights.move)).toBeGreaterThan(600);
+  expect(Number(armyLabelWeights.name)).toBeLessThan(600);
+  expect(armyLabelWeights.swatchCursor).toBe("grab");
+
+  const rowBeforeHover = await page
+    .locator(".army-row")
+    .first()
+    .evaluate((row) => getComputedStyle(row).backgroundColor);
+  await page.locator(".army-row").first().hover();
+  await page.waitForTimeout(180);
+  const rowAfterHover = await page
+    .locator(".army-row")
+    .first()
+    .evaluate((row) => getComputedStyle(row).backgroundColor);
+  expect(rowAfterHover).not.toBe(rowBeforeHover);
+
+  const firstColor = await page
+    .locator(".army-swatch")
+    .first()
+    .evaluate((swatch) => getComputedStyle(swatch).backgroundColor);
+  await page.locator(".army-swatch").first().click();
+  const clicked = await page.locator(".army-swatch").evaluateAll((swatches) =>
+    swatches.map((swatch) => ({
+      color: getComputedStyle(swatch).backgroundColor,
+      override: swatch.classList.contains("custom-color-override"),
+      borderWidth: getComputedStyle(swatch).borderTopWidth,
+    })),
+  );
+  expect(clicked[0]).toEqual({
+    color: firstColor,
+    override: true,
+    borderWidth: "2px",
+  });
+  await page.locator(".army-swatch").first().click();
+  const reset = await page.locator(".army-swatch").first().evaluate((swatch) => ({
+    color: getComputedStyle(swatch).backgroundColor,
+    override: swatch.classList.contains("custom-color-override"),
+  }));
+  expect(reset.override).toBe(false);
+  expect(reset.color).toBe(firstColor);
 
   await page.locator(".army-swatch").first().dragTo(page.locator(".army-swatch").nth(1));
   const copied = await page.locator(".army-swatch").evaluateAll((swatches) =>
@@ -249,20 +389,29 @@ test("custom finite panel layout and color swatch overrides work", async ({
   );
   expect(copied[1]).toEqual({ color: copied[0].color, override: true });
 
-  await page.locator(".army-swatch").nth(1).click();
-  const reset = await page.locator(".army-swatch").evaluateAll((swatches) =>
-    swatches.map((swatch) => ({
-      color: getComputedStyle(swatch).backgroundColor,
-      override: swatch.classList.contains("custom-color-override"),
-    })),
-  );
-  expect(reset[1].override).toBe(false);
-  expect(reset[1].color).not.toBe(reset[0].color);
+  const tooltip = page.locator(".global-tooltip");
+  await page.locator("#add-piece-button .info-icon").hover();
+  await expect(tooltip).toBeHidden();
+  await page.waitForTimeout(200);
+  await expect(tooltip).toBeHidden();
+  await page.waitForTimeout(250);
+  await expect(tooltip).toBeVisible();
+  await page.mouse.move(10, 10);
+  await expect(tooltip).toBeHidden();
 
   await page.locator("#random-pool-toggle-button").click();
   await expect(page.locator(".random-pool-row").first()).toContainText(
     "(2, 1) Knight",
   );
+  const poolLabelWeights = await page
+    .locator(".random-pool-row")
+    .first()
+    .evaluate((row) => ({
+      move: getComputedStyle(row.querySelector(".pool-piece-move")!).fontWeight,
+      name: getComputedStyle(row.querySelector(".pool-piece-name")!).fontWeight,
+    }));
+  expect(Number(poolLabelWeights.move)).toBeGreaterThan(600);
+  expect(Number(poolLabelWeights.name)).toBeLessThan(600);
 });
 
 test("radius border renders with track off and subpath-loaded app is nonblank", async ({
@@ -513,7 +662,7 @@ test("random custom army controls populate and edit the random pool", async ({
   await page.fill("#piece-b-input", "4");
   await page.click("#add-piece-button");
   await expect(page.locator(".random-pool-row")).toHaveCount(12);
-  await expect(page.locator("#army-list")).toContainText("Custom (7, 4)");
+  await expect(page.locator("#army-list")).toContainText("(7, 4) Custom");
 
   await page.fill("#random-count-input", "4");
   await page.click("#random-piece-button");
@@ -642,6 +791,7 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
       }),
     )
     .not.toBe("grab");
+  await expect(page.locator("#zoom-row")).toBeHidden();
 
   await page.mouse.move(500, 360);
   await page.mouse.wheel(0, -120);
@@ -651,6 +801,7 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
   );
   await expect(page.locator("#zoom-slider")).toHaveValue("2");
   await expect(page.locator("#zoom-output")).toHaveText("x2");
+  await expect(page.locator("#zoom-row")).toBeVisible();
   await page.selectOption("#display-mode-select", "PixelOneToOne");
   await expect
     .poll(() =>

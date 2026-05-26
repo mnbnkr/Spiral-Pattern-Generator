@@ -4,7 +4,7 @@ This file is the source of truth for the app's behavior, math, architecture, UI 
 
 ## Project Shape
 
-Spiral Pattern Generator is a deterministic Rust/WASM simulation app. It places pieces on spiral-ordered boards under passive and optional proactive attack rules, renders the result with WebGL point sprites on one HTML5 canvas, and keeps simulation work in a Web Worker.
+Spiral Pattern Generator is a deterministic Rust/WASM simulation app. It places pieces on spiral-ordered boards under passive and optional proactive attack rules, renders the result with WebGL 2 point sprites on one HTML5 canvas, and keeps simulation work in a Web Worker.
 
 Required stack:
 
@@ -23,7 +23,7 @@ Do not introduce React, Yew, npm build tooling, or a heavy UI framework. Playwri
 - `src/ui`: direct DOM control binding, worker lifecycle, status text, placement log, and downloads.
 - `src/engine`: deterministic simulation state machines and spatial indexes.
 - `src/math`: board spirals, continuous geometry, root solving, and collision predicates.
-- `src/render`: WebGL point-sprite renderer and deterministic image export.
+- `src/render`: WebGL 2 point-sprite renderer and deterministic image export.
 - `src/render_data.rs`: worker-side packing of `[x, y, r, g, b]` vertices.
 - `src/protocol.rs`: typed `serde` contracts for main-thread/worker messages.
 
@@ -214,9 +214,9 @@ Fit Screen maps the requested radius and board-specific bounds to the viewport. 
 
 ## Rendering
 
-Pieces render on one HTML5 canvas through WebGL point sprites. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
+Pieces render on one responsive HTML5 canvas through WebGL 2 point sprites. The canvas CSS size stays viewport-driven, including dynamic mobile viewport units where supported, while the backing store is resized from the measured CSS bounds and current device pixel ratio. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
 
-Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`. Placement vertices are stored in fixed-size CPU/WebGL pages so large radius runs do not hit a single-buffer reallocation cliff; image export flattens those pages only when an export is requested.
+Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`, with derivative-based edge coverage to reduce zoomed-out and high-DPI/mobile aliasing. Placement vertices are stored in fixed-size CPU/WebGL pages so large radius runs do not hit a single-buffer reallocation cliff; image export flattens those pages only when an export is requested.
 
 Render shapes:
 
@@ -240,7 +240,7 @@ Board view/export bounds are board-specific:
 - Hex uses its wider axial x extent and y extent, so side corners are visible and pannable.
 - Triangle uses its asymmetric shell bounds, so Fit Screen and exports do not leave excessive empty space below.
 
-In `Free Camera`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Camera and applies the wheel zoom around the cursor. The canvas shows pan cursors and accepts left-drag panning whenever Free Camera is active, including `x1`.
+In `Free Camera`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Camera, shows the Zoom slider, and applies the wheel zoom around the cursor. Mouse coordinates are mapped through the current canvas CSS rectangle and backing-store ratio so panning and wheel zoom remain accurate after browser resizes and on high-DPI displays. The canvas shows pan cursors and accepts left-drag panning whenever Free Camera is active, including `x1`.
 
 ## Image And Log Export
 
@@ -308,9 +308,9 @@ Per-second Speed mode schedules worker ticks from the selected rate. `1/s` means
 
 Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highlighted while editing. On blur, invalid text is restored to the last valid value; an empty invalid field becomes `0`.
 
-Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path. Custom row color swatches can be dragged onto another row's swatch to copy the visible color; clicking a swatch resets that row to its automatic order color. Copied colors do not change the automatic row color key, row order, or row cursor, but they do change the effective color identity used by `Color` and `Color-Attack-set` enemy checks. Rows with the same effective visible color are allies for color-based enemy checks. If a copied color changes that identity relationship, the edit stages a fresh generation instead of continuing the old mathematically inconsistent run.
+Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path. Custom row color swatches can be dragged onto another row's swatch to copy the visible color; clicking an automatic swatch fixes that row's currently visible color as a semi-permanent override, and clicking a fixed swatch again resets it to the automatic order color. Fixed swatches use a stronger visible border. Copied or clicked colors do not change the automatic row color key, row order, or row cursor, but they do change the effective color identity used by `Color` and `Color-Attack-set` enemy checks. Rows with the same effective visible color are allies for color-based enemy checks. If a visible color override changes that identity relationship, the edit stages a fresh generation instead of continuing the old mathematically inconsistent run.
 
-Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, populates the custom army from a session-local random pool, and immediately starts the new generation through the same guarded worker-start path as the Start button. `First Move`, `Turn Move`, and `Army Preset` are shown on one compact row, with a divider before the preset control. The move fields remain visible but disabled and visually muted when a prime preset is selected because they only apply to Custom Finite. A vertical divider separates Add from Random, and another divider separates Step from Refresh. The Add/Random labels include info capsules describing the move fields, row dragging, color dragging, random count, and pool editor. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show moves and names on one line, such as `(2, 1) Knight`, but no order color swatches. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
+Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, populates the custom army from a session-local random pool, and immediately starts the new generation through the same guarded worker-start path as the Start button. `First Move`, `Turn Move`, and `Army Preset` are shown on one compact row, with a divider before the preset control. The move fields remain visible but disabled and visually muted when a prime preset is selected because they only apply to Custom Finite. A standard vertical divider separates Add from Random, and another divider separates Step from Refresh. The Add/Random labels include info capsules describing the move fields, row dragging, color dragging, random count, and pool editor; info capsules appear after a short hover/focus delay. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show bold moves and non-bold names on one line, such as `(2, 1) Knight`, but no order color swatches. Unknown pieces added to the pool are named `Custom` without repeating their coordinates. Active custom army rows show the row index, bold move coordinates, and a non-bold default-pool name when the coordinates match a default pool entry. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
 
 The Prime Knight `Modulo Divisor (colors)` control is hidden for Custom Finite and Prime Gapper. Color anchors remain available because custom rows and prime color gradients use them.
 
@@ -342,7 +342,7 @@ trunk serve --port 8080
 pnpm exec playwright test --project=chromium
 ```
 
-GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install the official Trunk `0.21.14` Linux release binary with a pinned SHA-256 checksum instead of compiling Trunk through Cargo. As of May 25, 2026, `0.21.14` is the latest stable Trunk release on crates.io; `0.22.0-beta.1` is newer but is a prerelease, so CI intentionally stays on stable. Playwright CI uses Corepack-managed `pnpm@11.1.2`, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and release-mode browser tests, then uploads the HTML report from `target/playwright/report/`. Playwright serves its browser-test build from `target/playwright/dist/` so its GitHub Pages public URL does not overwrite the main local `dist/` used by `trunk serve --port 8080`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed. Cleanup can remove generated files inside `dist/`, but keep the ignored `dist/` directory itself present because Trunk canonicalizes watch-ignore paths before serving.
+GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install the official Trunk `0.21.14` Linux release binary with a pinned SHA-256 checksum instead of compiling Trunk through Cargo. As of May 25, 2026, `0.21.14` is the latest stable Trunk release on crates.io; `0.22.0-beta.1` is newer but is a prerelease, so CI intentionally stays on stable. Playwright CI uses Corepack-managed `pnpm@11.3.0`, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and release-mode browser tests, then uploads the HTML report from `target/playwright/report/`. Dependabot checks the pnpm-backed Playwright harness and GitHub Actions weekly so stable dependency and action updates do not sit stale. Playwright serves its browser-test build from `target/playwright/dist/` so its GitHub Pages public URL does not overwrite the main local `dist/` used by `trunk serve --port 8080`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed. Cleanup can remove generated files inside `dist/`, but keep the ignored `dist/` directory itself present because Trunk canonicalizes watch-ignore paths before serving.
 
 WASM-only files are guarded with `#[cfg(target_arch = "wasm32")]`. `.vscode/settings.json` sets `rust-analyzer.cargo.target = "wasm32-unknown-unknown"` so app, worker, UI, and renderer modules are analyzed as active.
 
@@ -361,7 +361,7 @@ trunk build --release
 
 For frontend or rendering changes, also run the app with Trunk and verify in a browser:
 
-- WebGL canvas rendering is visible and nonblank.
+- WebGL 2 canvas rendering is visible and nonblank.
 - The app loads from a GitHub Pages-style repository subpath, including WASM and worker assets.
 - Start/Pause remain responsive during Fastest mode.
 - Radius-bounded runs complete instead of generating outside the radius.

@@ -5,7 +5,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
     Blob, CanvasRenderingContext2d, HtmlAnchorElement, HtmlCanvasElement, ImageData, Url,
-    WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlUniformLocation,
+    WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlShader, WebGlUniformLocation,
 };
 
 use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
@@ -25,16 +25,16 @@ const MAX_BORDER_POINTS: usize = 4_096;
 const EXPORT_ENCODER_TIMEOUT_MS: i32 = 30_000;
 type ExportTick = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 
-const VERTEX_SHADER: &str = r#"
-attribute vec2 a_position;
-attribute vec3 a_color;
+const VERTEX_SHADER: &str = r#"#version 300 es
+in vec2 a_position;
+in vec3 a_color;
 
 uniform vec2 u_resolution;
 uniform float u_scale;
 uniform float u_point_size;
 uniform vec2 u_pan;
 
-varying vec3 v_color;
+out vec3 v_color;
 
 void main() {
     vec2 screen = vec2(
@@ -52,54 +52,68 @@ void main() {
 }
 "#;
 
-const FRAGMENT_SHADER: &str = r#"
-precision mediump float;
+const FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
 
 uniform int u_shape;
 uniform float u_alpha;
 uniform float u_saturation;
+uniform float u_sprite_scale;
 
-varying vec3 v_color;
+in vec3 v_color;
+
+out vec4 out_color;
+
+float coverage_from_signed_distance(float distance_to_edge) {
+    float width = max(fwidth(distance_to_edge), 0.001);
+    return 1.0 - smoothstep(0.0, width, distance_to_edge);
+}
 
 void main() {
+    float coverage = 1.0;
     if (u_shape == 1) {
-        vec2 p = gl_PointCoord * 2.0 - 1.0;
-        if (dot(p, p) > 1.0) {
-            discard;
-        }
+        vec2 p = (gl_PointCoord * 2.0 - 1.0) * u_sprite_scale;
+        vec2 q = abs(p) - vec2(1.0);
+        coverage = coverage_from_signed_distance(max(q.x, q.y));
     } else if (u_shape == 2) {
-        vec2 p = abs(gl_PointCoord * 2.0 - 1.0);
-        if (p.x > 0.8660254 || p.y > 1.0 || p.x * 0.5773503 + p.y > 1.0) {
-            discard;
-        }
+        vec2 p = gl_PointCoord * 2.0 - 1.0;
+        p *= u_sprite_scale;
+        coverage = coverage_from_signed_distance(length(p) - 1.0);
     } else if (u_shape == 3) {
-        vec2 p = 1.0 - gl_PointCoord * 2.0;
-        if (p.y < -0.5 || p.y > 1.0 || abs(p.x) > (1.0 - p.y) * 0.5773503) {
-            discard;
-        }
+        vec2 p = abs((gl_PointCoord * 2.0 - 1.0) * u_sprite_scale);
+        float edge = max(max(p.x - 0.8660254, p.y - 1.0), p.x * 0.5773503 + p.y - 1.0);
+        coverage = coverage_from_signed_distance(edge);
+    } else if (u_shape == 4) {
+        vec2 p = (1.0 - gl_PointCoord * 2.0) * u_sprite_scale;
+        float edge = max(max(-0.5 - p.y, p.y - 1.0), abs(p.x) - (1.0 - p.y) * 0.5773503);
+        coverage = coverage_from_signed_distance(edge);
+    }
+
+    if (coverage <= 0.0) {
+        discard;
     }
 
     float luminance = dot(v_color, vec3(0.2126, 0.7152, 0.0722));
     vec3 color = mix(vec3(luminance), v_color, clamp(u_saturation, 0.0, 1.0));
-    gl_FragColor = vec4(color, u_alpha);
+    out_color = vec4(color, u_alpha * coverage);
 }
 "#;
 
-const CIRCLE_VERTEX_SHADER: &str = r#"
-attribute vec2 a_position;
-attribute vec2 a_center;
-attribute float a_radius;
-attribute vec3 a_color;
+const CIRCLE_VERTEX_SHADER: &str = r#"#version 300 es
+in vec2 a_position;
+in vec2 a_center;
+in float a_radius;
+in vec3 a_color;
 
 uniform vec2 u_resolution;
 uniform float u_scale;
 uniform vec2 u_pan;
 uniform highp float u_line_width;
 
-varying highp vec2 v_position;
-varying highp vec2 v_center;
-varying highp float v_radius;
-varying vec3 v_color;
+out highp vec2 v_position;
+out highp vec2 v_center;
+out highp float v_radius;
+out vec3 v_color;
 
 void main() {
     highp vec2 world_position = a_center + a_position * (a_radius + u_line_width);
@@ -120,16 +134,18 @@ void main() {
 }
 "#;
 
-const CIRCLE_FRAGMENT_SHADER: &str = r#"
-precision mediump float;
+const CIRCLE_FRAGMENT_SHADER: &str = r#"#version 300 es
+precision highp float;
 
 uniform float u_alpha;
 uniform highp float u_line_width;
 
-varying highp vec2 v_position;
-varying highp vec2 v_center;
-varying highp float v_radius;
-varying vec3 v_color;
+in highp vec2 v_position;
+in highp vec2 v_center;
+in highp float v_radius;
+in vec3 v_color;
+
+out vec4 out_color;
 
 void main() {
     highp float delta = abs(distance(v_position, v_center) - v_radius);
@@ -138,7 +154,7 @@ void main() {
     }
 
     float coverage = 1.0 - smoothstep(u_line_width * 0.65, u_line_width, delta);
-    gl_FragColor = vec4(v_color, u_alpha * coverage);
+    out_color = vec4(v_color, u_alpha * coverage);
 }
 "#;
 
@@ -167,6 +183,7 @@ pub struct CanvasRenderer {
     shape_uniform: WebGlUniformLocation,
     alpha_uniform: WebGlUniformLocation,
     saturation_uniform: WebGlUniformLocation,
+    sprite_scale_uniform: WebGlUniformLocation,
     circle_resolution_uniform: WebGlUniformLocation,
     circle_scale_uniform: WebGlUniformLocation,
     circle_pan_uniform: WebGlUniformLocation,
@@ -212,8 +229,8 @@ impl CanvasRenderer {
             .ok_or_else(|| JsValue::from_str("canvas not found"))?
             .dyn_into::<HtmlCanvasElement>()?;
         let gl = canvas
-            .get_context("webgl")?
-            .ok_or_else(|| JsValue::from_str("webgl context unavailable"))?
+            .get_context("webgl2")?
+            .ok_or_else(|| JsValue::from_str("webgl2 context unavailable"))?
             .dyn_into::<Gl>()?;
 
         let program = link_program(
@@ -237,6 +254,7 @@ impl CanvasRenderer {
         let shape_uniform = uniform_location(&gl, &program, "u_shape")?;
         let alpha_uniform = uniform_location(&gl, &program, "u_alpha")?;
         let saturation_uniform = uniform_location(&gl, &program, "u_saturation")?;
+        let sprite_scale_uniform = uniform_location(&gl, &program, "u_sprite_scale")?;
         let circle_position_attrib = attrib_location(&gl, &circle_program, "a_position")?;
         let circle_center_attrib = attrib_location(&gl, &circle_program, "a_center")?;
         let circle_radius_attrib = attrib_location(&gl, &circle_program, "a_radius")?;
@@ -285,6 +303,7 @@ impl CanvasRenderer {
             shape_uniform,
             alpha_uniform,
             saturation_uniform,
+            sprite_scale_uniform,
             circle_resolution_uniform,
             circle_scale_uniform,
             circle_pan_uniform,
@@ -321,6 +340,9 @@ impl CanvasRenderer {
         renderer
             .canvas
             .set_attribute("data-generation-border", "visible")?;
+        renderer
+            .canvas
+            .set_attribute("data-webgl-context", "webgl2")?;
         renderer.resize_to_viewport()?;
         Ok(renderer)
     }
@@ -409,8 +431,9 @@ impl CanvasRenderer {
             return Ok(());
         }
 
-        self.pan_x += dx / scale;
-        self.pan_y -= dy / scale;
+        let (canvas_dx, canvas_dy) = self.css_delta_to_canvas_pixels(dx, dy);
+        self.pan_x += canvas_dx / scale;
+        self.pan_y -= canvas_dy / scale;
         self.clamp_pan_to_view();
         self.redraw()
     }
@@ -426,14 +449,14 @@ impl CanvasRenderer {
             return Ok(old_zoom);
         }
 
-        let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
-        let dpr = window.device_pixel_ratio();
-        let px = client_x * dpr;
-        let py = client_y * dpr;
+        let (px, py) = self.client_to_canvas_pixels(client_x, client_y);
         let width = self.canvas.width() as f64;
         let height = self.canvas.height() as f64;
         let bounds = self.view_bounds(rendered_piece_radius(&self.placement_settings));
         let old_scale = self.world_scale(width, height);
+        if old_scale <= f64::EPSILON {
+            return Ok(old_zoom);
+        }
         let world_x = (px - width * 0.5) / old_scale - (self.pan_x - bounds.center_x());
         let world_y = (height * 0.5 - py) / old_scale - (self.pan_y - bounds.center_y());
 
@@ -549,25 +572,58 @@ impl CanvasRenderer {
 
     pub fn resize_to_viewport(&mut self) -> Result<(), JsValue> {
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
-        let width = window
+        self.canvas.style().remove_property("width")?;
+        self.canvas.style().remove_property("height")?;
+        let rect = self.canvas.get_bounding_client_rect();
+        let fallback_width = window
             .inner_width()?
             .as_f64()
             .ok_or_else(|| JsValue::from_str("invalid window width"))?;
-        let height = window
+        let fallback_height = window
             .inner_height()?
             .as_f64()
             .ok_or_else(|| JsValue::from_str("invalid window height"))?;
+        let width = if rect.width().is_finite() && rect.width() > 0.0 {
+            rect.width()
+        } else {
+            fallback_width
+        };
+        let height = if rect.height().is_finite() && rect.height() > 0.0 {
+            rect.height()
+        } else {
+            fallback_height
+        };
         let scale = window.device_pixel_ratio();
+        let target_width = backing_store_dimension(width, scale);
+        let target_height = backing_store_dimension(height, scale);
 
-        self.canvas.set_width((width * scale).round() as u32);
-        self.canvas.set_height((height * scale).round() as u32);
-        self.canvas
-            .style()
-            .set_property("width", &format!("{width}px"))?;
-        self.canvas
-            .style()
-            .set_property("height", &format!("{height}px"))?;
+        if self.canvas.width() != target_width {
+            self.canvas.set_width(target_width);
+        }
+        if self.canvas.height() != target_height {
+            self.canvas.set_height(target_height);
+        }
+        self.clamp_pan_to_view();
         self.redraw()
+    }
+
+    fn client_to_canvas_pixels(&self, client_x: f64, client_y: f64) -> (f64, f64) {
+        let rect = self.canvas.get_bounding_client_rect();
+        let fallback = window_device_pixel_ratio();
+        let ratio_x = canvas_backing_ratio(self.canvas.width(), rect.width(), fallback);
+        let ratio_y = canvas_backing_ratio(self.canvas.height(), rect.height(), fallback);
+        (
+            (client_x - rect.left()) * ratio_x,
+            (client_y - rect.top()) * ratio_y,
+        )
+    }
+
+    fn css_delta_to_canvas_pixels(&self, dx: f64, dy: f64) -> (f64, f64) {
+        let rect = self.canvas.get_bounding_client_rect();
+        let fallback = window_device_pixel_ratio();
+        let ratio_x = canvas_backing_ratio(self.canvas.width(), rect.width(), fallback);
+        let ratio_y = canvas_backing_ratio(self.canvas.height(), rect.height(), fallback);
+        (dx * ratio_x, dy * ratio_y)
     }
 
     pub fn redraw(&mut self) -> Result<(), JsValue> {
@@ -612,6 +668,8 @@ impl CanvasRenderer {
             .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
         self.gl
             .uniform1i(Some(&self.shape_uniform), render_state.shape);
+        self.gl
+            .uniform1f(Some(&self.sprite_scale_uniform), render_state.sprite_scale);
         self.gl.uniform1f(Some(&self.alpha_uniform), 1.0);
         self.gl.uniform1f(
             Some(&self.saturation_uniform),
@@ -643,6 +701,8 @@ impl CanvasRenderer {
             .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
         self.gl
             .uniform1i(Some(&self.shape_uniform), render_state.shape);
+        self.gl
+            .uniform1f(Some(&self.sprite_scale_uniform), render_state.sprite_scale);
         self.gl.uniform1f(
             Some(&self.alpha_uniform),
             self.settings.attack_overlay_opacity.clamp(0.0, 1.0),
@@ -668,6 +728,8 @@ impl CanvasRenderer {
             .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
         self.gl
             .uniform1i(Some(&self.shape_uniform), render_state.shape);
+        self.gl
+            .uniform1f(Some(&self.sprite_scale_uniform), render_state.sprite_scale);
         self.gl.uniform1f(
             Some(&self.alpha_uniform),
             (self.settings.attack_overlay_opacity * 0.5).clamp(0.0, 0.5),
@@ -741,6 +803,7 @@ impl CanvasRenderer {
         self.configure_vertex_attribs();
         self.gl.uniform1f(Some(&self.point_size_uniform), 1.0);
         self.gl.uniform1i(Some(&self.shape_uniform), 0);
+        self.gl.uniform1f(Some(&self.sprite_scale_uniform), 1.0);
         self.gl.uniform1f(
             Some(&self.alpha_uniform),
             self.settings.track_opacity.clamp(0.0, 1.0),
@@ -772,6 +835,7 @@ impl CanvasRenderer {
         self.configure_vertex_attribs();
         self.gl.uniform1f(Some(&self.point_size_uniform), 1.0);
         self.gl.uniform1i(Some(&self.shape_uniform), 0);
+        self.gl.uniform1f(Some(&self.sprite_scale_uniform), 1.0);
         self.gl.uniform1f(Some(&self.alpha_uniform), 0.55);
         self.gl.uniform1f(Some(&self.saturation_uniform), 1.0);
         self.gl.draw_arrays(
@@ -1057,7 +1121,10 @@ impl CanvasRenderer {
 
     fn render_state(&self, width: u32, height: u32) -> RenderState {
         let scale = self.world_scale(width as f64, height as f64);
-        let radius_px = (scale * rendered_piece_radius(&self.placement_settings)).max(1.0);
+        let logical_point_size =
+            (scale * rendered_piece_radius(&self.placement_settings) * 2.0).max(1.0);
+        let edge_padding = if logical_point_size <= 2.0 { 0.75 } else { 1.0 };
+        let point_size = logical_point_size + edge_padding * 2.0;
         let shape = shader_shape(&self.placement_settings);
         let bounds = self.view_bounds(rendered_piece_radius(&self.placement_settings));
 
@@ -1065,7 +1132,8 @@ impl CanvasRenderer {
             width,
             height,
             scale: scale as f32,
-            point_size: (radius_px * 2.0) as f32,
+            point_size: point_size as f32,
+            sprite_scale: (point_size / logical_point_size) as f32,
             shape,
             center_x: bounds.center_x(),
             center_y: bounds.center_y(),
@@ -1203,6 +1271,7 @@ struct RenderState {
     height: u32,
     scale: f32,
     point_size: f32,
+    sprite_scale: f32,
     shape: i32,
     center_x: f64,
     center_y: f64,
@@ -1500,13 +1569,13 @@ fn rendered_piece_radius(settings: &EngineSettings) -> f64 {
 
 fn shader_shape(settings: &EngineSettings) -> i32 {
     if settings.board == BoardKind::ContinuousArchimedean || settings.shape == ShapeKind::Circle {
-        1
-    } else if settings.shape == ShapeKind::Hex {
         2
-    } else if settings.shape == ShapeKind::Triangle {
+    } else if settings.shape == ShapeKind::Hex {
         3
+    } else if settings.shape == ShapeKind::Triangle {
+        4
     } else {
-        0
+        1
     }
 }
 
@@ -1616,6 +1685,39 @@ fn world_scale_for_settings_with_margin(
 
 fn fit_screen_scale(width: f64, height: f64, bounds: WorldBounds) -> f64 {
     (width / (bounds.width() + 4.0)).min(height / (bounds.height() + 4.0))
+}
+
+fn backing_store_dimension(css_pixels: f64, device_pixel_ratio: f64) -> u32 {
+    let css_pixels = if css_pixels.is_finite() && css_pixels > 0.0 {
+        css_pixels
+    } else {
+        1.0
+    };
+    let device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
+        device_pixel_ratio
+    } else {
+        1.0
+    };
+    (css_pixels * device_pixel_ratio)
+        .round()
+        .clamp(1.0, u32::MAX as f64) as u32
+}
+
+fn canvas_backing_ratio(backing_pixels: u32, css_pixels: f64, fallback: f64) -> f64 {
+    if css_pixels.is_finite() && css_pixels > f64::EPSILON {
+        backing_pixels as f64 / css_pixels
+    } else if fallback.is_finite() && fallback > f64::EPSILON {
+        fallback
+    } else {
+        1.0
+    }
+}
+
+fn window_device_pixel_ratio() -> f64 {
+    web_sys::window()
+        .map(|window| window.device_pixel_ratio())
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0)
+        .unwrap_or(1.0)
 }
 
 fn build_track_vertices(settings: &EngineSettings) -> Vec<f32> {
@@ -2603,5 +2705,20 @@ mod tests {
         let zoomed = world_scale_for_settings(&settings, 1200.0, 800.0);
 
         assert!((zoomed - base * 4.0).abs() <= f64::EPSILON * 4.0);
+    }
+
+    #[test]
+    fn backing_store_dimensions_round_css_viewport_by_device_pixel_ratio() {
+        assert_eq!(backing_store_dimension(390.0, 2.0), 780);
+        assert_eq!(backing_store_dimension(320.4, 1.25), 401);
+        assert_eq!(backing_store_dimension(0.0, 2.0), 2);
+        assert_eq!(backing_store_dimension(f64::NAN, f64::NAN), 1);
+    }
+
+    #[test]
+    fn canvas_backing_ratio_uses_css_rect_before_fallback() {
+        assert_eq!(canvas_backing_ratio(780, 390.0, 1.0), 2.0);
+        assert_eq!(canvas_backing_ratio(780, 0.0, 1.5), 1.5);
+        assert_eq!(canvas_backing_ratio(780, f64::NAN, f64::NAN), 1.0);
     }
 }

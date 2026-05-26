@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Private Playwright regression harness for Spiral Pattern Generator.",
   "private": true,
-  "packageManager": "pnpm@11.1.2",
+  "packageManager": "pnpm@11.3.0",
   "type": "module",
   "devDependencies": {
     "@playwright/test": "^1.60.0",

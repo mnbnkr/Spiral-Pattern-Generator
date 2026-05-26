@@ -866,15 +866,20 @@ fn schedule_render(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
 }
 
 fn install_resize_handler(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
     let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
         if let Err(error) = state.borrow_mut().renderer.resize_to_viewport() {
             log_error(&error);
         }
     });
 
-    web_sys::window()
-        .ok_or_else(|| JsValue::from_str("window unavailable"))?
-        .add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())?;
+    window.add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())?;
+    window
+        .add_event_listener_with_callback("orientationchange", closure.as_ref().unchecked_ref())?;
+    if let Some(visual_viewport) = window.visual_viewport() {
+        visual_viewport
+            .add_event_listener_with_callback("resize", closure.as_ref().unchecked_ref())?;
+    }
     closure.forget();
     Ok(())
 }
@@ -1492,7 +1497,7 @@ fn install_add_piece_handler(
                 let mut state = state.borrow_mut();
                 state.random_pool.push(RandomPoolPiece {
                     name: random_pool_piece_name(a, b)
-                        .map_or_else(|| format!("Custom ({a}, {b})"), str::to_string),
+                        .map_or_else(|| "Custom".to_string(), str::to_string),
                     a,
                     b,
                 });
@@ -1983,8 +1988,7 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         row.set_attribute("draggable", "true")?;
         install_piece_drag_handlers(&row, document.clone(), Rc::clone(&state), index)?;
 
-        let label = document.create_element("span")?;
-        label.set_text_content(Some(&format!("{}. ({}, {})", index + 1, piece.a, piece.b)));
+        let label = custom_army_piece_label(document, index, piece)?;
         row.append_child(&label)?;
 
         let swatch = document.create_element("span")?.dyn_into::<HtmlElement>()?;
@@ -1994,10 +1998,13 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         }
         let display_color = custom_piece_display_color(&settings, index, piece, army_len);
         swatch.style().set_property("background", &display_color)?;
-        swatch.set_title(&format!(
-            "Order color {}. Drag onto another color to copy; click to reset this row to automatic color.",
-            index + 1
-        ));
+        let color_title = if piece.color_override.is_some() {
+            "Fixed visible row color. Drag onto another swatch to copy it; click resets this row to its automatic color."
+        } else {
+            "Automatic order color. Drag onto another swatch to copy it; click keeps this visible color fixed for this row."
+        };
+        swatch.set_title(color_title);
+        swatch.set_attribute("aria-label", color_title)?;
         swatch.set_attribute("draggable", "true")?;
         install_piece_color_handlers(
             &swatch,
@@ -2059,6 +2066,7 @@ fn render_random_pool_list(
         install_random_pool_drag_handlers(&row, document.clone(), Rc::clone(&state), index)?;
 
         let label = document.create_element("span")?;
+        label.set_class_name("pool-piece-label");
         let mov = document.create_element("span")?;
         mov.set_class_name("pool-piece-move");
         mov.set_text_content(Some(&format!("({}, {}) ", piece.a, piece.b)));
@@ -2097,6 +2105,34 @@ fn render_random_pool_list(
     }
 
     Ok(())
+}
+
+fn custom_army_piece_label(
+    document: &Document,
+    index: usize,
+    piece: &CustomPiece,
+) -> Result<Element, JsValue> {
+    let label = document.create_element("span")?;
+    label.set_class_name("army-piece-label");
+
+    let order = document.create_element("span")?;
+    order.set_class_name("army-row-index");
+    order.set_text_content(Some(&format!("{}. ", index + 1)));
+    label.append_child(&order)?;
+
+    let mov = document.create_element("span")?;
+    mov.set_class_name("army-piece-move");
+    mov.set_text_content(Some(&format!("({}, {}) ", piece.a, piece.b)));
+    label.append_child(&mov)?;
+
+    if let Some(name_text) = random_pool_piece_name(piece.a, piece.b) {
+        let name = document.create_element("span")?;
+        name.set_class_name("army-piece-name");
+        name.set_text_content(Some(name_text));
+        label.append_child(&name)?;
+    }
+
+    Ok(label)
 }
 
 fn custom_piece_display_color(
@@ -2271,19 +2307,30 @@ fn install_piece_color_handlers(
 
     let click_document = document;
     let click_state = state;
+    let click_color = display_color;
     let click = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
         event.stop_propagation();
-        {
+        let next_color = {
             let mut state = click_state.borrow_mut();
             if js_sys::Date::now() <= state.suppress_color_click_until_ms {
                 state.suppress_color_click_until_ms = 0.0;
                 return;
             };
             state.suppress_color_click_until_ms = 0.0;
-        }
+            if state
+                .settings
+                .custom_army
+                .get(index)
+                .is_some_and(|piece| piece.color_override.is_some())
+            {
+                None
+            } else {
+                Some(click_color.clone())
+            }
+        };
 
         if let Err(error) =
-            sync_custom_color_override(&click_document, Rc::clone(&click_state), index, None)
+            sync_custom_color_override(&click_document, Rc::clone(&click_state), index, next_color)
         {
             log_error(&error);
         }
@@ -3186,7 +3233,14 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     select(document, "enemy-mode-select")?.set_disabled(false);
 
     let zoom_row = html_element(document, "zoom-row")?;
-    zoom_row.style().set_property("display", "none")?;
+    zoom_row.style().set_property(
+        "display",
+        if settings.display_mode == DisplayMode::PixelOneToOne {
+            "grid"
+        } else {
+            "none"
+        },
+    )?;
     set_text(
         document,
         "zoom-output",

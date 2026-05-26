@@ -347,7 +347,7 @@
                 <span>Add</span>
                 <span
                   class="info-icon button-info"
-                  data-tip="Adds the First/Turn move as a new custom row. Drag rows to reorder; drag a color swatch onto another swatch to copy it, and click a swatch to reset it."
+                  data-tip="Adds the First/Turn move as a new custom row. Drag rows to reorder; drag or click a color swatch to keep that visible color fixed."
                   >i</span
                 >
               </button>
@@ -470,15 +470,27 @@
         const tooltip = document.createElement("div");
         tooltip.className = "global-tooltip";
         document.body.appendChild(tooltip);
+        let tooltipTimer = 0;
+
+        const cancelTooltipTimer = () => {
+          if (tooltipTimer) {
+            window.clearTimeout(tooltipTimer);
+            tooltipTimer = 0;
+          }
+        };
 
         document.querySelectorAll(".info-icon").forEach((icon) => {
           icon.addEventListener("mousedown", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            cancelTooltipTimer();
+            tooltip.classList.remove("visible");
           });
           icon.addEventListener("click", (event) => {
             event.preventDefault();
             event.stopPropagation();
+            cancelTooltipTimer();
+            tooltip.classList.remove("visible");
           });
 
           const show = () => {
@@ -500,11 +512,21 @@
             tooltip.style.left = `${left}px`;
             tooltip.style.top = `${top}px`;
           };
-          const hide = () => tooltip.classList.remove("visible");
+          const scheduleShow = () => {
+            cancelTooltipTimer();
+            tooltipTimer = window.setTimeout(() => {
+              tooltipTimer = 0;
+              show();
+            }, 400);
+          };
+          const hide = () => {
+            cancelTooltipTimer();
+            tooltip.classList.remove("visible");
+          };
 
-          icon.addEventListener("mouseenter", show);
+          icon.addEventListener("mouseenter", scheduleShow);
           icon.addEventListener("mouseleave", hide);
-          icon.addEventListener("focus", show);
+          icon.addEventListener("focus", scheduleShow);
           icon.addEventListener("blur", hide);
         });
 
@@ -512,6 +534,7 @@
           .querySelectorAll(".panel, .panel-body")
           .forEach((scrollRoot) => {
             scrollRoot.addEventListener("scroll", () => {
+              cancelTooltipTimer();
               tooltip.classList.remove("visible");
             });
           });
