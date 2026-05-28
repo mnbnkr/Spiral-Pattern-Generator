@@ -5,7 +5,8 @@ use crate::math::{AxialCoord, Point2, SquareCoord, TriangleCoord, attack_radius_
 use crate::protocol::{
     ArmyPreset, AttackOverlayUpdate, BoardKind, ColorRule, ColorState, CustomPiece, EnemyMode,
     EngineSettings, PieceSignature, Placement, RgbColor, SpotCoord, VertexBufferUpdate,
-    custom_army_effective_color_groups, normalize_prime_modulo_divisor, parse_hex_rgb, rainbow_rgb,
+    custom_army_effective_color_groups, move_key_for_board, normalize_prime_modulo_divisor,
+    parse_hex_rgb, rainbow_rgb,
 };
 
 const ATTACK_OVERLAY_COLOR: RgbColor = RgbColor::new(
@@ -149,7 +150,7 @@ enum AttackOverlayBuildStage {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OverlayCandidate {
     signature: PieceSignature,
-    move_group: (i32, i32),
+    move_group: (u32, u32),
     enemy_color_group: u64,
 }
 
@@ -644,6 +645,7 @@ fn overlay_candidates(settings: &EngineSettings, placement_count: usize) -> Vec<
                 .enumerate()
                 .map(|(index, piece)| {
                     overlay_candidate_for_custom_piece(
+                        settings.board,
                         piece,
                         enemy_color_groups
                             .get(index)
@@ -655,27 +657,38 @@ fn overlay_candidates(settings: &EngineSettings, placement_count: usize) -> Vec<
         }
         ArmyPreset::PrimeKnight => {
             vec![overlay_candidate_for_prime_knight(
+                settings.board,
                 placement_count,
                 settings.prime_modulo_divisor,
             )]
         }
-        ArmyPreset::PrimeGapper => vec![overlay_candidate_for_prime_gapper(placement_count)],
+        ArmyPreset::PrimeGapper => {
+            vec![overlay_candidate_for_prime_gapper(
+                settings.board,
+                placement_count,
+            )]
+        }
     }
 }
 
 fn overlay_candidate_for_custom_piece(
+    board: BoardKind,
     piece: &CustomPiece,
     enemy_color_group: u64,
 ) -> OverlayCandidate {
     let signature = PieceSignature::new(piece.a, piece.b);
     OverlayCandidate {
         signature,
-        move_group: normalized_move_group(signature),
+        move_group: move_group(board, signature),
         enemy_color_group,
     }
 }
 
-fn overlay_candidate_for_prime_knight(index: usize, divisor: u32) -> OverlayCandidate {
+fn overlay_candidate_for_prime_knight(
+    board: BoardKind,
+    index: usize,
+    divisor: u32,
+) -> OverlayCandidate {
     let prime = nth_prime(index) as i32;
     let signature = PieceSignature::new(1, prime);
     let color_group = if index == 0 {
@@ -686,12 +699,12 @@ fn overlay_candidate_for_prime_knight(index: usize, divisor: u32) -> OverlayCand
     };
     OverlayCandidate {
         signature,
-        move_group: normalized_move_group(signature),
+        move_group: move_group(board, signature),
         enemy_color_group: color_group,
     }
 }
 
-fn overlay_candidate_for_prime_gapper(index: usize) -> OverlayCandidate {
+fn overlay_candidate_for_prime_gapper(board: BoardKind, index: usize) -> OverlayCandidate {
     let a = nth_prime(index) as i32;
     let b = nth_prime(index + 1) as i32;
     let signature = PieceSignature::new(a, b);
@@ -702,7 +715,7 @@ fn overlay_candidate_for_prime_gapper(index: usize) -> OverlayCandidate {
     };
     OverlayCandidate {
         signature,
-        move_group: normalized_move_group(signature),
+        move_group: move_group(board, signature),
         enemy_color_group: color_group,
     }
 }
@@ -725,7 +738,7 @@ fn overlay_candidate_is_enemy(
     matches!(
         settings.enemy_mode,
         EnemyMode::AttackSet | EnemyMode::ColorAttackSet
-    ) && normalized_move_group(placement.piece) != candidate.move_group
+    ) && move_group(settings.board, placement.piece) != candidate.move_group
 }
 
 fn placement_enemy_color_group(
@@ -745,10 +758,8 @@ fn placement_enemy_color_group(
         .unwrap_or(placement.color.key.group)
 }
 
-fn normalized_move_group(piece: PieceSignature) -> (i32, i32) {
-    let a = piece.a.unsigned_abs() as i32;
-    let b = piece.b.unsigned_abs() as i32;
-    (a.min(b), a.max(b))
+fn move_group(board: BoardKind, piece: PieceSignature) -> (u32, u32) {
+    move_key_for_board(board, piece)
 }
 
 fn prime_knight_color_bucket(value: u32, divisor: u32) -> (u32, f64) {

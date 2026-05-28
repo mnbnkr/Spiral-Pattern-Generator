@@ -12,15 +12,17 @@ use crate::math::{
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
     EngineStats, PieceColor, PieceSignature, Placement, PlacementSearchMode, ShapeKind, SpotCoord,
-    custom_army_effective_color_groups, custom_army_moves_match,
-    custom_color_group_change_affects_generation, normalize_prime_modulo_divisor,
+    custom_army_effective_color_groups, custom_army_moves_match_for_board,
+    custom_color_group_change_affects_generation, move_key_for_board,
+    normalize_prime_modulo_divisor,
 };
 
 const CONTINUOUS_CENTER_STREAMS: usize = 1;
 const SPECIAL_PRIME_COLOR_GROUP: u64 = 0;
 const SPECIAL_PRIME_COLOR: &str = "#808080";
 const ATTACK_RELEVANCE_RADIUS_MULTIPLIER: f64 = 4.0;
-const CONTINUOUS_BODY_OVERLAP_ALLOWANCE_FRACTION: f64 = 0.005;
+const CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_FRACTION: f64 = 0.0045;
+const CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_ABSOLUTE: f64 = 1.0e-10;
 const MAX_PREALLOCATED_SPIRAL_PATH_SPOTS: u64 = 12_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,7 +45,7 @@ impl SimulationMode {
 struct CandidatePiece {
     signature: PieceSignature,
     color: PieceColor,
-    move_group: (i32, i32),
+    move_group: (u32, u32),
     color_group: u64,
     enemy_color_group: u64,
     attack_radius: f64,
@@ -691,7 +693,11 @@ impl SimulationEngine {
                 continue;
             };
 
-            if continuous_bodies_overlap(center, existing_center, body_radius) {
+            if continuous_bodies_overlap_for_placement_rejection(
+                center,
+                existing_center,
+                body_radius,
+            ) {
                 return false;
             }
         }
@@ -785,7 +791,8 @@ impl SimulationEngine {
             return true;
         }
 
-        self.enemy_mode_uses_attack_set() && move_group(existing.piece) != candidate.move_group
+        self.enemy_mode_uses_attack_set()
+            && move_group(self.settings.board, existing.piece) != candidate.move_group
     }
 
     fn enemy_mode_uses_color(&self) -> bool {
@@ -848,7 +855,11 @@ impl SimulationEngine {
             || current.enemy_mode != next.enemy_mode
             || current.placement_search != next.placement_search
             || current.army_preset != next.army_preset
-            || !custom_army_moves_match(&current.custom_army, &next.custom_army)
+            || !custom_army_moves_match_for_board(
+                current.board,
+                &current.custom_army,
+                &next.custom_army,
+            )
             || custom_color_group_change_affects_generation(current, next)
             || current.continuous_offset != next.continuous_offset
             || current.prime_modulo_divisor != next.prime_modulo_divisor
@@ -890,7 +901,7 @@ impl SimulationEngine {
                     gradient_value: color_t,
                 },
             },
-            move_group: move_group(signature),
+            move_group: move_group(self.settings.board, signature),
             color_group,
             enemy_color_group,
             attack_radius: attack_radius_from_move(signature.a, signature.b),
@@ -913,7 +924,7 @@ impl SimulationEngine {
                                 gradient_value: 0.0,
                             },
                         },
-                        move_group: move_group(signature),
+                        move_group: move_group(self.settings.board, signature),
                         color_group: SPECIAL_PRIME_COLOR_GROUP,
                         enemy_color_group: SPECIAL_PRIME_COLOR_GROUP,
                         attack_radius: attack_radius_from_move(signature.a, signature.b),
@@ -936,7 +947,7 @@ impl SimulationEngine {
                             gradient_value: t,
                         },
                     },
-                    move_group: move_group(signature),
+                    move_group: move_group(self.settings.board, signature),
                     color_group,
                     enemy_color_group: color_group,
                     attack_radius: attack_radius_from_move(signature.a, signature.b),
@@ -957,7 +968,7 @@ impl SimulationEngine {
                                 gradient_value: 0.0,
                             },
                         },
-                        move_group: move_group(signature),
+                        move_group: move_group(self.settings.board, signature),
                         color_group: SPECIAL_PRIME_COLOR_GROUP,
                         enemy_color_group: SPECIAL_PRIME_COLOR_GROUP,
                         attack_radius: attack_radius_from_move(signature.a, signature.b),
@@ -976,7 +987,7 @@ impl SimulationEngine {
                             gradient_value: gap as f64,
                         },
                     },
-                    move_group: move_group(signature),
+                    move_group: move_group(self.settings.board, signature),
                     color_group: gap as u64,
                     enemy_color_group: gap as u64,
                     attack_radius: attack_radius_from_move(signature.a, signature.b),
@@ -1535,10 +1546,8 @@ fn rotate_cube_right((x, y, z): (i64, i64, i64)) -> (i64, i64, i64) {
     (-z, -x, -y)
 }
 
-fn move_group(piece: PieceSignature) -> (i32, i32) {
-    let a = piece.a.unsigned_abs() as i32;
-    let b = piece.b.unsigned_abs() as i32;
-    (a.min(b), a.max(b))
+fn move_group(board: BoardKind, piece: PieceSignature) -> (u32, u32) {
+    move_key_for_board(board, piece)
 }
 
 fn forced_shape_for_board(board: BoardKind, requested: ShapeKind) -> ShapeKind {
@@ -1580,10 +1589,15 @@ pub(crate) fn attack_radius_relevant_to_generation(
     attack_radius <= max_relevant_attack_radius(settings) + f64::EPSILON
 }
 
-fn continuous_bodies_overlap(a: Point2, b: Point2, body_radius: f64) -> bool {
+fn continuous_bodies_overlap_for_placement_rejection(
+    a: Point2,
+    b: Point2,
+    body_radius: f64,
+) -> bool {
     let minimum_distance = (2.0 * body_radius.max(0.0)).max(0.0);
-    let allowance = minimum_distance * CONTINUOUS_BODY_OVERLAP_ALLOWANCE_FRACTION;
-    a.distance(b) < minimum_distance - allowance - GEOM_EPS
+    let tolerance = (minimum_distance * CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_FRACTION)
+        .max(CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_ABSOLUTE);
+    a.distance(b) < minimum_distance - tolerance - GEOM_EPS
 }
 
 fn prime_knight_color_bucket(value: u32, divisor: u32) -> (u32, f64) {
@@ -1634,7 +1648,7 @@ fn is_prime_with_cache(n: u32, primes: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::attack_circle_hits_body;
+    use crate::math::{attack_circle_hits_body, bodies_overlap};
 
     #[test]
     fn engine_emits_square_batch() {
@@ -1929,7 +1943,8 @@ mod tests {
                     let automatic_groups_differ =
                         attacker.color.key.group != placement.color.key.group;
                     if automatic_groups_differ
-                        && move_group(attacker.piece) == move_group(placement.piece)
+                        && move_group(BoardKind::LatticeSquare, attacker.piece)
+                            == move_group(BoardKind::LatticeSquare, placement.piece)
                         && placement_attacks(attacker, placement, BoardKind::LatticeSquare, 0.5)
                     {
                         allowed_copied_color_attack = true;
@@ -1966,6 +1981,25 @@ mod tests {
         assert_eq!(first[0].color.key.group, next[0].color.key.group);
         assert_eq!(next[0].color.key.group, 0);
         assert_eq!(next[1].color.key.group, 1);
+    }
+
+    #[test]
+    fn continuous_placement_tolerance_does_not_change_strict_body_geometry() {
+        let origin = Point2::new(0.0, 0.0);
+        let placement_tolerated_overlap = Point2::new(1.0 - 0.004, 0.0);
+        let visible_overlap = Point2::new(1.0 - 0.01, 0.0);
+
+        assert!(bodies_overlap(origin, placement_tolerated_overlap, 0.5));
+        assert!(!continuous_bodies_overlap_for_placement_rejection(
+            origin,
+            placement_tolerated_overlap,
+            0.5
+        ));
+        assert!(continuous_bodies_overlap_for_placement_rejection(
+            origin,
+            visible_overlap,
+            0.5
+        ));
     }
 
     #[test]
@@ -2106,7 +2140,7 @@ mod tests {
                 let mut earlier: Vec<&Placement> = Vec::new();
                 for placement in &batch {
                     for attacker in &earlier {
-                        if !placements_are_enemies(enemy_mode, attacker, placement) {
+                        if !placements_are_enemies(board, enemy_mode, attacker, placement) {
                             continue;
                         }
                         assert!(
@@ -2182,8 +2216,8 @@ mod tests {
                         placement.spot_index
                     );
                     assert_eq!(
-                        move_group(attacker.piece),
-                        move_group(placement.piece),
+                        move_group(BoardKind::LatticeSquare, attacker.piece),
+                        move_group(BoardKind::LatticeSquare, placement.piece),
                         "spot {} was attacked by a different attack set",
                         placement.spot_index
                     );
@@ -3009,12 +3043,14 @@ mod tests {
     }
 
     fn placements_are_enemies(
+        board: BoardKind,
         enemy_mode: EnemyMode,
         attacker: &Placement,
         target: &Placement,
     ) -> bool {
         let different_color = attacker.color.key.group != target.color.key.group;
-        let different_attack_set = move_group(attacker.piece) != move_group(target.piece);
+        let different_attack_set =
+            move_group(board, attacker.piece) != move_group(board, target.piece);
         match enemy_mode {
             EnemyMode::Color => different_color,
             EnemyMode::AttackSet => different_attack_set,

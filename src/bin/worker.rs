@@ -9,7 +9,7 @@ use spiral_pattern_generator::engine::SimulationEngine;
 use spiral_pattern_generator::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, ColorState, EngineSettings, Placement,
     SpeedMode, VertexBufferUpdate, WorkerToApp, custom_army_color_overrides_match,
-    custom_army_moves_match, custom_color_group_change_affects_generation,
+    custom_army_moves_match_for_board, custom_color_group_change_affects_generation,
 };
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::render_data::{
@@ -528,7 +528,7 @@ fn attack_overlay_settings_changed_excluding_opacity(
         || old.proactive_attacking != new.proactive_attacking
         || old.enemy_mode != new.enemy_mode
         || old.army_preset != new.army_preset
-        || !custom_army_moves_match(&old.custom_army, &new.custom_army)
+        || !custom_army_moves_match_for_board(old.board, &old.custom_army, &new.custom_army)
         || custom_color_group_change_affects_generation(old, new)
         || old.continuous_offset != new.continuous_offset
         || old.prime_modulo_divisor != new.prime_modulo_divisor

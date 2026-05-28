@@ -237,6 +237,40 @@ test("default simulation auto-runs", async ({ page }) => {
   await pauseIfRunning(page);
 });
 
+test("WebGL1 fallback renders when WebGL2 is unavailable", async ({ page }) => {
+  await page.addInitScript(() => {
+    const originalGetContext = HTMLCanvasElement.prototype.getContext;
+    (HTMLCanvasElement.prototype as unknown as { getContext: unknown }).getContext =
+      function patchedGetContext(
+        this: HTMLCanvasElement,
+        contextId: string,
+        ...args: unknown[]
+      ) {
+        if (contextId === "webgl2") {
+          return null;
+        }
+        return (originalGetContext as unknown as Function).call(
+          this,
+          contextId,
+          ...args,
+        );
+      };
+  });
+
+  await page.goto("./");
+  await expect(page.locator("#status-line")).toContainText("placements", {
+    timeout: 15_000,
+  });
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-webgl-context",
+    "webgl1",
+  );
+  await expect
+    .poll(() => renderedPixelCount(page), { timeout: 10_000 })
+    .toBeGreaterThan(0);
+  await pauseIfRunning(page);
+});
+
 test("mobile viewport rendering stays nonblank and uses device pixels", async ({
   page,
 }) => {
@@ -355,24 +389,52 @@ test("custom finite panel layout and color swatch overrides work", async ({
     .evaluate((row) => getComputedStyle(row).backgroundColor);
   expect(rowAfterHover).not.toBe(rowBeforeHover);
 
+  await page.locator(".army-swatch").first().hover();
+  await page.waitForTimeout(180);
+  const swatchHover = await page.locator(".army-row").first().evaluate((row) => {
+    const swatch = row.querySelector(".army-swatch")!;
+    return {
+      rowBackground: getComputedStyle(row).backgroundColor,
+      swatchOutline: getComputedStyle(swatch).outlineWidth,
+      swatchOutlineColor: getComputedStyle(swatch).outlineColor,
+    };
+  });
+  expect(swatchHover.rowBackground).toBe(rowBeforeHover);
+  expect(swatchHover.swatchOutline).toBe("2px");
+  expect(swatchHover.swatchOutlineColor).toBe("rgb(85, 167, 255)");
+
   const firstColor = await page
     .locator(".army-swatch")
     .first()
     .evaluate((swatch) => getComputedStyle(swatch).backgroundColor);
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "normal",
+  );
   await page.locator(".army-swatch").first().click();
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "normal",
+  );
   const clicked = await page.locator(".army-swatch").evaluateAll((swatches) =>
     swatches.map((swatch) => ({
       color: getComputedStyle(swatch).backgroundColor,
       override: swatch.classList.contains("custom-color-override"),
       borderWidth: getComputedStyle(swatch).borderTopWidth,
+      markerWidth: getComputedStyle(swatch, "::after").width,
     })),
   );
   expect(clicked[0]).toEqual({
     color: firstColor,
     override: true,
     borderWidth: "2px",
+    markerWidth: "9px",
   });
   await page.locator(".army-swatch").first().click();
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "normal",
+  );
   const reset = await page.locator(".army-swatch").first().evaluate((swatch) => ({
     color: getComputedStyle(swatch).backgroundColor,
     override: swatch.classList.contains("custom-color-override"),
@@ -456,6 +518,21 @@ test("continuous center distance uses the configured unit-chord spiral spots", a
   expect(spiralPath.length).toBeGreaterThan(8);
   expect(centerDistance.length).toBeGreaterThan(8);
   expect(centerDistance).toEqual(spiralPath);
+});
+
+test("custom move names are symmetric except on triangle lattice", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.fill("#piece-a-input", "0");
+  await page.fill("#piece-b-input", "3");
+  await page.click("#add-piece-button");
+  await expect(page.locator(".army-row").last()).toContainText("(0, 3)");
+  await expect(page.locator(".army-row").last()).toContainText("Spehbed");
+
+  await page.selectOption("#board-select", "LatticeTriangle");
+  await expect(page.locator(".army-row").last()).toContainText("(0, 3)");
+  await expect(page.locator(".army-row").last().locator(".army-piece-name")).toHaveCount(0);
 });
 
 test("continuous prime presets show early progress in fastest mode", async ({
@@ -791,7 +868,8 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
       }),
     )
     .not.toBe("grab");
-  await expect(page.locator("#zoom-row")).toBeHidden();
+  await expect(page.locator("#zoom-row")).toHaveCount(0);
+  await expect(page.locator("#zoom-slider")).toHaveCount(0);
 
   await page.mouse.move(500, 360);
   await page.mouse.wheel(0, -120);
@@ -799,9 +877,11 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
   await expect(page.locator("#display-mode-select option[value='PixelOneToOne']")).toHaveText(
     "Free Camera",
   );
-  await expect(page.locator("#zoom-slider")).toHaveValue("2");
-  await expect(page.locator("#zoom-output")).toHaveText("x2");
-  await expect(page.locator("#zoom-row")).toBeVisible();
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-camera-zoom",
+    "2.000",
+  );
+  await expect(page.locator("#zoom-row")).toHaveCount(0);
   await page.selectOption("#display-mode-select", "PixelOneToOne");
   await expect
     .poll(() =>
@@ -811,12 +891,6 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
     )
     .toBe("grab");
 
-  await page.evaluate(() => {
-    const slider = document.querySelector<HTMLInputElement>("#zoom-slider");
-    if (!slider) throw new Error("missing zoom slider");
-    slider.value = "1";
-    slider.dispatchEvent(new Event("input", { bubbles: true }));
-  });
   await expect
     .poll(() =>
       page.locator("#sim-canvas").evaluate((canvas) => {
@@ -824,6 +898,58 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
       }),
     )
     .toBe("grab");
+});
+
+test("mobile pinch activates Free Camera and zooms without a slider", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await expect(page.locator("#zoom-slider")).toHaveCount(0);
+
+  await page.locator("#sim-canvas").evaluate((canvas) => {
+    if (!("Touch" in window) || !("TouchEvent" in window)) {
+      throw new Error("TouchEvent unavailable");
+    }
+    const target = canvas as HTMLCanvasElement;
+    const makeTouch = (identifier: number, clientX: number, clientY: number) =>
+      new Touch({
+        identifier,
+        target,
+        clientX,
+        clientY,
+      });
+    target.dispatchEvent(
+      new TouchEvent("touchstart", {
+        bubbles: true,
+        cancelable: true,
+        touches: [makeTouch(1, 520, 360), makeTouch(2, 620, 360)],
+      }),
+    );
+    target.dispatchEvent(
+      new TouchEvent("touchmove", {
+        bubbles: true,
+        cancelable: true,
+        touches: [makeTouch(1, 500, 360), makeTouch(2, 640, 360)],
+      }),
+    );
+    target.dispatchEvent(
+      new TouchEvent("touchend", {
+        bubbles: true,
+        cancelable: true,
+        touches: [],
+      }),
+    );
+  });
+
+  await expect(page.locator("#display-mode-select")).toHaveValue("PixelOneToOne");
+  await expect
+    .poll(() =>
+      page.locator("#sim-canvas").evaluate((canvas) =>
+        Number((canvas as HTMLCanvasElement).dataset.cameraZoom),
+      ),
+    )
+    .toBeGreaterThan(1);
+  await expect(page.locator("#zoom-slider")).toHaveCount(0);
 });
 
 test("display mode stack is left and top-aligned against render sliders", async ({
@@ -1289,6 +1415,55 @@ test("starting a staged board switch clears stale square data", async ({
   );
   await expect(page.locator("#placement-log")).toContainText("coord=triangle(");
   await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
+});
+
+test("continuous offset edits dim and preserve the current snapshot until restart", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.selectOption("#board-select", "ContinuousArchimedean");
+  await page.fill("#radius-input", "12");
+  await page.click("#refresh-button");
+  await page.click("#step-button");
+  await expect(page.locator("#placement-log")).toContainText(
+    "board=ContinuousArchimedean",
+    { timeout: 15_000 },
+  );
+  await expect(page.locator("#placement-log")).toContainText("coord=continuous(");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "normal",
+  );
+  const pixelsBefore = await renderedPixelCount(page);
+  expect(pixelsBefore).toBeGreaterThan(0);
+
+  await page.fill("#continuous-offset-input", "bad");
+  await expect(page.locator("#continuous-offset-input")).toHaveClass(
+    /invalid-input/,
+  );
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "normal",
+  );
+  await expect(page.locator("#placement-log")).toContainText("coord=continuous(");
+  expect(await renderedPixelCount(page)).toBeGreaterThan(0);
+
+  await page.fill("#continuous-offset-input", "0.25");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "dimmed",
+  );
+  await expect(page.locator("#placement-log")).toContainText("coord=continuous(");
+  expect(await renderedPixelCount(page)).toBeGreaterThan(0);
+
+  await page.click("#start-button");
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-color-saturation",
+    "normal",
+    { timeout: 15_000 },
+  );
+  await expect(page.locator("#placement-log")).toContainText("offset=0.250");
+  await pauseIfRunning(page);
 });
 
 test("reselecting the current board refreshes without changing board", async ({

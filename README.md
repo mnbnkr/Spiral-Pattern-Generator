@@ -4,7 +4,7 @@ Inspired by <i>- Numberphile's 'Red & Black Knights' <a href="https://youtu.be/U
 
 <br><br>
 
-Rust/WASM application for deterministic spiral pattern simulations. The simulation engine runs in a Web Worker, the main thread owns UI and WebGL rendering, and builds are static assets suitable for GitHub Pages.
+Rust/WASM application for deterministic spiral pattern simulations. The simulation engine runs in a Web Worker, the main thread owns UI and WebGL rendering with WebGL 2 preferred and WebGL 1 fallback, and builds are static assets suitable for GitHub Pages.
 
 ## Manual
 
@@ -16,7 +16,7 @@ The detailed source of truth is [MANUAL.md](MANUAL.md). It documents the board m
 - Target `wasm32-unknown-unknown`
 - Trunk
 - `wasm-bindgen`, `web-sys`, `js-sys`
-- WebGL point sprites on one HTML5 canvas
+- WebGL point sprites on one HTML5 canvas, with WebGL 2 preferred and WebGL 1 fallback
 - Binary worker transport with `bincode` over transferable `Uint8Array`
 
 ## Run

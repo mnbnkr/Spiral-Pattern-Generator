@@ -122,12 +122,32 @@ impl CustomPiece {
 }
 
 #[must_use]
-pub fn custom_army_moves_match(left: &[CustomPiece], right: &[CustomPiece]) -> bool {
+pub fn move_key_for_board(board: BoardKind, piece: PieceSignature) -> (u32, u32) {
+    let a = piece.a.unsigned_abs();
+    let b = piece.b.unsigned_abs();
+    if board == BoardKind::LatticeTriangle {
+        (a, b)
+    } else {
+        (a.min(b), a.max(b))
+    }
+}
+
+#[must_use]
+pub fn custom_army_moves_match_for_board(
+    board: BoardKind,
+    left: &[CustomPiece],
+    right: &[CustomPiece],
+) -> bool {
     left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.a == right.a && left.b == right.b)
+        && left.iter().zip(right).all(|(left, right)| {
+            move_key_for_board(board, PieceSignature::new(left.a, left.b))
+                == move_key_for_board(board, PieceSignature::new(right.a, right.b))
+        })
+}
+
+#[must_use]
+pub fn custom_army_moves_match(left: &[CustomPiece], right: &[CustomPiece]) -> bool {
+    custom_army_moves_match_for_board(BoardKind::LatticeSquare, left, right)
 }
 
 #[must_use]
@@ -406,7 +426,7 @@ pub struct EngineSettings {
     pub visual_progress: bool,
     pub speed: SpeedMode,
     pub display_mode: DisplayMode,
-    pub zoom: u8,
+    pub zoom: f64,
     pub track_opacity: f32,
     pub attack_overlay_opacity: f32,
     pub proactive_attacking: bool,
@@ -430,7 +450,7 @@ impl Default for EngineSettings {
             visual_progress: true,
             speed: SpeedMode::Fastest,
             display_mode: DisplayMode::FitScreen,
-            zoom: 1,
+            zoom: 1.0,
             track_opacity: 0.1,
             attack_overlay_opacity: 0.0,
             proactive_attacking: false,
@@ -678,6 +698,43 @@ mod tests {
             custom_piece_order_color(&settings, 0, 3)
         );
         assert_eq!(custom_army_effective_color_groups(&settings), vec![0, 0, 2]);
+    }
+
+    #[test]
+    fn move_keys_are_symmetric_except_on_triangle_board() {
+        let left = PieceSignature::new(3, 0);
+        let right = PieceSignature::new(0, 3);
+        let min_leg = PieceSignature::new(i32::MIN, 0);
+
+        for board in [
+            BoardKind::LatticeSquare,
+            BoardKind::LatticeHex,
+            BoardKind::ContinuousArchimedean,
+        ] {
+            assert_eq!(
+                move_key_for_board(board, left),
+                move_key_for_board(board, right)
+            );
+            assert!(custom_army_moves_match_for_board(
+                board,
+                &[CustomPiece::with_auto_color(3, 0)],
+                &[CustomPiece::with_auto_color(0, 3)]
+            ));
+        }
+
+        assert_ne!(
+            move_key_for_board(BoardKind::LatticeTriangle, left),
+            move_key_for_board(BoardKind::LatticeTriangle, right)
+        );
+        assert!(!custom_army_moves_match_for_board(
+            BoardKind::LatticeTriangle,
+            &[CustomPiece::with_auto_color(3, 0)],
+            &[CustomPiece::with_auto_color(0, 3)]
+        ));
+        assert_eq!(
+            move_key_for_board(BoardKind::LatticeSquare, min_leg),
+            (0, 2_147_483_648)
+        );
     }
 
     #[test]

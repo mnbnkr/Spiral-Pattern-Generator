@@ -5,7 +5,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::{Clamped, JsCast};
 use web_sys::{
     Blob, CanvasRenderingContext2d, HtmlAnchorElement, HtmlCanvasElement, ImageData, Url,
-    WebGl2RenderingContext as Gl, WebGlBuffer, WebGlProgram, WebGlShader, WebGlUniformLocation,
+    WebGlBuffer, WebGlProgram, WebGlRenderingContext as Gl, WebGlShader, WebGlUniformLocation,
 };
 
 use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
@@ -158,6 +158,144 @@ void main() {
 }
 "#;
 
+const VERTEX_SHADER_WEBGL1: &str = r#"
+attribute vec2 a_position;
+attribute vec3 a_color;
+
+uniform vec2 u_resolution;
+uniform float u_scale;
+uniform float u_point_size;
+uniform vec2 u_pan;
+
+varying vec3 v_color;
+
+void main() {
+    vec2 screen = vec2(
+        u_resolution.x * 0.5 + (a_position.x + u_pan.x) * u_scale,
+        u_resolution.y * 0.5 - (a_position.y + u_pan.y) * u_scale
+    );
+    vec2 clip = vec2(
+        (screen.x / u_resolution.x) * 2.0 - 1.0,
+        1.0 - (screen.y / u_resolution.y) * 2.0
+    );
+
+    gl_Position = vec4(clip, 0.0, 1.0);
+    gl_PointSize = max(u_point_size, 1.0);
+    v_color = a_color;
+}
+"#;
+
+const FRAGMENT_SHADER_WEBGL1: &str = r#"
+#extension GL_OES_standard_derivatives : enable
+precision highp float;
+
+uniform int u_shape;
+uniform float u_alpha;
+uniform float u_saturation;
+uniform float u_sprite_scale;
+
+varying vec3 v_color;
+
+float coverage_from_signed_distance(float distance_to_edge) {
+    float width = max(fwidth(distance_to_edge), 0.001);
+    return 1.0 - smoothstep(0.0, width, distance_to_edge);
+}
+
+void main() {
+    float coverage = 1.0;
+    if (u_shape == 1) {
+        vec2 p = (gl_PointCoord * 2.0 - 1.0) * u_sprite_scale;
+        vec2 q = abs(p) - vec2(1.0);
+        coverage = coverage_from_signed_distance(max(q.x, q.y));
+    } else if (u_shape == 2) {
+        vec2 p = gl_PointCoord * 2.0 - 1.0;
+        p *= u_sprite_scale;
+        coverage = coverage_from_signed_distance(length(p) - 1.0);
+    } else if (u_shape == 3) {
+        vec2 p = abs((gl_PointCoord * 2.0 - 1.0) * u_sprite_scale);
+        float edge = max(max(p.x - 0.8660254, p.y - 1.0), p.x * 0.5773503 + p.y - 1.0);
+        coverage = coverage_from_signed_distance(edge);
+    } else if (u_shape == 4) {
+        vec2 p = (1.0 - gl_PointCoord * 2.0) * u_sprite_scale;
+        float edge = max(max(-0.5 - p.y, p.y - 1.0), abs(p.x) - (1.0 - p.y) * 0.5773503);
+        coverage = coverage_from_signed_distance(edge);
+    }
+
+    if (coverage <= 0.0) {
+        discard;
+    }
+
+    float luminance = dot(v_color, vec3(0.2126, 0.7152, 0.0722));
+    vec3 color = mix(vec3(luminance), v_color, clamp(u_saturation, 0.0, 1.0));
+    gl_FragColor = vec4(color, u_alpha * coverage);
+}
+"#;
+
+const CIRCLE_VERTEX_SHADER_WEBGL1: &str = r#"
+attribute vec2 a_position;
+attribute vec2 a_center;
+attribute float a_radius;
+attribute vec3 a_color;
+
+uniform vec2 u_resolution;
+uniform float u_scale;
+uniform vec2 u_pan;
+uniform highp float u_line_width;
+
+varying highp vec2 v_position;
+varying highp vec2 v_center;
+varying highp float v_radius;
+varying vec3 v_color;
+
+void main() {
+    highp vec2 world_position = a_center + a_position * (a_radius + u_line_width);
+    vec2 screen = vec2(
+        u_resolution.x * 0.5 + (world_position.x + u_pan.x) * u_scale,
+        u_resolution.y * 0.5 - (world_position.y + u_pan.y) * u_scale
+    );
+    vec2 clip = vec2(
+        (screen.x / u_resolution.x) * 2.0 - 1.0,
+        1.0 - (screen.y / u_resolution.y) * 2.0
+    );
+
+    gl_Position = vec4(clip, 0.0, 1.0);
+    v_position = world_position;
+    v_center = a_center;
+    v_radius = a_radius;
+    v_color = a_color;
+}
+"#;
+
+const CIRCLE_FRAGMENT_SHADER_WEBGL1: &str = r#"
+precision highp float;
+
+uniform float u_alpha;
+uniform highp float u_line_width;
+
+varying highp vec2 v_position;
+varying highp vec2 v_center;
+varying highp float v_radius;
+varying vec3 v_color;
+
+void main() {
+    highp float delta = abs(distance(v_position, v_center) - v_radius);
+    if (delta > u_line_width) {
+        discard;
+    }
+
+    float coverage = 1.0 - smoothstep(u_line_width * 0.65, u_line_width, delta);
+    gl_FragColor = vec4(v_color, u_alpha * coverage);
+}
+"#;
+
+#[derive(Clone, Copy)]
+struct ShaderSources {
+    vertex: &'static str,
+    fragment: &'static str,
+    circle_vertex: &'static str,
+    circle_fragment: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExportKind {
     FullPng,
@@ -228,20 +366,17 @@ impl CanvasRenderer {
             .get_element_by_id(canvas_id)
             .ok_or_else(|| JsValue::from_str("canvas not found"))?
             .dyn_into::<HtmlCanvasElement>()?;
-        let gl = canvas
-            .get_context("webgl2")?
-            .ok_or_else(|| JsValue::from_str("webgl2 context unavailable"))?
-            .dyn_into::<Gl>()?;
+        let (gl, context_label, shaders) = webgl_context_with_fallback(&canvas)?;
 
         let program = link_program(
             &gl,
-            &compile_shader(&gl, Gl::VERTEX_SHADER, VERTEX_SHADER)?,
-            &compile_shader(&gl, Gl::FRAGMENT_SHADER, FRAGMENT_SHADER)?,
+            &compile_shader(&gl, Gl::VERTEX_SHADER, shaders.vertex)?,
+            &compile_shader(&gl, Gl::FRAGMENT_SHADER, shaders.fragment)?,
         )?;
         let circle_program = link_program(
             &gl,
-            &compile_shader(&gl, Gl::VERTEX_SHADER, CIRCLE_VERTEX_SHADER)?,
-            &compile_shader(&gl, Gl::FRAGMENT_SHADER, CIRCLE_FRAGMENT_SHADER)?,
+            &compile_shader(&gl, Gl::VERTEX_SHADER, shaders.circle_vertex)?,
+            &compile_shader(&gl, Gl::FRAGMENT_SHADER, shaders.circle_fragment)?,
         )?;
         gl.use_program(Some(&program));
 
@@ -342,7 +477,11 @@ impl CanvasRenderer {
             .set_attribute("data-generation-border", "visible")?;
         renderer
             .canvas
-            .set_attribute("data-webgl-context", "webgl2")?;
+            .set_attribute("data-color-saturation", "normal")?;
+        renderer.canvas.set_attribute("data-camera-zoom", "1.000")?;
+        renderer
+            .canvas
+            .set_attribute("data-webgl-context", context_label)?;
         renderer.resize_to_viewport()?;
         Ok(renderer)
     }
@@ -376,6 +515,7 @@ impl CanvasRenderer {
         }
         self.settings = view_settings;
         self.placement_settings = placement_settings;
+        self.sync_camera_zoom_attribute()?;
         self.canvas.set_attribute(
             "data-piece-shape",
             shape_data_value(self.placement_settings.shape),
@@ -391,6 +531,14 @@ impl CanvasRenderer {
 
     pub fn set_color_saturation(&mut self, color_saturation: f32) -> Result<(), JsValue> {
         self.color_saturation = color_saturation.clamp(0.0, 1.0);
+        self.canvas.set_attribute(
+            "data-color-saturation",
+            if self.color_saturation < 1.0 {
+                "dimmed"
+            } else {
+                "normal"
+            },
+        )?;
         self.redraw()
     }
 
@@ -438,14 +586,49 @@ impl CanvasRenderer {
         self.redraw()
     }
 
-    pub fn zoom_at(&mut self, client_x: f64, client_y: f64, delta: i32) -> Result<u8, JsValue> {
-        if self.settings.display_mode != DisplayMode::PixelOneToOne || delta == 0 {
+    pub fn zoom_by_steps_at(
+        &mut self,
+        client_x: f64,
+        client_y: f64,
+        delta: i32,
+    ) -> Result<f64, JsValue> {
+        if delta == 0 {
             return Ok(self.settings.zoom);
         }
 
-        let old_zoom = self.settings.zoom.clamp(1, 32);
-        let new_zoom = (old_zoom as i32 + delta).clamp(1, 32) as u8;
+        self.set_zoom_at(client_x, client_y, self.settings.zoom + delta as f64)
+    }
+
+    pub fn zoom_by_factor_at(
+        &mut self,
+        client_x: f64,
+        client_y: f64,
+        factor: f64,
+    ) -> Result<f64, JsValue> {
+        if !factor.is_finite() || factor <= 0.0 {
+            return Ok(self.settings.zoom);
+        }
+
+        self.set_zoom_at(client_x, client_y, self.settings.zoom * factor)
+    }
+
+    fn set_zoom_at(
+        &mut self,
+        client_x: f64,
+        client_y: f64,
+        requested_zoom: f64,
+    ) -> Result<f64, JsValue> {
+        if self.settings.display_mode != DisplayMode::PixelOneToOne {
+            return Ok(self.settings.zoom);
+        }
+
+        let old_zoom = self.settings.zoom.clamp(1.0, 32.0);
+        let new_zoom = requested_zoom.clamp(1.0, 32.0);
+        let unchanged = (new_zoom - old_zoom).abs() <= f64::EPSILON * old_zoom.max(1.0);
         if new_zoom == old_zoom {
+            return Ok(old_zoom);
+        }
+        if unchanged {
             return Ok(old_zoom);
         }
 
@@ -461,12 +644,18 @@ impl CanvasRenderer {
         let world_y = (height * 0.5 - py) / old_scale - (self.pan_y - bounds.center_y());
 
         self.settings.zoom = new_zoom;
+        self.sync_camera_zoom_attribute()?;
         let new_scale = self.world_scale(width, height);
         self.pan_x = (px - width * 0.5) / new_scale + bounds.center_x() - world_x;
         self.pan_y = (height * 0.5 - py) / new_scale + bounds.center_y() - world_y;
         self.clamp_pan_to_view();
         self.redraw()?;
         Ok(new_zoom)
+    }
+
+    fn sync_camera_zoom_attribute(&self) -> Result<(), JsValue> {
+        self.canvas
+            .set_attribute("data-camera-zoom", &format!("{:.3}", self.settings.zoom))
     }
 
     pub fn apply_batch(
@@ -1655,11 +1844,13 @@ fn board_world_bounds(settings: &EngineSettings, margin: f64) -> WorldBounds {
         }
         BoardKind::LatticeTriangle => {
             let shell = settings.radius.max(0.0).floor().max(1.0);
+            let x_extent = 1.5 * shell;
+            let y_extent = 3.0_f64.sqrt() * shell;
             WorldBounds {
-                min_x: -1.5 * shell - margin,
-                max_x: 1.5 * shell - 0.5 + margin,
-                min_y: -0.5 * 3.0_f64.sqrt() * shell - margin,
-                max_y: 3.0_f64.sqrt() * shell + margin,
+                min_x: -x_extent - margin,
+                max_x: x_extent + margin,
+                min_y: -y_extent - margin,
+                max_y: y_extent + margin,
             }
         }
     }
@@ -1679,7 +1870,7 @@ fn world_scale_for_settings_with_margin(
     let fit_scale = fit_screen_scale(width, height, board_world_bounds(settings, margin));
     match settings.display_mode {
         DisplayMode::FitScreen => fit_scale,
-        DisplayMode::PixelOneToOne => fit_scale * settings.zoom.clamp(1, 32) as f64,
+        DisplayMode::PixelOneToOne => fit_scale * settings.zoom.clamp(1.0, 32.0),
     }
 }
 
@@ -2291,6 +2482,45 @@ fn js_value_text(value: &JsValue) -> String {
     value.as_string().unwrap_or_else(|| format!("{value:?}"))
 }
 
+fn webgl_context_with_fallback(
+    canvas: &HtmlCanvasElement,
+) -> Result<(Gl, &'static str, ShaderSources), JsValue> {
+    if let Some(context) = canvas.get_context("webgl2")? {
+        return Ok((
+            context.unchecked_into::<Gl>(),
+            "webgl2",
+            ShaderSources {
+                vertex: VERTEX_SHADER,
+                fragment: FRAGMENT_SHADER,
+                circle_vertex: CIRCLE_VERTEX_SHADER,
+                circle_fragment: CIRCLE_FRAGMENT_SHADER,
+            },
+        ));
+    }
+
+    let context = canvas
+        .get_context("webgl")?
+        .or_else(|| canvas.get_context("experimental-webgl").ok().flatten())
+        .ok_or_else(|| JsValue::from_str("webgl context unavailable"))?
+        .dyn_into::<Gl>()?;
+    if context.get_extension("OES_standard_derivatives")?.is_none() {
+        return Err(JsValue::from_str(
+            "webgl1 fallback requires OES_standard_derivatives",
+        ));
+    }
+
+    Ok((
+        context,
+        "webgl1",
+        ShaderSources {
+            vertex: VERTEX_SHADER_WEBGL1,
+            fragment: FRAGMENT_SHADER_WEBGL1,
+            circle_vertex: CIRCLE_VERTEX_SHADER_WEBGL1,
+            circle_fragment: CIRCLE_FRAGMENT_SHADER_WEBGL1,
+        },
+    ))
+}
+
 fn compile_shader(gl: &Gl, shader_type: u32, source: &str) -> Result<WebGlShader, JsValue> {
     let shader = gl
         .create_shader(shader_type)
@@ -2650,7 +2880,7 @@ mod tests {
     }
 
     #[test]
-    fn triangle_world_bounds_follow_asymmetric_triangle_shell() {
+    fn triangle_world_bounds_center_on_spiral_origin() {
         let settings = EngineSettings {
             board: BoardKind::LatticeTriangle,
             radius: 10.0,
@@ -2658,9 +2888,10 @@ mod tests {
         };
         let bounds = board_world_bounds(&settings, 0.0);
 
-        assert!(bounds.center_y() > 0.0);
-        assert!(bounds.min_y > -3.0_f64.sqrt() * 10.0);
-        assert_eq!(bounds.max_x, 14.5);
+        assert_eq!(bounds.center_x(), 0.0);
+        assert_eq!(bounds.center_y(), 0.0);
+        assert_eq!(bounds.max_x, 15.0);
+        assert_eq!(bounds.max_y, 3.0_f64.sqrt() * 10.0);
     }
 
     #[test]
@@ -2669,7 +2900,7 @@ mod tests {
             board: BoardKind::LatticeTriangle,
             radius: 850.0,
             display_mode: DisplayMode::FitScreen,
-            zoom: 1,
+            zoom: 1.0,
             ..EngineSettings::default()
         };
         let pixel_settings = EngineSettings {
@@ -2691,12 +2922,12 @@ mod tests {
             board: BoardKind::LatticeSquare,
             radius: 100.0,
             display_mode: DisplayMode::PixelOneToOne,
-            zoom: 4,
+            zoom: 4.0,
             ..EngineSettings::default()
         };
         let base = world_scale_for_settings(
             &EngineSettings {
-                zoom: 1,
+                zoom: 1.0,
                 ..settings.clone()
             },
             1200.0,

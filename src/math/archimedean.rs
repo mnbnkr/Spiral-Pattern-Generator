@@ -367,4 +367,23 @@ mod tests {
             assert!((distance - 1.0).abs() <= 1.0e-12);
         }
     }
+
+    #[test]
+    fn iterator_uses_unit_chords_across_offsets_and_high_indices() {
+        for offset in [0.0, 0.125, 0.5, 0.875, 1.0] {
+            let spots: Vec<_> = ArchimedeanSpots::new(offset).skip(2_500).take(32).collect();
+            assert_eq!(spots.len(), 32);
+            for pair in spots.windows(2) {
+                let distance = pair[0].center.distance(pair[1].center);
+                assert!(
+                    (distance - UNIT_TOUCH_DISTANCE).abs() <= 2.0e-10,
+                    "offset={offset}, index={}, distance={distance}",
+                    pair[0].index
+                );
+                let radius_error =
+                    (pair[0].center.radius() - ArchimedeanSpiral::radius(pair[0].theta)).abs();
+                assert!(radius_error <= 1.0e-12);
+            }
+        }
+    }
 }

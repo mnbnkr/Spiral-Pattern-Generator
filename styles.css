@@ -38,6 +38,7 @@ body {
   display: block;
   background: #08090a;
   cursor: default;
+  touch-action: none;
 }
 
 #sim-canvas.pan-enabled {
@@ -75,7 +76,7 @@ body {
   min-height: 0;
   overflow: auto;
   margin-right: -8px;
-  padding-right: 14px;
+  padding: 2px 14px 2px 4px;
   scrollbar-gutter: stable;
   scrollbar-color: #66727d transparent;
   scrollbar-width: thin;
@@ -579,6 +580,7 @@ input[type="color"] {
   gap: 6px;
   align-items: center;
   min-height: 36px;
+  padding: 2px 3px;
   cursor: grab;
   border-radius: 6px;
   outline: 1px solid transparent;
@@ -634,6 +636,13 @@ input[type="color"] {
   outline-color: rgb(247 247 247 / 35%);
 }
 
+.army-row:has(.army-swatch:hover),
+.army-row:has(.army-swatch:focus-visible),
+.army-row:has(.army-swatch.color-drag-over) {
+  background: transparent;
+  outline-color: transparent;
+}
+
 .army-row > span {
   min-width: 0;
   overflow: hidden;
@@ -644,12 +653,25 @@ input[type="color"] {
 }
 
 .army-row .army-swatch {
+  position: relative;
   width: 28px;
   height: 28px;
   min-width: 28px;
   border: 1px solid rgb(255 255 255 / 18%);
   border-radius: 999px;
   cursor: grab;
+  outline: 0 solid transparent;
+  outline-offset: 2px;
+  transition:
+    border-color 120ms ease,
+    box-shadow 120ms ease,
+    outline-color 120ms ease;
+}
+
+.army-row .army-swatch:hover,
+.army-row .army-swatch:focus-visible {
+  outline: 2px solid #55a7ff;
+  box-shadow: 0 0 0 4px rgb(85 167 255 / 18%);
 }
 
 .army-row .army-swatch.custom-color-override {
@@ -658,6 +680,19 @@ input[type="color"] {
     0 0 0 2px rgb(85 167 255 / 88%),
     0 0 0 5px rgb(8 9 10 / 72%),
     0 0 14px rgb(85 167 255 / 35%);
+}
+
+.army-row .army-swatch.custom-color-override::after {
+  content: "";
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 9px;
+  height: 9px;
+  border: 2px solid #08090a;
+  border-radius: 999px;
+  background: #f7f7f7;
+  box-shadow: 0 0 0 1px rgb(85 167 255 / 92%);
 }
 
 .army-row .army-swatch:active {

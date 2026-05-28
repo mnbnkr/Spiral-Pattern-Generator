@@ -4,7 +4,7 @@ This file is the source of truth for the app's behavior, math, architecture, UI 
 
 ## Project Shape
 
-Spiral Pattern Generator is a deterministic Rust/WASM simulation app. It places pieces on spiral-ordered boards under passive and optional proactive attack rules, renders the result with WebGL 2 point sprites on one HTML5 canvas, and keeps simulation work in a Web Worker.
+Spiral Pattern Generator is a deterministic Rust/WASM simulation app. It places pieces on spiral-ordered boards under passive and optional proactive attack rules, renders the result with WebGL point sprites on one HTML5 canvas, and keeps simulation work in a Web Worker.
 
 Required stack:
 
@@ -23,7 +23,7 @@ Do not introduce React, Yew, npm build tooling, or a heavy UI framework. Playwri
 - `src/ui`: direct DOM control binding, worker lifecycle, status text, placement log, and downloads.
 - `src/engine`: deterministic simulation state machines and spatial indexes.
 - `src/math`: board spirals, continuous geometry, root solving, and collision predicates.
-- `src/render`: WebGL 2 point-sprite renderer and deterministic image export.
+- `src/render`: WebGL point-sprite renderer and deterministic image export.
 - `src/render_data.rs`: worker-side packing of `[x, y, r, g, b]` vertices.
 - `src/protocol.rs`: typed `serde` contracts for main-thread/worker messages.
 
@@ -121,7 +121,7 @@ Reject a candidate if it would attack an existing enemy piece.
 
 Enemy mode:
 
-- `Attack-set`: enemies have different normalized attack groups `(min(abs(a), abs(b)), max(abs(a), abs(b)))`.
+- `Attack-set`: enemies have different board-specific attack groups. Square, Hex, and Continuous normalize to `(min(abs(a), abs(b)), max(abs(a), abs(b)))`; Triangle keeps ordered `(abs(a), abs(b))`.
 - `Color`: enemies have different color groups.
 - `Color-Attack-set`: enemies have different color groups or different normalized attack groups. Color is checked first, then attack-set.
 
@@ -132,10 +132,10 @@ Lattice boards use occupied-cell and attacked-cell maps keyed by board coordinat
 Continuous body overlap:
 
 ```text
-center_distance < 2 * piece_radius - 0.005 * (2 * piece_radius) - EPS
+center_distance < 2 * piece_radius - EPS
 ```
 
-That tiny continuous-only allowance keeps the configured unit-chord Archimedean spot stream from creating visual empty holes at cross-turn near-tangencies. Lattice occupancy and continuous attack-hit predicates do not use this allowance.
+For candidate placement only, Continuous mode accepts cross-turn near-tangent cases that are within `0.0045 * (2 * piece_radius)` of strict tangency. This is a placement acceptance tolerance, not a geometry rule: centers still stay on the unit-chord Archimedean stream, rendered/exported body radius stays `piece_radius`, and continuous attack-hit predicates use the strict formula below.
 
 Continuous attacks:
 
@@ -214,7 +214,7 @@ Fit Screen maps the requested radius and board-specific bounds to the viewport. 
 
 ## Rendering
 
-Pieces render on one responsive HTML5 canvas through WebGL 2 point sprites. The canvas CSS size stays viewport-driven, including dynamic mobile viewport units where supported, while the backing store is resized from the measured CSS bounds and current device pixel ratio. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
+Pieces render on one responsive HTML5 canvas through WebGL point sprites. The renderer requests WebGL 2 first and uses it whenever available; if WebGL 2 is unavailable, it falls back to WebGL 1 with GLSL 100 shader variants and the derivative extension used for antialiasing. The canvas CSS size stays viewport-driven, including dynamic mobile viewport units where supported, while the backing store is resized from the measured CSS bounds and current device pixel ratio. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
 
 Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`, with derivative-based edge coverage to reduce zoomed-out and high-DPI/mobile aliasing. Placement vertices are stored in fixed-size CPU/WebGL pages so large radius runs do not hit a single-buffer reallocation cliff; image export flattens those pages only when an export is requested.
 
@@ -238,9 +238,9 @@ Board view/export bounds are board-specific:
 
 - Square and Continuous are centered square bounds.
 - Hex uses its wider axial x extent and y extent, so side corners are visible and pannable.
-- Triangle uses its asymmetric shell bounds, so Fit Screen and exports do not leave excessive empty space below.
+- Triangle uses origin-centered shell bounds for Fit Screen, Free Camera `x1`, wheel/pinch zoom anchoring, pan clamping, and exports. The triangular shell/radius border still follows the true triangular shell geometry.
 
-In `Free Camera`, `Zoom x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Camera, shows the Zoom slider, and applies the wheel zoom around the cursor. Mouse coordinates are mapped through the current canvas CSS rectangle and backing-store ratio so panning and wheel zoom remain accurate after browser resizes and on high-DPI displays. The canvas shows pan cursors and accepts left-drag panning whenever Free Camera is active, including `x1`.
+In `Free Camera`, internal zoom `x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Camera and applies wheel zoom around the cursor; there is no visible Zoom slider. Touch input uses one-finger panning in Free Camera and two-finger pinch zoom around the touch centroid, switching from Fit Screen to Free Camera when needed. Pointer coordinates are mapped through the current canvas CSS rectangle and backing-store ratio so panning, wheel zoom, and pinch zoom remain accurate after browser resizes and on high-DPI displays.
 
 ## Image And Log Export
 
@@ -270,7 +270,7 @@ Required controls:
 - Display Mode
 - Spiral Track
 - Attack Spots
-- Zoom
+- Free Camera wheel/pinch zoom
 - Placement Search
 - Proactive Attack Rule
 - Ally / Enemy Condition
@@ -292,7 +292,7 @@ Default settings:
 - Visual Progress: enabled
 - Spiral Track: `10%`
 - Attack Spots: off
-- Zoom: `x1`
+- Internal Free Camera zoom: `x1`
 - Anchor A: `#ff7800`
 - Anchor B: `#ff0006`
 
@@ -306,11 +306,11 @@ Per-second Speed mode schedules worker ticks from the selected rate. `1/s` means
 
 `Visual Progress` off makes the worker suppress live vertices/logs and send final render/log data only on completion or after a long silent work slice yields. Re-enabling Visual Progress during a silent run cancels and pauses that run cleanly so future visual runs are not corrupted.
 
-Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highlighted while editing. On blur, invalid text is restored to the last valid value; an empty invalid field becomes `0`.
+Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highlighted while editing without clearing or dimming the current snapshot. On blur, invalid text is restored to the last valid value; an empty invalid field becomes `0`. Valid offset edits stage a new Continuous generation while preserving the current canvas/log snapshot at reduced saturation until Start, Step, or Refresh begins the staged run.
 
-Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path. Custom row color swatches can be dragged onto another row's swatch to copy the visible color; clicking an automatic swatch fixes that row's currently visible color as a semi-permanent override, and clicking a fixed swatch again resets it to the automatic order color. Fixed swatches use a stronger visible border. Copied or clicked colors do not change the automatic row color key, row order, or row cursor, but they do change the effective color identity used by `Color` and `Color-Attack-set` enemy checks. Rows with the same effective visible color are allies for color-based enemy checks. If a visible color override changes that identity relationship, the edit stages a fresh generation instead of continuing the old mathematically inconsistent run.
+Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path. Custom row color swatches can be dragged onto another row's swatch to copy the visible color; hovering or focusing a swatch uses the swatch ring instead of the whole-row hover outline. Clicking an automatic swatch fixes that row's currently visible color as a semi-permanent override, and clicking a fixed swatch again resets it to the automatic order color. Fixed swatches use a stronger visible border and marker. Fixing or unfixing a swatch whose resulting visible color and color-enemy identity are unchanged is treated as a visual no-op and does not dim the snapshot. Copied or clicked colors do not change the automatic row color key, row order, or row cursor, but they do change the effective color identity used by `Color` and `Color-Attack-set` enemy checks. Rows with the same effective visible color are allies for color-based enemy checks. If a visible color override changes that identity relationship, the edit stages a fresh generation instead of continuing the old mathematically inconsistent run.
 
-Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, populates the custom army from a session-local random pool, and immediately starts the new generation through the same guarded worker-start path as the Start button. `First Move`, `Turn Move`, and `Army Preset` are shown on one compact row, with a divider before the preset control. The move fields remain visible but disabled and visually muted when a prime preset is selected because they only apply to Custom Finite. A standard vertical divider separates Add from Random, and another divider separates Step from Refresh. The Add/Random labels include info capsules describing the move fields, row dragging, color dragging, random count, and pool editor; info capsules appear after a short hover/focus delay. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show bold moves and non-bold names on one line, such as `(2, 1) Knight`, but no order color swatches. Unknown pieces added to the pool are named `Custom` without repeating their coordinates. Active custom army rows show the row index, bold move coordinates, and a non-bold default-pool name when the coordinates match a default pool entry. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
+Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, populates the custom army from a session-local random pool, and immediately starts the new generation through the same guarded worker-start path as the Start button. `First Move`, `Turn Move`, and `Army Preset` are shown on one compact row, with a divider before the preset control. The move fields remain visible but disabled and visually muted when a prime preset is selected because they only apply to Custom Finite. A standard vertical divider separates Add from Random, and another divider separates Step from Refresh. The Add/Random labels include info capsules describing the move fields, row dragging, color dragging, random count, and pool editor; info capsules appear after a short hover/focus delay. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show bold moves and non-bold names on one line, such as `(2, 1) Knight`, but no order color swatches. Unknown pieces added to the pool are named `Custom` without repeating their coordinates. Active custom army rows show the row index, bold move coordinates, and a non-bold default-pool name when the coordinates match a default pool entry; Square, Hex, and Continuous rows use swapped move-name symmetry, while Triangle rows require the exact ordered move. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
 
 The Prime Knight `Modulo Divisor (colors)` control is hidden for Custom Finite and Prime Gapper. Color anchors remain available because custom rows and prime color gradients use them.
 
@@ -361,7 +361,7 @@ trunk build --release
 
 For frontend or rendering changes, also run the app with Trunk and verify in a browser:
 
-- WebGL 2 canvas rendering is visible and nonblank.
+- WebGL 2 canvas rendering is visible and nonblank; when WebGL 2 is unavailable, the WebGL 1 fallback is visible and nonblank.
 - The app loads from a GitHub Pages-style repository subpath, including WASM and worker assets.
 - Start/Pause remain responsive during Fastest mode.
 - Radius-bounded runs complete instead of generating outside the radius.
@@ -370,7 +370,7 @@ For frontend or rendering changes, also run the app with Trunk and verify in a b
 - Spiral Track changes redraw without resetting placement counts and keep exact lattice spiral shape through high radii without sampled compression.
 - Attack Spots changes redraw attack overlays without resetting placement counts.
 - The View / Generation Radius border is visible when Spiral Track is off, hidden when Spiral Track is visible, hidden after true edge-reaching completion, and restored immediately after settings change.
-- Hex and Triangle Fit Screen framing and exports use the full board bounds without clipping or excessive empty space.
+- Hex Fit Screen framing and exports use the full board bounds without clipping. Triangle Fit Screen, Free Camera `x1`, and exports are centered on the true spiral origin.
 - LatticeHex and ContinuousArchimedean custom runs with Attacking enabled show active rejection counts when candidates can hit enemies.
 - LatticeTriangle custom runs render and log exact triangle coordinates.
 - Refresh after a silent ContinuousArchimedean prime run leaves the app responsive without a browser reload.

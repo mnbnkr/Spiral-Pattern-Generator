@@ -6,13 +6,13 @@ use wasm_bindgen::prelude::*;
 use web_sys::{
     Blob, BlobPropertyBag, Document, DragEvent, Element, Event, HtmlAnchorElement,
     HtmlButtonElement, HtmlElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent,
-    MessageEvent, MouseEvent, Url, WheelEvent, Worker,
+    MessageEvent, MouseEvent, TouchEvent, Url, WheelEvent, Worker,
 };
 
 use crate::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DEFAULT_RADIUS,
     DisplayMode, EnemyMode, EngineSettings, EngineStats, Placement, PlacementSearchMode, ShapeKind,
-    SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp, custom_army_moves_match,
+    SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp, custom_army_moves_match_for_board,
     custom_color_group_change_affects_generation, custom_piece_order_color,
     normalize_prime_modulo_divisor, parse_hex_rgb,
 };
@@ -55,6 +55,13 @@ struct AppState {
     canvas_dragging: bool,
     canvas_last_x: f64,
     canvas_last_y: f64,
+    canvas_touch_active: bool,
+    canvas_touch_last_x: f64,
+    canvas_touch_last_y: f64,
+    canvas_pinch_active: bool,
+    canvas_pinch_last_distance: f64,
+    canvas_pinch_last_x: f64,
+    canvas_pinch_last_y: f64,
     board_select_pointer_value: Option<String>,
     preferred_square_shape: ShapeKind,
     preferred_hex_shape: ShapeKind,
@@ -139,6 +146,13 @@ pub fn boot_app() -> Result<(), JsValue> {
         canvas_dragging: false,
         canvas_last_x: 0.0,
         canvas_last_y: 0.0,
+        canvas_touch_active: false,
+        canvas_touch_last_x: 0.0,
+        canvas_touch_last_y: 0.0,
+        canvas_pinch_active: false,
+        canvas_pinch_last_distance: 0.0,
+        canvas_pinch_last_x: 0.0,
+        canvas_pinch_last_y: 0.0,
         board_select_pointer_value: None,
         preferred_square_shape: ShapeKind::Square,
         preferred_hex_shape: ShapeKind::Hex,
@@ -605,9 +619,19 @@ fn simulation_settings_match(visible: &EngineSettings, current: &EngineSettings)
         && visible.enemy_mode == current.enemy_mode
         && visible.placement_search == current.placement_search
         && visible.army_preset == current.army_preset
-        && visible.custom_army == current.custom_army
+        && custom_army_generation_equivalent(visible, current)
         && visible.continuous_offset == current.continuous_offset
         && visible.prime_modulo_divisor == current.prime_modulo_divisor
+}
+
+fn custom_army_generation_equivalent(visible: &EngineSettings, current: &EngineSettings) -> bool {
+    visible.board == current.board
+        && custom_army_moves_match_for_board(
+            visible.board,
+            &visible.custom_army,
+            &current.custom_army,
+        )
+        && !custom_color_group_change_affects_generation(visible, current)
 }
 
 fn radius_settings_match(visible: &EngineSettings, current: &EngineSettings) -> bool {
@@ -951,34 +975,21 @@ fn install_canvas_interaction_handlers(
     let wheel_state = Rc::clone(&state);
     let wheel = Closure::<dyn FnMut(WheelEvent)>::new(move |event: WheelEvent| {
         let mut state = wheel_state.borrow_mut();
-        if state.settings.display_mode == DisplayMode::FitScreen {
-            state.settings.display_mode = DisplayMode::PixelOneToOne;
-            if let Err(error) =
-                set_select_value(&wheel_document, "display-mode-select", "PixelOneToOne")
-            {
-                log_error(&error);
-            }
-            if let Err(error) = update_outputs(&wheel_document, &state.settings) {
-                log_error(&error);
-            }
-            if let Err(error) = update_renderer_snapshot(&mut state) {
-                log_error(&error);
-            }
+        if let Err(error) = activate_free_camera(&wheel_document, &mut state) {
+            log_error(&error);
         }
         if state.settings.display_mode != DisplayMode::PixelOneToOne {
             return;
         }
         event.prevent_default();
         let delta = if event.delta_y() < 0.0 { 1 } else { -1 };
-        match state
-            .renderer
-            .zoom_at(event.client_x() as f64, event.client_y() as f64, delta)
-        {
+        match state.renderer.zoom_by_steps_at(
+            event.client_x() as f64,
+            event.client_y() as f64,
+            delta,
+        ) {
             Ok(zoom) => {
                 state.settings.zoom = zoom;
-                if let Ok(input) = input(&wheel_document, "zoom-slider") {
-                    input.set_value(&zoom.to_string());
-                }
                 if let Err(error) = update_outputs(&wheel_document, &state.settings) {
                     log_error(&error);
                 }
@@ -989,7 +1000,144 @@ fn install_canvas_interaction_handlers(
     canvas.add_event_listener_with_callback("wheel", wheel.as_ref().unchecked_ref())?;
     wheel.forget();
 
+    let touch_start_state = Rc::clone(&state);
+    let touch_start_canvas = canvas.clone();
+    let touch_start = Closure::<dyn FnMut(TouchEvent)>::new(move |event: TouchEvent| {
+        let mut state = touch_start_state.borrow_mut();
+        if let Some((first, second)) = first_two_touches(&event) {
+            event.prevent_default();
+            let (distance, x, y) = touch_distance_and_center(first, second);
+            state.canvas_pinch_active = true;
+            state.canvas_pinch_last_distance = distance;
+            state.canvas_pinch_last_x = x;
+            state.canvas_pinch_last_y = y;
+            state.canvas_touch_active = false;
+            if let Err(error) = touch_start_canvas.class_list().add_1("dragging") {
+                log_error(&error);
+            }
+        } else if let Some((x, y)) = first_touch(&event) {
+            event.prevent_default();
+            state.canvas_touch_active = true;
+            state.canvas_touch_last_x = x;
+            state.canvas_touch_last_y = y;
+            state.canvas_pinch_active = false;
+            if canvas_pan_enabled(&state.settings)
+                && let Err(error) = touch_start_canvas.class_list().add_1("dragging")
+            {
+                log_error(&error);
+            }
+        }
+    });
+    canvas.add_event_listener_with_callback("touchstart", touch_start.as_ref().unchecked_ref())?;
+    touch_start.forget();
+
+    let touch_move_document = document.clone();
+    let touch_move_state = Rc::clone(&state);
+    let touch_move = Closure::<dyn FnMut(TouchEvent)>::new(move |event: TouchEvent| {
+        let mut state = touch_move_state.borrow_mut();
+        if let Some((first, second)) = first_two_touches(&event) {
+            event.prevent_default();
+            let (distance, x, y) = touch_distance_and_center(first, second);
+            if let Err(error) = activate_free_camera(&touch_move_document, &mut state) {
+                log_error(&error);
+            }
+            if state.canvas_pinch_active && state.canvas_pinch_last_distance > f64::EPSILON {
+                let factor = (distance / state.canvas_pinch_last_distance).clamp(0.25, 4.0);
+                match state.renderer.zoom_by_factor_at(x, y, factor) {
+                    Ok(zoom) => state.settings.zoom = zoom,
+                    Err(error) => log_error(&error),
+                }
+                let dx = x - state.canvas_pinch_last_x;
+                let dy = y - state.canvas_pinch_last_y;
+                if let Err(error) = state.renderer.pan_by_pixels(dx, dy) {
+                    log_error(&error);
+                }
+                if let Err(error) = update_outputs(&touch_move_document, &state.settings) {
+                    log_error(&error);
+                }
+            }
+            state.canvas_pinch_active = true;
+            state.canvas_pinch_last_distance = distance;
+            state.canvas_pinch_last_x = x;
+            state.canvas_pinch_last_y = y;
+            state.canvas_touch_active = false;
+        } else if let Some((x, y)) = first_touch(&event) {
+            if state.canvas_touch_active && canvas_pan_enabled(&state.settings) {
+                event.prevent_default();
+                let dx = x - state.canvas_touch_last_x;
+                let dy = y - state.canvas_touch_last_y;
+                if let Err(error) = state.renderer.pan_by_pixels(dx, dy) {
+                    log_error(&error);
+                }
+            }
+            state.canvas_touch_active = true;
+            state.canvas_touch_last_x = x;
+            state.canvas_touch_last_y = y;
+            state.canvas_pinch_active = false;
+        }
+    });
+    canvas.add_event_listener_with_callback("touchmove", touch_move.as_ref().unchecked_ref())?;
+    touch_move.forget();
+
+    let touch_end_state = Rc::clone(&state);
+    let touch_end_canvas = canvas.clone();
+    let touch_end = Closure::<dyn FnMut(TouchEvent)>::new(move |event: TouchEvent| {
+        let mut state = touch_end_state.borrow_mut();
+        if let Some((x, y)) = first_touch(&event) {
+            state.canvas_touch_active = true;
+            state.canvas_touch_last_x = x;
+            state.canvas_touch_last_y = y;
+        } else {
+            state.canvas_touch_active = false;
+            if let Err(error) = touch_end_canvas.class_list().remove_1("dragging") {
+                log_error(&error);
+            }
+        }
+        state.canvas_pinch_active = false;
+        state.canvas_pinch_last_distance = 0.0;
+    });
+    canvas.add_event_listener_with_callback("touchend", touch_end.as_ref().unchecked_ref())?;
+    canvas.add_event_listener_with_callback("touchcancel", touch_end.as_ref().unchecked_ref())?;
+    touch_end.forget();
+
     Ok(())
+}
+
+fn activate_free_camera(document: &Document, state: &mut AppState) -> Result<(), JsValue> {
+    if state.settings.display_mode == DisplayMode::FitScreen {
+        state.settings.display_mode = DisplayMode::PixelOneToOne;
+        set_select_value(document, "display-mode-select", "PixelOneToOne")?;
+        update_outputs(document, &state.settings)?;
+        update_renderer_snapshot(state)?;
+    }
+    Ok(())
+}
+
+fn first_touch(event: &TouchEvent) -> Option<(f64, f64)> {
+    event
+        .touches()
+        .item(0)
+        .map(|touch| (touch.client_x() as f64, touch.client_y() as f64))
+}
+
+fn first_two_touches(event: &TouchEvent) -> Option<((f64, f64), (f64, f64))> {
+    let touches = event.touches();
+    let first = touches.item(0)?;
+    let second = touches.item(1)?;
+    Some((
+        (first.client_x() as f64, first.client_y() as f64),
+        (second.client_x() as f64, second.client_y() as f64),
+    ))
+}
+
+fn touch_distance_and_center(first: (f64, f64), second: (f64, f64)) -> (f64, f64, f64) {
+    let dx = second.0 - first.0;
+    let dy = second.1 - first.1;
+    (
+        dx.hypot(dy),
+        (first.0 + second.0) * 0.5,
+        (first.1 + second.1) * 0.5,
+    )
 }
 
 fn install_panel_toggle_handler(document: &Document) -> Result<(), JsValue> {
@@ -1045,7 +1193,7 @@ fn install_control_handlers(
         SyncAction::AutoControl("visual-progress-toggle".to_string()),
     )?;
 
-    for id in ["display-mode-select", "zoom-slider", "track-opacity-slider"] {
+    for id in ["display-mode-select", "track-opacity-slider"] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::RenderOnly)?;
     }
     install_settings_handler(
@@ -1988,7 +2136,7 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         row.set_attribute("draggable", "true")?;
         install_piece_drag_handlers(&row, document.clone(), Rc::clone(&state), index)?;
 
-        let label = custom_army_piece_label(document, index, piece)?;
+        let label = custom_army_piece_label(document, settings.board, index, piece)?;
         row.append_child(&label)?;
 
         let swatch = document.create_element("span")?.dyn_into::<HtmlElement>()?;
@@ -2006,6 +2154,7 @@ fn render_army_list(document: &Document, state: Rc<RefCell<AppState>>) -> Result
         swatch.set_title(color_title);
         swatch.set_attribute("aria-label", color_title)?;
         swatch.set_attribute("draggable", "true")?;
+        swatch.set_attribute("tabindex", "0")?;
         install_piece_color_handlers(
             &swatch,
             document.clone(),
@@ -2109,6 +2258,7 @@ fn render_random_pool_list(
 
 fn custom_army_piece_label(
     document: &Document,
+    board: BoardKind,
     index: usize,
     piece: &CustomPiece,
 ) -> Result<Element, JsValue> {
@@ -2125,7 +2275,7 @@ fn custom_army_piece_label(
     mov.set_text_content(Some(&format!("({}, {}) ", piece.a, piece.b)));
     label.append_child(&mov)?;
 
-    if let Some(name_text) = random_pool_piece_name(piece.a, piece.b) {
+    if let Some(name_text) = random_pool_piece_name_for_board(board, piece.a, piece.b) {
         let name = document.create_element("span")?;
         name.set_class_name("army-piece-name");
         name.set_text_content(Some(name_text));
@@ -2159,9 +2309,17 @@ fn sync_custom_color_override(
     color: Option<String>,
 ) -> Result<(), JsValue> {
     let next_color = color.and_then(|value| normalize_css_hex_color(&value));
-    let previous_settings = {
+    let (previous_settings, action) = {
         let mut state = state.borrow_mut();
         let previous_settings = state.settings.clone();
+        let previous_display_color = previous_settings.custom_army.get(index).map(|piece| {
+            custom_piece_display_color(
+                &previous_settings,
+                index,
+                piece,
+                previous_settings.custom_army.len().max(1),
+            )
+        });
         let Some(piece) = state.settings.custom_army.get_mut(index) else {
             return Ok(());
         };
@@ -2169,16 +2327,26 @@ fn sync_custom_color_override(
             return Ok(());
         }
         piece.color_override = next_color;
-        previous_settings
+        let next_settings = state.settings.clone();
+        let next_display_color = next_settings.custom_army.get(index).map(|piece| {
+            custom_piece_display_color(
+                &next_settings,
+                index,
+                piece,
+                next_settings.custom_army.len().max(1),
+            )
+        });
+        let action = if previous_display_color == next_display_color
+            && !custom_color_group_change_affects_generation(&previous_settings, &next_settings)
+        {
+            SyncAction::RenderOnly
+        } else {
+            SyncAction::UpdateWorker
+        };
+        (previous_settings, action)
     };
 
-    sync_settings_with_previous(
-        document,
-        state,
-        SyncAction::UpdateWorker,
-        previous_settings,
-        false,
-    )
+    sync_settings_with_previous(document, state, action, previous_settings, false)
 }
 
 fn install_piece_color_handlers(
@@ -2668,6 +2836,7 @@ fn apply_synced_settings(
 
     match action {
         SyncAction::RenderOnly => {}
+        SyncAction::ResetWorker if previous_settings == settings => {}
         SyncAction::AutoControl(id) if id == "visual-progress-toggle" => {
             let turning_visual_back_on =
                 !previous_settings.visual_progress && settings.visual_progress;
@@ -2721,13 +2890,12 @@ fn apply_synced_settings(
             }
         }
         SyncAction::ResetWorker => {
-            let clear_visible = previous_settings == settings;
             recreate_worker_with_settings(
                 document,
                 Rc::clone(&state),
                 settings,
                 false,
-                clear_visible,
+                false,
                 "Reset",
             )?;
         }
@@ -2755,6 +2923,8 @@ fn sync_state_from_controls(
     state.settings = settings.clone();
     if !canvas_pan_enabled(&settings) {
         state.canvas_dragging = false;
+        state.canvas_touch_active = false;
+        state.canvas_pinch_active = false;
         if let Some(canvas) = document.get_element_by_id("sim-canvas") {
             canvas.class_list().remove_1("dragging")?;
         }
@@ -2782,6 +2952,8 @@ fn sync_state_from_controls_with_previous(
     state.settings = settings.clone();
     if !canvas_pan_enabled(&settings) {
         state.canvas_dragging = false;
+        state.canvas_touch_active = false;
+        state.canvas_pinch_active = false;
         if let Some(canvas) = document.get_element_by_id("sim-canvas") {
             canvas.class_list().remove_1("dragging")?;
         }
@@ -2894,7 +3066,7 @@ fn radius_increase_can_update_worker(current: &EngineSettings, next: &EngineSett
         && current.proactive_attacking == next.proactive_attacking
         && current.enemy_mode == next.enemy_mode
         && current.army_preset == next.army_preset
-        && custom_army_moves_match(&current.custom_army, &next.custom_army)
+        && custom_army_moves_match_for_board(current.board, &current.custom_army, &next.custom_army)
         && !custom_color_group_change_affects_generation(current, next)
         && current.continuous_offset == next.continuous_offset
         && current.prime_modulo_divisor == next.prime_modulo_divisor
@@ -3118,10 +3290,7 @@ fn read_settings(
         visual_progress: input_checked(document, "visual-progress-toggle")?,
         speed,
         display_mode,
-        zoom: input_value(document, "zoom-slider")?
-            .parse::<u8>()
-            .unwrap_or(1)
-            .clamp(1, 32),
+        zoom: fallback.zoom.clamp(1.0, 32.0),
         track_opacity: parse_finite_f64(&input_value(document, "track-opacity-slider")?, 0.0)
             .clamp(0.0, 100.0) as f32
             / 100.0,
@@ -3232,20 +3401,6 @@ fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), 
     set_disabled_class(document, "continuous-offset-group", !continuous)?;
     select(document, "enemy-mode-select")?.set_disabled(false);
 
-    let zoom_row = html_element(document, "zoom-row")?;
-    zoom_row.style().set_property(
-        "display",
-        if settings.display_mode == DisplayMode::PixelOneToOne {
-            "grid"
-        } else {
-            "none"
-        },
-    )?;
-    set_text(
-        document,
-        "zoom-output",
-        &format!("x{}", input_value(document, "zoom-slider")?),
-    )?;
     update_canvas_pan_class(document, settings)?;
 
     let custom_selected = settings.army_preset == ArmyPreset::CustomFinite;
@@ -3587,6 +3742,10 @@ fn default_random_pool() -> Vec<RandomPoolPiece> {
 }
 
 fn random_pool_piece_name(a: i32, b: i32) -> Option<&'static str> {
+    random_pool_piece_name_for_board(BoardKind::LatticeTriangle, a, b)
+}
+
+fn random_pool_piece_name_for_board(board: BoardKind, a: i32, b: i32) -> Option<&'static str> {
     [
         ("Knight", 2, 1),
         ("Fers", 1, 1),
@@ -3601,7 +3760,15 @@ fn random_pool_piece_name(a: i32, b: i32) -> Option<&'static str> {
         ("Marzban", 3, 3),
     ]
     .into_iter()
-    .find_map(|(name, piece_a, piece_b)| (a == piece_a && b == piece_b).then_some(name))
+    .find_map(|(name, piece_a, piece_b)| {
+        if board == BoardKind::LatticeTriangle {
+            (a == piece_a && b == piece_b).then_some(name)
+        } else {
+            let requested = (a.unsigned_abs(), b.unsigned_abs());
+            let named = (piece_a as u32, piece_b as u32);
+            (requested == named || requested == (named.1, named.0)).then_some(name)
+        }
+    })
 }
 
 fn random_army_from_pool(pool: &[RandomPoolPiece], count: usize) -> Vec<CustomPiece> {
