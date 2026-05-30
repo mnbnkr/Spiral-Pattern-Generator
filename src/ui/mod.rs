@@ -1,24 +1,29 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use web_sys::{
-    Blob, BlobPropertyBag, Document, DragEvent, Element, Event, HtmlAnchorElement,
+    Blob, BlobPropertyBag, Document, DragEvent, Element, Event, FileReader, HtmlAnchorElement,
     HtmlButtonElement, HtmlElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent,
     MessageEvent, MouseEvent, TouchEvent, Url, WheelEvent, Worker,
 };
 
 use crate::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DEFAULT_RADIUS,
-    DisplayMode, EnemyMode, EngineSettings, EngineStats, Placement, PlacementSearchMode, ShapeKind,
-    SpeedMode, SpotCoord, VertexBufferUpdate, WorkerToApp, custom_army_moves_match_for_board,
+    DisplayMode, EnemyMode, EngineSettings, EngineStats, MAX_FREE_CAMERA_ZOOM,
+    MIN_FREE_CAMERA_ZOOM, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
+    VertexBufferUpdate, WorkerToApp, custom_army_moves_match_for_board,
     custom_color_group_change_affects_generation, custom_piece_order_color,
     normalize_prime_modulo_divisor, parse_hex_rgb,
 };
 use crate::render::{CanvasRenderer, ExportKind};
 
 const RADIUS_COMMIT_DELAY_MS: i32 = 2_000;
+const DEFAULT_RANDOM_COUNT: usize = 3;
+const SETTINGS_EXPORT_APP: &str = "spiral-pattern-generator";
+const SETTINGS_EXPORT_VERSION: u32 = 1;
 
 struct AppState {
     worker: Worker,
@@ -71,11 +76,35 @@ struct AppState {
     active_export_button_text: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct RandomPoolPiece {
     name: String,
     a: i32,
     b: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SettingsExportFile {
+    app: String,
+    #[serde(default = "settings_export_version")]
+    version: u32,
+    settings: EngineSettings,
+    #[serde(default = "default_random_pool")]
+    random_pool: Vec<RandomPoolPiece>,
+    #[serde(default)]
+    random_pool_editing: bool,
+    #[serde(default)]
+    piece_a: i32,
+    #[serde(default)]
+    piece_b: i32,
+    #[serde(default = "default_random_count")]
+    random_count: usize,
+    #[serde(default = "default_preferred_square_shape")]
+    preferred_square_shape: ShapeKind,
+    #[serde(default = "default_preferred_hex_shape")]
+    preferred_hex_shape: ShapeKind,
+    #[serde(default = "default_preferred_triangle_shape")]
+    preferred_triangle_shape: ShapeKind,
 }
 
 #[derive(Clone)]
@@ -734,13 +763,12 @@ fn spot_coord_text(coord: SpotCoord) -> String {
     }
 }
 
-fn download_log(state: &mut AppState) -> Result<(), JsValue> {
-    let text = placement_log_text(state);
+fn download_text_file(text: &str, filename: &str, mime_type: &str) -> Result<(), JsValue> {
     let parts = js_sys::Array::new();
-    parts.push(&JsValue::from_str(&text));
+    parts.push(&JsValue::from_str(text));
 
     let options = BlobPropertyBag::new();
-    options.set_type("text/plain;charset=utf-8");
+    options.set_type(mime_type);
     let blob = Blob::new_with_str_sequence_and_options(&parts, &options)?;
     let url = Url::create_object_url_with_blob(&blob)?;
     let document = current_document()?;
@@ -748,12 +776,7 @@ fn download_log(state: &mut AppState) -> Result<(), JsValue> {
         .create_element("a")?
         .dyn_into::<HtmlAnchorElement>()?;
     anchor.set_href(&url);
-    anchor.set_download(&download_filename(
-        &state.settings,
-        state.last_stats,
-        "placement-log",
-        "txt",
-    ));
+    anchor.set_download(filename);
     anchor.click();
     Url::revoke_object_url(&url)?;
     Ok(())
@@ -1210,6 +1233,9 @@ fn install_control_handlers(
     install_select_quick_close_handlers(document, Rc::clone(&state))?;
     install_continuous_offset_blur_handler(document, Rc::clone(&state))?;
     install_prime_divisor_commit_handlers(document, Rc::clone(&state))?;
+    install_blank_number_default_handler(document, "piece-a-input", "0")?;
+    install_blank_number_default_handler(document, "piece-b-input", "0")?;
+    install_blank_number_default_handler(document, "random-count-input", "1")?;
 
     install_add_piece_handler(document, Rc::clone(&state))?;
     install_random_piece_handler(document, Rc::clone(&state))?;
@@ -1302,21 +1328,8 @@ fn install_control_handlers(
             encoder_quality: None,
         },
     )?;
-    install_image_export_button(
-        document,
-        Rc::clone(&state),
-        ImageExportButtonConfig {
-            id: "download-jpeg-button",
-            artifact: "image-half",
-            extension: "jpg",
-            mime_type: "image/jpeg",
-            kind: ExportKind::JpegHalf,
-            encoder_quality: Some(0.82),
-        },
-    )?;
-    install_button(document, "download-log-button", state, |state| {
-        download_log(state)
-    })?;
+    install_settings_export_button(document, Rc::clone(&state))?;
+    install_settings_import_handlers(document, state)?;
 
     Ok(())
 }
@@ -1425,6 +1438,23 @@ fn install_prime_divisor_commit_handlers(
     });
     divisor_input.add_event_listener_with_callback("keydown", keydown.as_ref().unchecked_ref())?;
     keydown.forget();
+    Ok(())
+}
+
+fn install_blank_number_default_handler(
+    document: &Document,
+    id: &str,
+    default_value: &'static str,
+) -> Result<(), JsValue> {
+    let input = input(document, id)?;
+    let closure_input = input.clone();
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        if closure_input.value().trim().is_empty() {
+            closure_input.set_value(default_value);
+        }
+    });
+    input.add_event_listener_with_callback("blur", closure.as_ref().unchecked_ref())?;
+    closure.forget();
     Ok(())
 }
 
@@ -1632,12 +1662,12 @@ fn install_add_piece_handler(
     let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
         let a = input_value(&document, "piece-a-input")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2);
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
         let b = input_value(&document, "piece-b-input")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1);
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
         let piece = CustomPiece::with_auto_color(a, b);
 
         if state.borrow().random_pool_editing {
@@ -1689,7 +1719,7 @@ fn install_random_piece_handler(
         let count = input_value(&document, "random-count-input")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .unwrap_or(3)
+            .unwrap_or(1)
             .min(10_000);
 
         let previous_settings = {
@@ -1905,6 +1935,262 @@ fn install_image_export_button(
 
     button.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
     closure.forget();
+    Ok(())
+}
+
+fn install_settings_export_button(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let document = document.clone();
+    let button = button(&document, "settings-export-button")?;
+    let closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        if let Err(error) = export_settings_file(&document, Rc::clone(&state)) {
+            log_error(&error);
+            if let Err(status_error) = set_status(&format!(
+                "Settings export failed: {}",
+                js_value_text(&error)
+            )) {
+                log_error(&status_error);
+            }
+        }
+    });
+    button.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())?;
+    closure.forget();
+    Ok(())
+}
+
+fn export_settings_file(document: &Document, state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
+    commit_blank_number_defaults(document)?;
+    let (settings_file, filename) = {
+        let mut state = state.borrow_mut();
+        sync_state_from_controls(document, &mut state, true)?;
+        let settings_file = settings_export_file_from_state(document, &state)?;
+        let filename = download_filename(&state.settings, state.last_stats, "settings", "json");
+        (settings_file, filename)
+    };
+    let text = serde_json::to_string_pretty(&settings_file)
+        .map_err(|error| JsValue::from_str(&format!("failed to encode settings: {error}")))?;
+    download_text_file(&text, &filename, "application/json;charset=utf-8")?;
+    set_status("Settings exported")?;
+    Ok(())
+}
+
+fn settings_export_file_from_state(
+    document: &Document,
+    state: &AppState,
+) -> Result<SettingsExportFile, JsValue> {
+    Ok(SettingsExportFile {
+        app: settings_export_app_name(),
+        version: SETTINGS_EXPORT_VERSION,
+        settings: state.settings.clone(),
+        random_pool: state.random_pool.clone(),
+        random_pool_editing: state.random_pool_editing,
+        piece_a: read_i32_control_or_default(document, "piece-a-input", 0)?,
+        piece_b: read_i32_control_or_default(document, "piece-b-input", 0)?,
+        random_count: read_usize_control_or_default(
+            document,
+            "random-count-input",
+            DEFAULT_RANDOM_COUNT,
+        )?
+        .min(10_000),
+        preferred_square_shape: state.preferred_square_shape,
+        preferred_hex_shape: state.preferred_hex_shape,
+        preferred_triangle_shape: state.preferred_triangle_shape,
+    })
+}
+
+fn install_settings_import_handlers(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+) -> Result<(), JsValue> {
+    let file_input = input(document, "settings-import-input")?;
+
+    let click_document = document.clone();
+    let import_button = button(document, "settings-import-button")?;
+    let click_closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        match input(&click_document, "settings-import-input") {
+            Ok(input) => {
+                input.set_value("");
+                input.click();
+            }
+            Err(error) => log_error(&error),
+        }
+    });
+    import_button
+        .add_event_listener_with_callback("click", click_closure.as_ref().unchecked_ref())?;
+    click_closure.forget();
+
+    let change_document = document.clone();
+    let change_state = state;
+    let change_closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+        let input = match input(&change_document, "settings-import-input") {
+            Ok(input) => input,
+            Err(error) => {
+                log_error(&error);
+                return;
+            }
+        };
+        let Some(files) = input.files() else {
+            return;
+        };
+        let Some(file) = files.item(0) else {
+            return;
+        };
+        let reader = match FileReader::new() {
+            Ok(reader) => reader,
+            Err(error) => {
+                log_error(&error);
+                return;
+            }
+        };
+
+        let load_document = change_document.clone();
+        let load_state = Rc::clone(&change_state);
+        let load_input = input.clone();
+        let load_reader = reader.clone();
+        let load_closure = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
+            load_input.set_value("");
+            let text = match load_reader.result() {
+                Ok(value) => value.as_string(),
+                Err(error) => {
+                    log_error(&error);
+                    None
+                }
+            };
+            let Some(text) = text else {
+                if let Err(error) = set_status("Import failed: selected file is not text") {
+                    log_error(&error);
+                }
+                return;
+            };
+            if let Err(error) = import_settings_text(&load_document, Rc::clone(&load_state), &text)
+                && let Err(status_error) =
+                    set_status(&format!("Import failed: {}", js_value_text(&error)))
+            {
+                log_error(&status_error);
+            }
+        });
+        reader.set_onload(Some(load_closure.as_ref().unchecked_ref()));
+        load_closure.forget();
+        if let Err(error) = reader.read_as_text(file.as_ref()) {
+            log_error(&error);
+        }
+    });
+    file_input
+        .add_event_listener_with_callback("change", change_closure.as_ref().unchecked_ref())?;
+    change_closure.forget();
+    Ok(())
+}
+
+fn import_settings_text(
+    document: &Document,
+    state: Rc<RefCell<AppState>>,
+    text: &str,
+) -> Result<(), JsValue> {
+    let mut settings_file: SettingsExportFile = serde_json::from_str(text)
+        .map_err(|error| JsValue::from_str(&format!("invalid settings JSON: {error}")))?;
+    if settings_file.app != SETTINGS_EXPORT_APP {
+        return Err(JsValue::from_str(
+            "file is not a Spiral Pattern Generator settings export",
+        ));
+    }
+    if settings_file.version > SETTINGS_EXPORT_VERSION {
+        return Err(JsValue::from_str(
+            "settings export was created by a newer app version",
+        ));
+    }
+
+    settings_file.settings = normalize_imported_settings(settings_file.settings);
+    settings_file.random_pool = normalize_imported_random_pool(settings_file.random_pool);
+    settings_file.random_pool_editing = settings_file.random_pool_editing
+        && settings_file.settings.army_preset == ArmyPreset::CustomFinite;
+    settings_file.preferred_square_shape =
+        normalize_preferred_lattice_shape(settings_file.preferred_square_shape, ShapeKind::Square);
+    settings_file.preferred_hex_shape =
+        normalize_preferred_lattice_shape(settings_file.preferred_hex_shape, ShapeKind::Hex);
+    settings_file.preferred_triangle_shape =
+        normalize_preferred_triangle_shape(settings_file.preferred_triangle_shape);
+
+    set_controls_from_settings_export(document, &settings_file)?;
+    {
+        let mut state = state.borrow_mut();
+        state.random_pool = settings_file.random_pool.clone();
+        state.random_pool_editing = settings_file.random_pool_editing;
+        state.preferred_square_shape = settings_file.preferred_square_shape;
+        state.preferred_hex_shape = settings_file.preferred_hex_shape;
+        state.preferred_triangle_shape = settings_file.preferred_triangle_shape;
+    }
+
+    recreate_worker_with_settings(
+        document,
+        Rc::clone(&state),
+        settings_file.settings.clone(),
+        false,
+        false,
+        "Settings imported | Paused",
+    )?;
+    render_army_list(document, Rc::clone(&state))?;
+    update_outputs(document, &settings_file.settings)?;
+    schedule_render(state)?;
+    Ok(())
+}
+
+fn set_controls_from_settings_export(
+    document: &Document,
+    settings_file: &SettingsExportFile,
+) -> Result<(), JsValue> {
+    let settings = &settings_file.settings;
+    set_select_value(document, "board-select", board_value(settings.board))?;
+    set_select_value(document, "shape-select", shape_value(settings.shape))?;
+    input(document, "radius-input")?.set_value(&finite_number_text(settings.radius));
+    input(document, "piece-radius-slider")?
+        .set_value(&format!("{:.2}", settings.piece_radius.clamp(0.05, 0.5)));
+    match settings.speed {
+        SpeedMode::Fastest => {
+            input(document, "fastest-toggle")?.set_checked(true);
+            input(document, "speed-slider")?.set_value("250");
+        }
+        SpeedMode::PerSecond(value) => {
+            input(document, "fastest-toggle")?.set_checked(false);
+            input(document, "speed-slider")?.set_value(&value.max(1).to_string());
+        }
+    }
+    input(document, "visual-progress-toggle")?.set_checked(settings.visual_progress);
+    set_select_value(
+        document,
+        "display-mode-select",
+        display_mode_value(settings.display_mode),
+    )?;
+    input(document, "track-opacity-slider")?
+        .set_value(&percent_slider_value(settings.track_opacity));
+    input(document, "attack-overlay-opacity-slider")?
+        .set_value(&percent_slider_value(settings.attack_overlay_opacity));
+    input(document, "attacking-toggle")?.set_checked(settings.proactive_attacking);
+    set_select_value(
+        document,
+        "enemy-mode-select",
+        enemy_mode_value(settings.enemy_mode),
+    )?;
+    set_select_value(
+        document,
+        "placement-search-select",
+        placement_search_value(settings.placement_search),
+    )?;
+    set_select_value(
+        document,
+        "army-preset-select",
+        army_preset_value(settings.army_preset),
+    )?;
+    input(document, "continuous-offset-input")?
+        .set_value(&continuous_offset_value_text(settings.continuous_offset));
+    input(document, "prime-divisor-input")?.set_value(&settings.prime_modulo_divisor.to_string());
+    input(document, "anchor-a-input")?.set_value(&settings.anchor_color_a);
+    input(document, "anchor-b-input")?.set_value(&settings.anchor_color_b);
+    input(document, "piece-a-input")?.set_value(&settings_file.piece_a.to_string());
+    input(document, "piece-b-input")?.set_value(&settings_file.piece_b.to_string());
+    input(document, "random-count-input")?
+        .set_value(&settings_file.random_count.min(10_000).to_string());
     Ok(())
 }
 
@@ -3189,6 +3475,46 @@ fn shape_value(shape: ShapeKind) -> &'static str {
     }
 }
 
+fn board_value(board: BoardKind) -> &'static str {
+    match board {
+        BoardKind::LatticeSquare => "LatticeSquare",
+        BoardKind::LatticeHex => "LatticeHex",
+        BoardKind::LatticeTriangle => "LatticeTriangle",
+        BoardKind::ContinuousArchimedean => "ContinuousArchimedean",
+    }
+}
+
+fn display_mode_value(display_mode: DisplayMode) -> &'static str {
+    match display_mode {
+        DisplayMode::FitScreen => "FitScreen",
+        DisplayMode::PixelOneToOne => "PixelOneToOne",
+    }
+}
+
+fn enemy_mode_value(enemy_mode: EnemyMode) -> &'static str {
+    match enemy_mode {
+        EnemyMode::AttackSet => "AttackSet",
+        EnemyMode::Color => "Color",
+        EnemyMode::ColorAttackSet => "ColorAttackSet",
+        EnemyMode::FreeForAll => "FreeForAll",
+    }
+}
+
+fn placement_search_value(placement_search: PlacementSearchMode) -> &'static str {
+    match placement_search {
+        PlacementSearchMode::SpiralPath => "SpiralPath",
+        PlacementSearchMode::CenterDistance => "CenterDistance",
+    }
+}
+
+fn army_preset_value(army_preset: ArmyPreset) -> &'static str {
+    match army_preset {
+        ArmyPreset::CustomFinite => "CustomFinite",
+        ArmyPreset::PrimeKnight => "PrimeKnight",
+        ArmyPreset::PrimeGapper => "PrimeGapper",
+    }
+}
+
 fn resolve_sync_action(
     action: SyncAction,
     previous: &EngineSettings,
@@ -3271,6 +3597,7 @@ fn read_settings(
     let enemy_mode = match select_value(document, "enemy-mode-select")?.as_str() {
         "Color" => EnemyMode::Color,
         "ColorAttackSet" => EnemyMode::ColorAttackSet,
+        "FreeForAll" => EnemyMode::FreeForAll,
         _ => EnemyMode::AttackSet,
     };
 
@@ -3290,7 +3617,9 @@ fn read_settings(
         visual_progress: input_checked(document, "visual-progress-toggle")?,
         speed,
         display_mode,
-        zoom: fallback.zoom.clamp(1.0, 32.0),
+        zoom: fallback
+            .zoom
+            .clamp(MIN_FREE_CAMERA_ZOOM, MAX_FREE_CAMERA_ZOOM),
         track_opacity: parse_finite_f64(&input_value(document, "track-opacity-slider")?, 0.0)
             .clamp(0.0, 100.0) as f32
             / 100.0,
@@ -3310,6 +3639,86 @@ fn read_settings(
         anchor_color_a: input_value(document, "anchor-a-input")?,
         anchor_color_b: input_value(document, "anchor-b-input")?,
     })
+}
+
+fn normalize_imported_settings(mut settings: EngineSettings) -> EngineSettings {
+    settings.radius = finite_or_default(settings.radius, DEFAULT_RADIUS).max(1.0);
+    settings.piece_radius = finite_or_default(settings.piece_radius, 0.5).clamp(0.05, 0.5);
+    settings.zoom =
+        finite_or_default(settings.zoom, 1.0).clamp(MIN_FREE_CAMERA_ZOOM, MAX_FREE_CAMERA_ZOOM);
+    settings.track_opacity = finite_f32_or_default(settings.track_opacity, 0.1).clamp(0.0, 1.0);
+    settings.attack_overlay_opacity =
+        finite_f32_or_default(settings.attack_overlay_opacity, 0.0).clamp(0.0, 1.0);
+    settings.continuous_offset = finite_or_default(settings.continuous_offset, 0.0).clamp(0.0, 1.0);
+    settings.prime_modulo_divisor = normalize_prime_modulo_divisor(settings.prime_modulo_divisor);
+    settings.anchor_color_a = normalize_css_hex_color(&settings.anchor_color_a)
+        .unwrap_or_else(|| crate::protocol::DEFAULT_ANCHOR_A.to_string());
+    settings.anchor_color_b = normalize_css_hex_color(&settings.anchor_color_b)
+        .unwrap_or_else(|| crate::protocol::DEFAULT_ANCHOR_B.to_string());
+    settings.custom_army = normalize_custom_army(settings.custom_army);
+    settings.shape = normalize_shape_for_board(settings.board, settings.shape);
+    settings.speed = match settings.speed {
+        SpeedMode::PerSecond(value) => SpeedMode::PerSecond(value.max(1)),
+        SpeedMode::Fastest => SpeedMode::Fastest,
+    };
+    settings
+}
+
+fn finite_or_default(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() { value } else { fallback }
+}
+
+fn finite_f32_or_default(value: f32, fallback: f32) -> f32 {
+    if value.is_finite() { value } else { fallback }
+}
+
+fn normalize_shape_for_board(board: BoardKind, shape: ShapeKind) -> ShapeKind {
+    match board {
+        BoardKind::ContinuousArchimedean => ShapeKind::Circle,
+        BoardKind::LatticeTriangle => normalize_preferred_triangle_shape(shape),
+        BoardKind::LatticeSquare | BoardKind::LatticeHex => {
+            normalize_preferred_lattice_shape(shape, ShapeKind::Square)
+        }
+    }
+}
+
+fn normalize_preferred_lattice_shape(shape: ShapeKind, fallback: ShapeKind) -> ShapeKind {
+    if matches!(
+        shape,
+        ShapeKind::Square | ShapeKind::Circle | ShapeKind::Hex
+    ) {
+        shape
+    } else {
+        fallback
+    }
+}
+
+fn normalize_preferred_triangle_shape(shape: ShapeKind) -> ShapeKind {
+    if matches!(shape, ShapeKind::Triangle | ShapeKind::Circle) {
+        shape
+    } else {
+        ShapeKind::Triangle
+    }
+}
+
+fn normalize_imported_random_pool(pool: Vec<RandomPoolPiece>) -> Vec<RandomPoolPiece> {
+    pool.into_iter()
+        .take(10_000)
+        .map(|piece| {
+            let trimmed = piece.name.trim();
+            let name = if trimmed.is_empty() {
+                random_pool_piece_name(piece.a, piece.b)
+                    .map_or_else(|| "Custom".to_string(), str::to_string)
+            } else {
+                trimmed.chars().take(80).collect()
+            };
+            RandomPoolPiece {
+                name,
+                a: piece.a,
+                b: piece.b,
+            }
+        })
+        .collect()
 }
 
 fn read_prime_modulo_divisor(
@@ -3349,6 +3758,60 @@ fn parse_finite_f64(raw: &str, fallback: f64) -> f64 {
         Ok(value) if value.is_finite() => value,
         _ => fallback,
     }
+}
+
+fn commit_blank_number_defaults(document: &Document) -> Result<(), JsValue> {
+    commit_blank_input_default(document, "piece-a-input", "0")?;
+    commit_blank_input_default(document, "piece-b-input", "0")?;
+    commit_blank_input_default(document, "random-count-input", "1")
+}
+
+fn commit_blank_input_default(
+    document: &Document,
+    id: &str,
+    default_value: &str,
+) -> Result<(), JsValue> {
+    let input = input(document, id)?;
+    if input.value().trim().is_empty() {
+        input.set_value(default_value);
+    }
+    Ok(())
+}
+
+fn read_i32_control_or_default(
+    document: &Document,
+    id: &str,
+    default_value: i32,
+) -> Result<i32, JsValue> {
+    Ok(input_value(document, id)?
+        .trim()
+        .parse()
+        .unwrap_or(default_value))
+}
+
+fn read_usize_control_or_default(
+    document: &Document,
+    id: &str,
+    default_value: usize,
+) -> Result<usize, JsValue> {
+    Ok(input_value(document, id)?
+        .trim()
+        .parse()
+        .unwrap_or(default_value))
+}
+
+fn finite_number_text(value: f64) -> String {
+    let text = format!("{:.12}", value);
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn percent_slider_value(value: f32) -> String {
+    ((value.clamp(0.0, 1.0) * 100.0).round() as u32).to_string()
 }
 
 fn update_outputs(document: &Document, settings: &EngineSettings) -> Result<(), JsValue> {
@@ -3716,6 +4179,30 @@ fn normalize_custom_army(army: Vec<CustomPiece>) -> Vec<CustomPiece> {
 
 fn normalize_css_hex_color(value: &str) -> Option<String> {
     parse_hex_rgb(value).map(|color| color.to_css_hex())
+}
+
+fn settings_export_app_name() -> String {
+    SETTINGS_EXPORT_APP.to_string()
+}
+
+fn settings_export_version() -> u32 {
+    SETTINGS_EXPORT_VERSION
+}
+
+fn default_random_count() -> usize {
+    DEFAULT_RANDOM_COUNT
+}
+
+fn default_preferred_square_shape() -> ShapeKind {
+    ShapeKind::Square
+}
+
+fn default_preferred_hex_shape() -> ShapeKind {
+    ShapeKind::Hex
+}
+
+fn default_preferred_triangle_shape() -> ShapeKind {
+    ShapeKind::Triangle
 }
 
 fn default_random_pool() -> Vec<RandomPoolPiece> {

@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_ANCHOR_A: &str = "#ff7800";
 pub const DEFAULT_ANCHOR_B: &str = "#ff0006";
 pub const DEFAULT_RADIUS: f64 = 200.0;
+pub const MIN_FREE_CAMERA_ZOOM: f64 = 1.0;
+pub const MAX_FREE_CAMERA_ZOOM: f64 = 256.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BoardKind {
@@ -31,6 +33,7 @@ pub enum EnemyMode {
     AttackSet,
     Color,
     ColorAttackSet,
+    FreeForAll,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

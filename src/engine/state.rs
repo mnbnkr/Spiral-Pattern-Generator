@@ -786,6 +786,10 @@ impl SimulationEngine {
     }
 
     fn are_enemies(&self, existing: &PlacedPiece, candidate: &CandidatePiece) -> bool {
+        if self.settings.enemy_mode == EnemyMode::FreeForAll {
+            return true;
+        }
+
         if self.enemy_mode_uses_color() && existing.enemy_color_group != candidate.enemy_color_group
         {
             return true;
@@ -1825,6 +1829,7 @@ mod tests {
                         EnemyMode::AttackSet,
                         EnemyMode::Color,
                         EnemyMode::ColorAttackSet,
+                        EnemyMode::FreeForAll,
                     ] {
                         let radius = if board == BoardKind::ContinuousArchimedean {
                             1.5
@@ -2050,6 +2055,40 @@ mod tests {
     }
 
     #[test]
+    fn free_for_all_rejects_same_color_and_attack_set_attacks() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            placement_search: PlacementSearchMode::SpiralPath,
+            enemy_mode: EnemyMode::FreeForAll,
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_color_override(2, 1, "#ff7800"),
+            ],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(64, 1_000_000);
+
+        assert_eq!(batch.len(), 64);
+        assert!(
+            engine.stats().passive_rejections > 0,
+            "Free for All should reject same-color, same-attack-set attacks"
+        );
+
+        let mut earlier: Vec<&Placement> = Vec::new();
+        for placement in &batch {
+            for attacker in &earlier {
+                assert!(
+                    !placement_attacks(attacker, placement, BoardKind::LatticeSquare, 0.5),
+                    "spot {} was attacked by same-color same-attack-set spot {}",
+                    placement.spot_index,
+                    attacker.spot_index
+                );
+            }
+            earlier.push(placement);
+        }
+    }
+
+    #[test]
     fn custom_two_color_square_knights_keep_per_row_forward_cursors() {
         let mut engine = SimulationEngine::new(EngineSettings {
             board: BoardKind::LatticeSquare,
@@ -2116,6 +2155,13 @@ mod tests {
                     vec![
                         CustomPiece::with_auto_color(2, 1),
                         CustomPiece::with_auto_color(3, 1),
+                    ],
+                ),
+                (
+                    EnemyMode::FreeForAll,
+                    vec![
+                        CustomPiece::with_auto_color(2, 1),
+                        CustomPiece::with_color_override(2, 1, "#ff7800"),
                     ],
                 ),
             ] {
@@ -3055,6 +3101,7 @@ mod tests {
             EnemyMode::Color => different_color,
             EnemyMode::AttackSet => different_attack_set,
             EnemyMode::ColorAttackSet => different_color || different_attack_set,
+            EnemyMode::FreeForAll => true,
         }
     }
 

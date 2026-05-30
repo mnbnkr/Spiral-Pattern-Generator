@@ -8,7 +8,7 @@ Spiral Pattern Generator is a deterministic Rust/WASM simulation app. It places 
 
 Required stack:
 
-- Rust `1.96.0-beta.9`
+- Rust `1.96` stable
 - Target `wasm32-unknown-unknown`
 - Trunk for browser build and local serving
 - `wasm-bindgen`, `web-sys`, and `js-sys` for browser APIs
@@ -124,6 +124,7 @@ Enemy mode:
 - `Attack-set`: enemies have different board-specific attack groups. Square, Hex, and Continuous normalize to `(min(abs(a), abs(b)), max(abs(a), abs(b)))`; Triangle keeps ordered `(abs(a), abs(b))`.
 - `Color`: enemies have different color groups.
 - `Color-Attack-set`: enemies have different color groups or different normalized attack groups. Color is checked first, then attack-set.
+- `Free for All`: every previously placed piece is an enemy of the candidate, regardless of color group or attack-set.
 
 For custom finite armies, two pieces with the same attack-set but different row colors are enemies in `Color` mode and allies in `Attack-set` mode. In `Color` mode, a spot attacked only by same-color pieces is legal; a spot attacked by any different-color piece is illegal.
 
@@ -198,6 +199,7 @@ Prime modes search spots for the current prime piece and only move to the next p
 
 - In `Attack-set` and `Color-Attack-set`, all prime pieces share one spot cursor.
 - In `Color`, Prime Knight uses one cursor per modulo-bounce color bucket, and Prime Gapper uses one cursor per gap value.
+- In `Free for All`, all prime pieces share one spot cursor because every placed piece is an enemy.
 - If passive or proactive rules reject a spot for the current prime piece, only that piece's active cursor advances. The piece keeps searching until it is placed or the current radius bound is exhausted.
 
 ## Radius And Staged Generations
@@ -240,21 +242,22 @@ Board view/export bounds are board-specific:
 - Hex uses its wider axial x extent and y extent, so side corners are visible and pannable.
 - Triangle uses origin-centered shell bounds for Fit Screen, Free Camera `x1`, wheel/pinch zoom anchoring, pan clamping, and exports. The triangular shell/radius border still follows the true triangular shell geometry.
 
-In `Free Camera`, internal zoom `x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Scrolling the canvas while in Fit Screen switches to Free Camera and applies wheel zoom around the cursor; there is no visible Zoom slider. Touch input uses one-finger panning in Free Camera and two-finger pinch zoom around the touch centroid, switching from Fit Screen to Free Camera when needed. Pointer coordinates are mapped through the current canvas CSS rectangle and backing-store ratio so panning, wheel zoom, and pinch zoom remain accurate after browser resizes and on high-DPI displays.
+In `Free Camera`, internal zoom `x1` is anchored to the same requested Radius bounds as Fit Screen, so the whole current board radius is visible at `x1`. Higher zoom levels multiply that fit scale while keeping cursor-centered wheel zoom and bounded left-drag panning. Mouse-wheel zoom is relative to the current zoom level: each wheel step changes zoom by 20%, so zooming remains responsive at both low and high magnification, up to `x256`. Scrolling the canvas while in Fit Screen switches to Free Camera and applies wheel zoom around the cursor; there is no visible Zoom slider. Touch input uses one-finger panning in Free Camera and two-finger pinch zoom around the touch centroid, switching from Fit Screen to Free Camera when needed. Pointer coordinates are mapped through the current canvas CSS rectangle and backing-store ratio so panning, wheel zoom, and pinch zoom remain accurate after browser resizes and on high-DPI displays.
 
-## Image And Log Export
+## Image And Settings Export
 
 Image export never copies the visible viewport canvas. It renders deterministic offscreen pixels from placement/vertex data. Export buttons re-read the visible controls for render bounds and filenames, but they do not force a pending Radius commit into the worker.
 
 - Full PNG preserves strict deterministic scale.
 - PNG keeps square/cell exports at one cell per pixel and caps non-square piece diameter to practical size.
-- Half JPEG intentionally uses half resolution and lossy compression.
 - LatticeSquare Square exports use nearest-neighbor one-cell pixels.
 - Non-square, Hex, Triangle, and Continuous exports use smoothed supersampled rasterization.
 - Image exports run in browser-scheduled chunks. Square Lattice Square exports write one cell directly to one output pixel instead of rasterizing every square shape, so large one-cell PNG exports avoid unnecessary per-piece shape loops. While an export is preparing, the clicked image button changes to `Cancel`; clicking it requests cancellation and restores the button when the worker-visible export job stops. Allocation, canvas, encoder failures, and encoder timeouts surface as visible status errors and restore the clicked button so later exports can run.
 - Filenames include render settings and placement count.
 
-The placement log must stay wired. It records settings, first placements, latest placements, exact coordinates, piece signatures, color groups, and color rules. The log is downloadable.
+Settings Export writes a JSON file for the current user-facing configuration: engine settings, custom pieces, First/Turn Move fields, Random count, editable random pool, random-pool editor state, and per-board session shape preferences. Settings Import reads that file through a file picker, restores the controls, stages a fresh worker generation, and keeps the current visible snapshot until Start, Step, or Refresh begins the imported run.
+
+The placement log must stay wired and visible. It records settings, first placements, latest placements, exact coordinates, piece signatures, color groups, and color rules.
 
 ## UI Semantics
 
@@ -278,7 +281,7 @@ Required controls:
 - Custom army editor
 - Start/End color anchors
 - Refresh, Start, Pause, Step
-- Full PNG, PNG, Half JPEG, Log downloads
+- Full PNG, PNG, settings Export, and settings Import
 
 Default settings:
 
@@ -310,7 +313,7 @@ Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highl
 
 Custom rows are draggable/reorderable and also have up/down arrow buttons. Reordering, adding, or deleting rows stages a new generation while keeping the old snapshot dimmed until Start, Step, or Refresh begins the replacement run. A drag/drop that leaves the exact same row order, including swaps between identical rows, is treated as a visual no-op and does not clear or dim the current snapshot. Deleting the last custom piece leaves an empty placeholder row. Custom colors are attached to row order, not to piece definitions: first row is Anchor A, last row is Anchor B, and intermediate rows follow the hue path. Custom row color swatches can be dragged onto another row's swatch to copy the visible color; hovering or focusing a swatch uses the swatch ring instead of the whole-row hover outline. Clicking an automatic swatch fixes that row's currently visible color as a semi-permanent override, and clicking a fixed swatch again resets it to the automatic order color. Fixed swatches use a stronger visible border and marker. Fixing or unfixing a swatch whose resulting visible color and color-enemy identity are unchanged is treated as a visual no-op and does not dim the snapshot. Copied or clicked colors do not change the automatic row color key, row order, or row cursor, but they do change the effective color identity used by `Color` and `Color-Attack-set` enemy checks. Rows with the same effective visible color are allies for color-based enemy checks. If a visible color override changes that identity relationship, the edit stages a fresh generation instead of continuing the old mathematically inconsistent run.
 
-Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, populates the custom army from a session-local random pool, and immediately starts the new generation through the same guarded worker-start path as the Start button. `First Move`, `Turn Move`, and `Army Preset` are shown on one compact row, with a divider before the preset control. The move fields remain visible but disabled and visually muted when a prime preset is selected because they only apply to Custom Finite. A standard vertical divider separates Add from Random, and another divider separates Step from Refresh. The Add/Random labels include info capsules describing the move fields, row dragging, color dragging, random count, and pool editor; info capsules appear after a short hover/focus delay. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show bold moves and non-bold names on one line, such as `(2, 1) Knight`, but no order color swatches. Unknown pieces added to the pool are named `Custom` without repeating their coordinates. Active custom army rows show the row index, bold move coordinates, and a non-bold default-pool name when the coordinates match a default pool entry; Square, Hex, and Continuous rows use swapped move-name symmetry, while Triangle rows require the exact ordered move. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
+Custom Finite also has Random controls. The Random button is enabled only in Custom Finite, uses a count field defaulting to `3`, populates the custom army from a session-local random pool, and immediately starts the new generation through the same guarded worker-start path as the Start button. If the Random count field is left blank and blurred, it commits to `1`. `First Move`, `Turn Move`, and `Army Preset` are shown on one compact row, with a divider before the preset control. If either move field is left blank and blurred, it commits to `0`. The move fields remain visible but disabled and visually muted when a prime preset is selected because they only apply to Custom Finite. A standard vertical divider separates Add from Random, another divider separates Step from Refresh, and another separates PNG image exports from settings Export/Import. The Add/Random labels include info capsules describing the move fields, row dragging, color dragging, random count, and pool editor; info capsules appear after a short hover/focus delay. The pool starts with Knight `(2,1)`, Fers `(1,1)`, Vazir `(1,0)`, Camel `(3,1)`, Zebra `(3,2)`, Antelope `(4,3)`, Eland `(5,3)`, Satrap `(2,0)`, Aspbad `(2,2)`, Spehbed `(3,0)`, and Marzban `(3,3)`. The square edit button toggles an editable pool view in the same list area; pool rows show bold moves and non-bold names on one line, such as `(2, 1) Knight`, but no order color swatches. Unknown pieces added to the pool are named `Custom` without repeating their coordinates. Active custom army rows show the row index, bold move coordinates, and a non-bold default-pool name when the coordinates match a default pool entry; Square, Hex, and Continuous rows use swapped move-name symmetry, while Triangle rows require the exact ordered move. Random generation samples without replacement until the pool is exhausted, then reshuffles and reuses the pool if more pieces are requested.
 
 The Prime Knight `Modulo Divisor (colors)` control is hidden for Custom Finite and Prime Gapper. Color anchors remain available because custom rows and prime color gradients use them.
 

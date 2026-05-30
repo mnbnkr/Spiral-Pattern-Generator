@@ -223,7 +223,7 @@
                 <span
                   class="info-icon"
                   tabindex="0"
-                  data-tip="Attack-set treats different normalized attack jumps as enemies. Color treats different color groups as enemies. Color-Attack-set applies both."
+                  data-tip="Attack-set treats different normalized attack jumps as enemies. Color treats different color groups as enemies. Color-Attack-set applies both. Free for All treats every piece as unique."
                   >i</span
                 ></span
               >
@@ -231,6 +231,7 @@
                 <option value="AttackSet">Attack-set</option>
                 <option value="Color" selected>Color</option>
                 <option value="ColorAttackSet">Color-Attack-set</option>
+                <option value="FreeForAll">Free for All</option>
               </select>
             </label>
 
@@ -435,11 +436,20 @@
           <button id="refresh-button" type="button">Refresh</button>
         </section>
 
-        <section class="button-row">
+        <section class="button-row export-button-row">
           <button id="download-full-png-button" type="button">Full PNG</button>
           <button id="download-png-button" type="button">PNG</button>
-          <button id="download-jpeg-button" type="button">Half JPEG</button>
-          <button id="download-log-button" type="button">Log</button>
+          <span class="button-row-divider" aria-hidden="true"></span>
+          <button id="settings-export-button" type="button">Export &#9881;&#xfe0e;</button>
+          <button id="settings-import-button" type="button">Import &#9881;&#xfe0e;</button>
+          <input
+            id="settings-import-input"
+            class="visually-hidden-file-input"
+            type="file"
+            accept="application/json,.json"
+            aria-hidden="true"
+            tabindex="-1"
+          />
         </section>
 
         <section class="control-section log-section">

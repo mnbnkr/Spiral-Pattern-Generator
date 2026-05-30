@@ -87,11 +87,17 @@ async function expectCanvasViewport(page, width: number, height: number) {
   await expect
     .poll(async () => {
       const metrics = await canvasViewportMetrics(page);
+      const expectedBackingWidth = metrics.cssWidth * metrics.dpr;
+      const expectedBackingHeight = metrics.cssHeight * metrics.dpr;
       return (
         Math.abs(metrics.cssWidth - width) <= 1 &&
         Math.abs(metrics.cssHeight - height) <= 1 &&
         metrics.inlineWidth === "" &&
-        metrics.inlineHeight === ""
+        metrics.inlineHeight === "" &&
+        metrics.backingWidth >= Math.floor(expectedBackingWidth) - 1 &&
+        metrics.backingWidth <= Math.ceil(expectedBackingWidth) + 1 &&
+        metrics.backingHeight >= Math.floor(expectedBackingHeight) - 1 &&
+        metrics.backingHeight <= Math.ceil(expectedBackingHeight) + 1
       );
     })
     .toBe(true);
@@ -215,10 +221,17 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect(page.locator("#enemy-mode-select option").nth(2)).toHaveText(
     "Color-Attack-set",
   );
+  await expect(page.locator("#enemy-mode-select option").nth(3)).toHaveText(
+    "Free for All",
+  );
   await expect(page.locator("#radius-input")).toHaveValue("200");
   await expect(page.locator("#track-opacity-output")).toHaveText("10%");
   await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
-  await expect(page.locator("#download-jpeg-button")).toHaveText("Half JPEG");
+  await expect(page.locator("#download-jpeg-button")).toHaveCount(0);
+  await expect(page.locator("#download-log-button")).toHaveCount(0);
+  await expect(page.locator("#settings-export-button")).toContainText("Export");
+  await expect(page.locator("#settings-import-button")).toContainText("Import");
+  await expect(page.locator(".export-button-row .button-row-divider")).toBeVisible();
   await expect(page.locator("#sim-canvas")).toHaveAttribute(
     "data-webgl-context",
     "webgl2",
@@ -766,6 +779,85 @@ test("random custom army controls populate and edit the random pool", async ({
   await expect(page.locator("#prime-divisor-label")).toBeHidden();
 });
 
+test("blank move and random count inputs commit defaults on blur", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+
+  await page.fill("#piece-a-input", "");
+  await page.locator("#piece-b-input").focus();
+  await expect(page.locator("#piece-a-input")).toHaveValue("0");
+
+  await page.fill("#piece-b-input", "");
+  await page.locator("#random-count-input").focus();
+  await expect(page.locator("#piece-b-input")).toHaveValue("0");
+
+  await page.fill("#random-count-input", "");
+  await page.locator("#piece-a-input").focus();
+  await expect(page.locator("#random-count-input")).toHaveValue("1");
+});
+
+test("settings export and import restore controls, army, and random pool", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.selectOption("#board-select", "LatticeHex");
+  await page.selectOption("#enemy-mode-select", "FreeForAll");
+  await page.fill("#radius-input", "33");
+  await page.fill("#piece-a-input", "7");
+  await page.fill("#piece-b-input", "4");
+  await page.click("#add-piece-button");
+  await expect(page.locator(".army-row")).toHaveCount(3);
+  await page.fill("#random-count-input", "4");
+
+  await page.click("#random-pool-toggle-button");
+  await page.fill("#piece-a-input", "9");
+  await page.fill("#piece-b-input", "5");
+  await page.click("#add-piece-button");
+  await expect(page.locator(".random-pool-row")).toHaveCount(12);
+  await expect(page.locator("#army-list")).toContainText("(9, 5) Custom");
+  await page.click("#random-pool-toggle-button");
+
+  const exportDownload = page.waitForEvent("download");
+  await page.click("#settings-export-button");
+  const exported = await exportDownload;
+  expect(exported.suggestedFilename()).toContain("settings");
+  expect(exported.suggestedFilename()).toMatch(/\.json$/);
+  const exportedPath = await exported.path();
+  if (!exportedPath) throw new Error("settings export path unavailable");
+
+  await page.selectOption("#board-select", "LatticeSquare");
+  await page.selectOption("#enemy-mode-select", "Color");
+  await page.fill("#radius-input", "12");
+  await page.fill("#random-count-input", "1");
+  await page.setInputFiles("#settings-import-input", exportedPath);
+
+  await expect(page.locator("#status-line")).toContainText("Settings imported");
+  await expect(page.locator("#board-select")).toHaveValue("LatticeHex");
+  await expect(page.locator("#enemy-mode-select")).toHaveValue("FreeForAll");
+  await expect(page.locator("#radius-input")).toHaveValue("33");
+  await expect(page.locator("#random-count-input")).toHaveValue("4");
+  await expect(page.locator("#piece-a-input")).toHaveValue("9");
+  await expect(page.locator("#piece-b-input")).toHaveValue("5");
+  await expect(page.locator(".army-row")).toHaveCount(3);
+  await expect(page.locator("#army-list")).toContainText("(7, 4)");
+
+  await page.click("#random-pool-toggle-button");
+  await expect(page.locator(".random-pool-row")).toHaveCount(12);
+  await expect(page.locator("#army-list")).toContainText("(9, 5) Custom");
+
+  await page.click("#random-pool-toggle-button");
+  await expect(page.locator(".army-row")).toHaveCount(3);
+  await page.setInputFiles("#settings-import-input", {
+    name: "not-spg-settings.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify({ settings: { radius: 999 } })),
+  });
+  await expect(page.locator("#status-line")).toContainText("Import failed");
+  await expect(page.locator("#board-select")).toHaveValue("LatticeHex");
+  await expect(page.locator("#enemy-mode-select")).toHaveValue("FreeForAll");
+});
+
 test("random custom army safely restarts an active run", async ({ page }) => {
   await pauseIfRunning(page);
   await page.fill("#radius-input", "400");
@@ -879,7 +971,7 @@ test("canvas cursor and wheel activate Free Camera panning", async ({
   );
   await expect(page.locator("#sim-canvas")).toHaveAttribute(
     "data-camera-zoom",
-    "2.000",
+    "1.200",
   );
   await expect(page.locator("#zoom-row")).toHaveCount(0);
   await page.selectOption("#display-mode-select", "PixelOneToOne");
@@ -1073,9 +1165,6 @@ test("hex shape, spiral track, and compressed export stay wired", async ({
     }),
   ).toBe(attackSpotCount);
 
-  const download = page.waitForEvent("download");
-  await page.click("#download-jpeg-button");
-  expect((await download).suggestedFilename()).toContain("image-half");
 });
 
 test("proactive attack spots initialize while a prime run is active", async ({
@@ -1165,7 +1254,7 @@ test("attack spots clear when board or attack settings change", async ({ page })
     .toBe(0);
 });
 
-test("full png, regular png, and jpeg export buttons produce downloads", async ({
+test("full png and regular png export buttons produce downloads", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -1186,9 +1275,7 @@ test("full png, regular png, and jpeg export buttons produce downloads", async (
   expect(pngName).toContain("image-");
   expect(pngName).toMatch(/\.png$/);
 
-  const jpeg = page.waitForEvent("download");
-  await page.click("#download-jpeg-button");
-  expect((await jpeg).suggestedFilename()).toContain("image-half");
+  await expect(page.locator("#download-jpeg-button")).toHaveCount(0);
 });
 
 test("failed image export restores the button and later reduced-radius exports work", async ({

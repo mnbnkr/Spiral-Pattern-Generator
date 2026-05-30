@@ -726,6 +726,10 @@ fn overlay_candidate_is_enemy(
     candidate: OverlayCandidate,
     enemy_color_groups: &[u64],
 ) -> bool {
+    if settings.enemy_mode == EnemyMode::FreeForAll {
+        return true;
+    }
+
     if matches!(
         settings.enemy_mode,
         EnemyMode::Color | EnemyMode::ColorAttackSet

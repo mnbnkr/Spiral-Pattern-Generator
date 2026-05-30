@@ -10,8 +10,9 @@ use web_sys::{
 
 use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
 use crate::protocol::{
-    AttackOverlayUpdate, BoardKind, ColorState, DisplayMode, EngineSettings, ShapeKind,
-    VertexBufferUpdate, custom_color_group_change_affects_generation,
+    AttackOverlayUpdate, BoardKind, ColorState, DisplayMode, EngineSettings, MAX_FREE_CAMERA_ZOOM,
+    MIN_FREE_CAMERA_ZOOM, ShapeKind, VertexBufferUpdate,
+    custom_color_group_change_affects_generation,
 };
 
 const FLOATS_PER_VERTEX: usize = 5;
@@ -300,7 +301,6 @@ struct ShaderSources {
 pub enum ExportKind {
     FullPng,
     Png,
-    JpegHalf,
 }
 
 pub struct CanvasRenderer {
@@ -596,7 +596,7 @@ impl CanvasRenderer {
             return Ok(self.settings.zoom);
         }
 
-        self.set_zoom_at(client_x, client_y, self.settings.zoom + delta as f64)
+        self.set_zoom_at(client_x, client_y, self.settings.zoom * 1.2_f64.powi(delta))
     }
 
     pub fn zoom_by_factor_at(
@@ -622,8 +622,11 @@ impl CanvasRenderer {
             return Ok(self.settings.zoom);
         }
 
-        let old_zoom = self.settings.zoom.clamp(1.0, 32.0);
-        let new_zoom = requested_zoom.clamp(1.0, 32.0);
+        let old_zoom = self
+            .settings
+            .zoom
+            .clamp(MIN_FREE_CAMERA_ZOOM, MAX_FREE_CAMERA_ZOOM);
+        let new_zoom = requested_zoom.clamp(MIN_FREE_CAMERA_ZOOM, MAX_FREE_CAMERA_ZOOM);
         let unchanged = (new_zoom - old_zoom).abs() <= f64::EPSILON * old_zoom.max(1.0);
         if new_zoom == old_zoom {
             return Ok(old_zoom);
@@ -1817,7 +1820,6 @@ fn export_scale(kind: ExportKind, square_pixel_cells: bool, piece_radius: f64) -
         ExportKind::FullPng => full_scale,
         ExportKind::Png if square_pixel_cells => full_scale,
         ExportKind::Png => full_scale.min(1.0 / piece_radius.max(0.125)),
-        ExportKind::JpegHalf => full_scale * 0.5,
     }
 }
 
@@ -1870,7 +1872,12 @@ fn world_scale_for_settings_with_margin(
     let fit_scale = fit_screen_scale(width, height, board_world_bounds(settings, margin));
     match settings.display_mode {
         DisplayMode::FitScreen => fit_scale,
-        DisplayMode::PixelOneToOne => fit_scale * settings.zoom.clamp(1.0, 32.0),
+        DisplayMode::PixelOneToOne => {
+            fit_scale
+                * settings
+                    .zoom
+                    .clamp(MIN_FREE_CAMERA_ZOOM, MAX_FREE_CAMERA_ZOOM)
+        }
     }
 }
 
@@ -2629,10 +2636,8 @@ mod tests {
     fn export_scales_keep_square_nearest_and_cap_regular_png() {
         assert_eq!(export_scale(ExportKind::FullPng, true, 0.5), 1.0);
         assert_eq!(export_scale(ExportKind::Png, true, 0.5), 1.0);
-        assert_eq!(export_scale(ExportKind::JpegHalf, true, 0.5), 0.5);
         assert_eq!(export_scale(ExportKind::FullPng, false, 0.5), 4.0);
         assert_eq!(export_scale(ExportKind::Png, false, 0.5), 2.0);
-        assert_eq!(export_scale(ExportKind::JpegHalf, false, 0.5), 2.0);
     }
 
     #[test]
