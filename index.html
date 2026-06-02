@@ -84,7 +84,7 @@
                 <span
                   class="info-icon"
                   tabindex="0"
-                  data-tip="Radius controls both Fit Screen bounds and where the worker stops generating. Edits preview immediately and commit after a short delay."
+                  data-tip="Radius controls both Fit Screen bounds and where the worker stops generating. Values clamp to 1..10000; edits preview immediately and commit after a short delay."
                   >i</span
                 ></span
               >
@@ -167,7 +167,15 @@
                 for="visual-progress-toggle"
               >
                 <input id="visual-progress-toggle" type="checkbox" checked />
-                Visual Progress
+                <span class="label-row"
+                  >Visual Progress
+                  <span
+                    class="info-icon"
+                    tabindex="0"
+                    data-tip="When off, the worker runs silently and skips live canvas/log traffic until it yields or completes. Turning it back on during a silent run pauses that run so the next visual run starts cleanly."
+                    >i</span
+                  ></span
+                >
               </label>
             </div>
 

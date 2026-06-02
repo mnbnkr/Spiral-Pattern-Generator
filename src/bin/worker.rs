@@ -138,13 +138,12 @@ fn handle_message(
                 };
 
                 if visual_colors_changed && runtime.engine.placement_count() > 0 {
-                    let vertices =
-                        pack_vertices_for_runtime(&runtime, runtime.engine.color_state());
                     post_stats_with_updates(
                         &runtime,
-                        VertexBufferUpdate::Replace(vertices),
+                        VertexBufferUpdate::ReplaceStart,
                         attack_overlay_update,
                     );
+                    post_vertex_replace_append_chunks(&runtime, runtime.engine.color_state());
                 } else if !attack_overlay_update_is_none(&attack_overlay_update) {
                     post_stats_with_updates(
                         &runtime,
@@ -246,7 +245,6 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
     let color_state = runtime.engine.color_state();
     if stats.exhausted {
         runtime.running = false;
-        let vertices = pack_vertices_for_runtime(runtime, color_state);
         let log_placements = log_sample_for_full_run(runtime);
         let attack_overlay_update = attack_overlay_update_for_runtime(runtime, false);
         post_worker_message(
@@ -254,13 +252,14 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
             &WorkerToApp::Batch {
                 epoch: runtime.epoch,
                 log_placements,
-                vertex_update: VertexBufferUpdate::Replace(vertices),
+                vertex_update: VertexBufferUpdate::ReplaceStart,
                 attack_overlay_update,
                 attack_overlay_pending: attack_overlay_pending(runtime),
                 stats,
                 color_state,
             },
         );
+        post_vertex_replace_append_chunks(runtime, color_state);
     } else {
         post_worker_message(
             &runtime.scope,
@@ -297,8 +296,9 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
             },
         );
     } else {
-        let vertex_update = if had_existing_placements && color_state != old_color_state {
-            VertexBufferUpdate::Replace(pack_vertices_for_runtime(runtime, color_state))
+        let color_replacement_needed = had_existing_placements && color_state != old_color_state;
+        let vertex_update = if color_replacement_needed {
+            VertexBufferUpdate::ReplaceStart
         } else {
             VertexBufferUpdate::Append(pack_vertices(
                 &placements,
@@ -320,6 +320,9 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
                 color_state,
             },
         );
+        if color_replacement_needed {
+            post_vertex_replace_append_chunks(runtime, color_state);
+        }
     }
 }
 
@@ -557,6 +560,18 @@ fn merge_vertex_updates(
             a.extend_from_slice(&b);
             VertexBufferUpdate::Append(a)
         }
+        (VertexBufferUpdate::ReplaceAppend(mut a), VertexBufferUpdate::ReplaceAppend(b)) => {
+            a.extend_from_slice(&b);
+            VertexBufferUpdate::ReplaceAppend(a)
+        }
+        (VertexBufferUpdate::Append(mut a), VertexBufferUpdate::ReplaceAppend(b))
+        | (VertexBufferUpdate::ReplaceAppend(mut a), VertexBufferUpdate::Append(b)) => {
+            a.extend_from_slice(&b);
+            VertexBufferUpdate::ReplaceAppend(a)
+        }
+        (_, VertexBufferUpdate::ReplaceStart) | (VertexBufferUpdate::ReplaceStart, _) => {
+            VertexBufferUpdate::ReplaceStart
+        }
         (_, replace @ VertexBufferUpdate::Replace(_)) => replace,
         (replace @ VertexBufferUpdate::Replace(_), _) => replace,
     }
@@ -582,20 +597,29 @@ fn batch_parameters(settings: &EngineSettings) -> (u32, u64) {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn pack_vertices_for_runtime(runtime: &WorkerRuntime, color_state: ColorState) -> Vec<f32> {
+fn post_vertex_replace_append_chunks(runtime: &WorkerRuntime, color_state: ColorState) {
     const PACK_CHUNK: usize = 65_536;
-
     let placement_count = runtime.engine.placement_count();
     let context = ColorContext::from_settings(runtime.engine.settings());
-    let mut vertices = Vec::with_capacity(placement_count.saturating_mul(5));
     let mut start = 0;
     while start < placement_count {
         let end = start.saturating_add(PACK_CHUNK).min(placement_count);
         let placements = runtime.engine.placements_in_range(start, end);
+        let mut vertices = Vec::with_capacity(placements.len().saturating_mul(5));
         append_vertices(&mut vertices, &placements, &context, color_state);
+        post_worker_message(
+            &runtime.scope,
+            &WorkerToApp::Stats {
+                epoch: runtime.epoch,
+                stats: runtime.engine.stats(),
+                color_state,
+                vertex_update: VertexBufferUpdate::ReplaceAppend(vertices),
+                attack_overlay_update: AttackOverlayUpdate::none(),
+                attack_overlay_pending: attack_overlay_pending(runtime),
+            },
+        );
         start = end;
     }
-    vertices
 }
 
 #[cfg(target_arch = "wasm32")]

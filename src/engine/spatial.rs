@@ -1,11 +1,71 @@
 use rustc_hash::FxHashMap;
 
 use crate::math::Point2;
+use crate::protocol::EnemyMode;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LatticePieceIdentity {
+    pub placement_id: u64,
+    pub color_group: u64,
+    pub move_group: (u32, u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LatticeOccupant {
+    pub placement_id: u64,
+    pub identity: LatticePieceIdentity,
+}
+
+#[derive(Clone, Debug)]
+struct AttackRecord {
+    first_color_group: u64,
+    has_other_color_group: bool,
+    first_move_group: (u32, u32),
+    has_other_move_group: bool,
+    first_composite: (u64, (u32, u32)),
+    has_other_composite: bool,
+}
+
+impl AttackRecord {
+    fn new(identity: LatticePieceIdentity) -> Self {
+        Self {
+            first_color_group: identity.color_group,
+            has_other_color_group: false,
+            first_move_group: identity.move_group,
+            has_other_move_group: false,
+            first_composite: (identity.color_group, identity.move_group),
+            has_other_composite: false,
+        }
+    }
+
+    fn add(&mut self, identity: LatticePieceIdentity) {
+        self.has_other_color_group |= identity.color_group != self.first_color_group;
+        self.has_other_move_group |= identity.move_group != self.first_move_group;
+        self.has_other_composite |=
+            (identity.color_group, identity.move_group) != self.first_composite;
+    }
+
+    fn has_enemy(&self, candidate: LatticePieceIdentity, enemy_mode: EnemyMode) -> bool {
+        match enemy_mode {
+            EnemyMode::FreeForAll => true,
+            EnemyMode::Color => {
+                self.first_color_group != candidate.color_group || self.has_other_color_group
+            }
+            EnemyMode::AttackSet => {
+                self.first_move_group != candidate.move_group || self.has_other_move_group
+            }
+            EnemyMode::ColorAttackSet => {
+                self.first_composite != (candidate.color_group, candidate.move_group)
+                    || self.has_other_composite
+            }
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct LatticeSpatialIndex {
-    occupied: FxHashMap<(i64, i64), u64>,
-    attacks: FxHashMap<(i64, i64), Vec<u64>>,
+    occupied: FxHashMap<(i64, i64), LatticeOccupant>,
+    attacks: FxHashMap<(i64, i64), AttackRecord>,
 }
 
 impl LatticeSpatialIndex {
@@ -19,16 +79,36 @@ impl LatticeSpatialIndex {
         self.attacks.clear();
     }
 
-    pub fn insert_occupied(&mut self, coord: (i64, i64), placement_id: u64) -> Option<u64> {
-        self.occupied.insert(coord, placement_id)
+    pub fn insert_occupied(
+        &mut self,
+        coord: (i64, i64),
+        identity: LatticePieceIdentity,
+    ) -> Option<LatticeOccupant> {
+        self.occupied.insert(
+            coord,
+            LatticeOccupant {
+                placement_id: identity.placement_id,
+                identity,
+            },
+        )
     }
 
-    pub fn add_attack(&mut self, coord: (i64, i64), attacker_id: u64) {
-        self.attacks.entry(coord).or_default().push(attacker_id);
+    pub fn add_attack(&mut self, coord: (i64, i64), identity: LatticePieceIdentity) {
+        self.attacks
+            .entry(coord)
+            .and_modify(|record| record.add(identity))
+            .or_insert_with(|| AttackRecord::new(identity));
     }
 
     #[must_use]
     pub fn get(&self, coord: (i64, i64)) -> Option<u64> {
+        self.occupied
+            .get(&coord)
+            .map(|occupant| occupant.placement_id)
+    }
+
+    #[must_use]
+    pub fn occupant_at(&self, coord: (i64, i64)) -> Option<LatticeOccupant> {
         self.occupied.get(&coord).copied()
     }
 
@@ -38,10 +118,15 @@ impl LatticeSpatialIndex {
     }
 
     #[must_use]
-    pub fn attackers_at(&self, coord: (i64, i64)) -> &[u64] {
+    pub fn is_attacked_by_enemy(
+        &self,
+        coord: (i64, i64),
+        candidate: LatticePieceIdentity,
+        enemy_mode: EnemyMode,
+    ) -> bool {
         self.attacks
             .get(&coord)
-            .map_or(&[] as &[u64], Vec::as_slice)
+            .is_some_and(|record| record.has_enemy(candidate, enemy_mode))
     }
 }
 
@@ -117,19 +202,94 @@ mod tests {
     #[test]
     fn lattice_index_tracks_occupied_cells() {
         let mut index = LatticeSpatialIndex::new();
+        let identity = LatticePieceIdentity {
+            placement_id: 9,
+            color_group: 1,
+            move_group: (1, 2),
+        };
         assert!(!index.contains((3, -2)));
-        index.insert_occupied((3, -2), 9);
+        index.insert_occupied((3, -2), identity);
         assert!(index.contains((3, -2)));
         assert_eq!(index.get((3, -2)), Some(9));
+        assert_eq!(
+            index.occupant_at((3, -2)).map(|occupant| occupant.identity),
+            Some(identity)
+        );
     }
 
     #[test]
-    fn lattice_index_tracks_attack_cells() {
+    fn lattice_index_compacts_attack_identities() {
         let mut index = LatticeSpatialIndex::new();
-        index.add_attack((2, 1), 7);
-        index.add_attack((2, 1), 9);
-        assert_eq!(index.attackers_at((2, 1)), &[7, 9]);
-        assert!(index.attackers_at((0, 0)).is_empty());
+        let red_knight = LatticePieceIdentity {
+            placement_id: 7,
+            color_group: 1,
+            move_group: (1, 2),
+        };
+        let blue_knight = LatticePieceIdentity {
+            placement_id: 9,
+            color_group: 2,
+            move_group: (1, 2),
+        };
+        let red_bishop = LatticePieceIdentity {
+            placement_id: 10,
+            color_group: 1,
+            move_group: (1, 1),
+        };
+        index.add_attack((2, 1), red_knight);
+        index.add_attack((2, 1), red_knight);
+        index.add_attack((2, 1), blue_knight);
+        index.add_attack((3, 1), red_bishop);
+
+        assert!(index.is_attacked_by_enemy((2, 1), red_knight, EnemyMode::Color));
+        assert!(!index.is_attacked_by_enemy((2, 1), red_knight, EnemyMode::AttackSet));
+        assert!(index.is_attacked_by_enemy((2, 1), red_knight, EnemyMode::ColorAttackSet));
+        assert!(index.is_attacked_by_enemy((2, 1), red_bishop, EnemyMode::ColorAttackSet));
+        assert!(index.is_attacked_by_enemy((3, 1), red_knight, EnemyMode::AttackSet));
+        assert!(index.is_attacked_by_enemy((2, 1), red_knight, EnemyMode::FreeForAll));
+        assert!(!index.is_attacked_by_enemy((0, 0), red_knight, EnemyMode::FreeForAll));
+    }
+
+    #[test]
+    fn lattice_index_attack_summaries_handle_many_groups() {
+        let mut index = LatticeSpatialIndex::new();
+        let candidate = LatticePieceIdentity {
+            placement_id: u64::MAX,
+            color_group: 130,
+            move_group: (5, 8),
+        };
+
+        for group in 0..512 {
+            index.add_attack(
+                (4, -3),
+                LatticePieceIdentity {
+                    placement_id: group,
+                    color_group: 1_000 + group,
+                    move_group: (group as u32, group as u32 + 1),
+                },
+            );
+        }
+
+        assert!(index.is_attacked_by_enemy((4, -3), candidate, EnemyMode::Color));
+        assert!(index.is_attacked_by_enemy((4, -3), candidate, EnemyMode::AttackSet));
+        assert!(index.is_attacked_by_enemy((4, -3), candidate, EnemyMode::ColorAttackSet));
+        assert!(index.is_attacked_by_enemy((4, -3), candidate, EnemyMode::FreeForAll));
+
+        let mut allied_index = LatticeSpatialIndex::new();
+        for id in 0..512 {
+            allied_index.add_attack(
+                (0, 0),
+                LatticePieceIdentity {
+                    placement_id: id,
+                    color_group: candidate.color_group,
+                    move_group: candidate.move_group,
+                },
+            );
+        }
+
+        assert!(!allied_index.is_attacked_by_enemy((0, 0), candidate, EnemyMode::Color));
+        assert!(!allied_index.is_attacked_by_enemy((0, 0), candidate, EnemyMode::AttackSet));
+        assert!(!allied_index.is_attacked_by_enemy((0, 0), candidate, EnemyMode::ColorAttackSet));
+        assert!(allied_index.is_attacked_by_enemy((0, 0), candidate, EnemyMode::FreeForAll));
     }
 
     #[test]

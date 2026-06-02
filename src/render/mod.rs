@@ -11,8 +11,8 @@ use web_sys::{
 use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
 use crate::protocol::{
     AttackOverlayUpdate, BoardKind, ColorState, DisplayMode, EngineSettings, MAX_FREE_CAMERA_ZOOM,
-    MIN_FREE_CAMERA_ZOOM, ShapeKind, VertexBufferUpdate,
-    custom_color_group_change_affects_generation,
+    MIN_FREE_CAMERA_ZOOM, ShapeKind, VertexBufferUpdate, checked_export_pixel_count,
+    custom_color_group_change_affects_generation, export_pixel_limit_error_message,
 };
 
 const FLOATS_PER_VERTEX: usize = 5;
@@ -699,6 +699,21 @@ impl CanvasRenderer {
                     PendingUpload::None => PendingUpload::Append { start_float: start },
                 };
             }
+            VertexBufferUpdate::ReplaceStart => {
+                self.clear_placement_vertices();
+                self.pending_upload = PendingUpload::Full;
+            }
+            VertexBufferUpdate::ReplaceAppend(vertices) => {
+                let start = self.placement_float_count;
+                self.append_placement_vertices(vertices)?;
+                self.pending_upload = match self.pending_upload {
+                    PendingUpload::Full => PendingUpload::Full,
+                    PendingUpload::Append { start_float } => PendingUpload::Append {
+                        start_float: start_float.min(start),
+                    },
+                    PendingUpload::None => PendingUpload::Append { start_float: start },
+                };
+            }
             VertexBufferUpdate::Replace(vertices) => {
                 self.clear_placement_vertices();
                 self.append_placement_vertices(vertices)?;
@@ -1147,7 +1162,7 @@ impl CanvasRenderer {
                     .gl
                     .create_buffer()
                     .ok_or_else(|| JsValue::from_str("failed to create WebGL placement buffer"))?,
-                vertices: Vec::new(),
+                vertices: Rc::new(Vec::new()),
                 allocated: false,
                 uploaded_floats: 0,
             });
@@ -1188,12 +1203,15 @@ impl CanvasRenderer {
             }
 
             let page = &mut self.placement_pages[page_index];
-            if page.vertices.len() != local_start {
-                page.vertices.truncate(local_start);
-                page.uploaded_floats = page.uploaded_floats.min(local_start);
+            {
+                let page_vertices = Rc::make_mut(&mut page.vertices);
+                if page_vertices.len() != local_start {
+                    page_vertices.truncate(local_start);
+                    page.uploaded_floats = page.uploaded_floats.min(local_start);
+                }
             }
             reserve_page_vertices(page, take)?;
-            page.vertices.extend_from_slice(&vertices[..take]);
+            Rc::make_mut(&mut page.vertices).extend_from_slice(&vertices[..take]);
             self.placement_float_count += take;
             vertices = &vertices[take..];
         }
@@ -1201,23 +1219,31 @@ impl CanvasRenderer {
         Ok(())
     }
 
-    fn collect_placement_vertices(&self) -> Result<Vec<f32>, JsValue> {
-        let mut vertices = Vec::new();
-        vertices
-            .try_reserve_exact(self.placement_float_count)
-            .map_err(|_| JsValue::from_str("export placement vertex buffer allocation failed"))?;
-
+    fn collect_placement_vertex_pages(&self) -> Result<PlacementVertexPages, JsValue> {
+        let page_count = self
+            .placement_float_count
+            .div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS);
+        let mut pages = Vec::new();
+        pages
+            .try_reserve_exact(page_count)
+            .map_err(|_| JsValue::from_str("export placement page list allocation failed"))?;
         let mut remaining = self.placement_float_count;
         for page in &self.placement_pages {
             if remaining == 0 {
                 break;
             }
             let take = remaining.min(page.vertices.len());
-            vertices.extend_from_slice(&page.vertices[..take]);
+            pages.push(PlacementVertexPageSnapshot {
+                vertices: Rc::clone(&page.vertices),
+                len: take,
+            });
             remaining -= take;
         }
 
-        Ok(vertices)
+        Ok(PlacementVertexPages {
+            pages,
+            vertex_count: self.placement_float_count / FLOATS_PER_VERTEX,
+        })
     }
 
     fn upload_vertex_range(&mut self, start_float: usize, end_float: usize) -> Result<(), JsValue> {
@@ -1401,24 +1427,40 @@ enum PendingUpload {
 
 struct VertexPage {
     buffer: WebGlBuffer,
-    vertices: Vec<f32>,
+    vertices: Rc<Vec<f32>>,
     allocated: bool,
     uploaded_floats: usize,
 }
 
+struct PlacementVertexPageSnapshot {
+    vertices: Rc<Vec<f32>>,
+    len: usize,
+}
+
+struct PlacementVertexPages {
+    pages: Vec<PlacementVertexPageSnapshot>,
+    vertex_count: usize,
+}
+
+impl PlacementVertexPages {
+    fn vertex_count(&self) -> usize {
+        self.vertex_count
+    }
+}
+
 fn reserve_page_vertices(page: &mut VertexPage, additional: usize) -> Result<(), JsValue> {
-    let needed = page
-        .vertices
+    let vertices = Rc::make_mut(&mut page.vertices);
+    let needed = vertices
         .len()
         .checked_add(additional)
         .ok_or_else(|| JsValue::from_str("placement vertex page capacity overflow"))?;
-    if needed <= page.vertices.capacity() {
+    if needed <= vertices.capacity() {
         return Ok(());
     }
 
     let target_capacity = needed.next_power_of_two().min(PLACEMENT_VERTEX_PAGE_FLOATS);
-    page.vertices
-        .try_reserve_exact(target_capacity.saturating_sub(page.vertices.capacity()))
+    vertices
+        .try_reserve_exact(target_capacity.saturating_sub(vertices.capacity()))
         .map_err(|_| JsValue::from_str("placement vertex page allocation failed"))
 }
 
@@ -1430,6 +1472,14 @@ fn apply_static_vertex_update(
     match update {
         VertexBufferUpdate::None => {}
         VertexBufferUpdate::Append(vertices) => {
+            target.extend_from_slice(vertices);
+            *upload_pending = true;
+        }
+        VertexBufferUpdate::ReplaceStart => {
+            target.clear();
+            *upload_pending = true;
+        }
+        VertexBufferUpdate::ReplaceAppend(vertices) => {
             target.extend_from_slice(vertices);
             *upload_pending = true;
         }
@@ -1484,14 +1534,14 @@ struct ExportSpec {
 enum ExportJob {
     Direct {
         spec: ExportSpec,
-        vertices: Vec<f32>,
+        vertices: PlacementVertexPages,
         pixels: Vec<u8>,
         stage: ExportStage,
     },
     Supersampled {
         spec: ExportSpec,
         supersampled: ExportSpec,
-        vertices: Vec<f32>,
+        vertices: PlacementVertexPages,
         high_pixels: Vec<u8>,
         pixels: Vec<u8>,
         stage: ExportStage,
@@ -1516,7 +1566,7 @@ impl ExportJob {
         let spec = renderer.export_spec(kind, 1.0);
         let pixel_count = checked_pixel_count(spec.width, spec.height)?;
         let pixels = allocate_pixel_buffer(pixel_count)?;
-        let vertices = renderer.collect_placement_vertices()?;
+        let vertices = renderer.collect_placement_vertex_pages()?;
 
         if spec.square_pixel_cells {
             return Ok(Self::Direct {
@@ -1570,7 +1620,7 @@ impl ExportJob {
                     Ok(ExportStep::Pending)
                 }
                 ExportStage::DrawPieces { next_vertex } => {
-                    let total_vertices = vertices.len() / FLOATS_PER_VERTEX;
+                    let total_vertices = vertices.vertex_count();
                     let vertices_per_chunk = if spec.square_pixel_cells {
                         SQUARE_PIXEL_VERTICES_PER_CHUNK
                     } else {
@@ -1579,7 +1629,7 @@ impl ExportJob {
                     let end = next_vertex
                         .saturating_add(vertices_per_chunk)
                         .min(total_vertices);
-                    draw_export_vertices(pixels, spec, vertices, *next_vertex, end);
+                    draw_export_vertex_pages(pixels, spec, vertices, *next_vertex, end);
                     if end >= total_vertices {
                         *stage = ExportStage::Finish;
                     } else {
@@ -1617,11 +1667,17 @@ impl ExportJob {
                     Ok(ExportStep::Pending)
                 }
                 ExportStage::DrawPieces { next_vertex } => {
-                    let total_vertices = vertices.len() / FLOATS_PER_VERTEX;
+                    let total_vertices = vertices.vertex_count();
                     let end = next_vertex
                         .saturating_add(SUPERSAMPLED_VERTICES_PER_CHUNK)
                         .min(total_vertices);
-                    draw_export_vertices(high_pixels, supersampled, vertices, *next_vertex, end);
+                    draw_export_vertex_pages(
+                        high_pixels,
+                        supersampled,
+                        vertices,
+                        *next_vertex,
+                        end,
+                    );
                     if end >= total_vertices {
                         *stage = ExportStage::Downsample { next_row: 0 };
                     } else {
@@ -2131,9 +2187,8 @@ fn export_dimension(span: f64, scale: f64) -> u32 {
 }
 
 fn checked_pixel_count(width: u32, height: u32) -> Result<usize, JsValue> {
-    (width as usize)
-        .checked_mul(height as usize)
-        .ok_or_else(|| JsValue::from_str("export dimensions are too large"))
+    checked_export_pixel_count(width, height)
+        .map_err(|error| JsValue::from_str(&export_pixel_limit_error_message(error)))
 }
 
 fn checked_rgba_len(pixel_count: usize) -> Result<usize, JsValue> {
@@ -2301,7 +2356,38 @@ fn fill_background_range(pixels: &mut [u8], start_pixel: usize, end_pixel: usize
     }
 }
 
-fn draw_export_vertices(
+fn draw_export_vertex_pages(
+    pixels: &mut [u8],
+    spec: &ExportSpec,
+    vertices: &PlacementVertexPages,
+    start_vertex: usize,
+    end_vertex: usize,
+) {
+    let mut page_start_vertex = 0_usize;
+    for page in &vertices.pages {
+        let page_vertex_count = page.len / FLOATS_PER_VERTEX;
+        let page_end_vertex = page_start_vertex.saturating_add(page_vertex_count);
+        if end_vertex <= page_start_vertex {
+            break;
+        }
+        if start_vertex < page_end_vertex {
+            let local_start = start_vertex.saturating_sub(page_start_vertex);
+            let local_end = end_vertex
+                .min(page_end_vertex)
+                .saturating_sub(page_start_vertex);
+            draw_export_vertex_slice(
+                pixels,
+                spec,
+                &page.vertices[..page.len.min(page.vertices.len())],
+                local_start,
+                local_end,
+            );
+        }
+        page_start_vertex = page_end_vertex;
+    }
+}
+
+fn draw_export_vertex_slice(
     pixels: &mut [u8],
     spec: &ExportSpec,
     vertices: &[f32],
@@ -2641,13 +2727,24 @@ mod tests {
     }
 
     #[test]
-    fn export_dimension_still_allows_reported_8003_case_without_policy_cap() {
+    fn export_dimension_allows_reported_8003_case_under_pixel_policy() {
         let width = export_dimension(8002.0, 1.0);
         let height = export_dimension(8002.0, 1.0);
         let reported_count = checked_pixel_count(width, height).unwrap();
 
         assert_eq!((width, height), (8003, 8003));
         assert_eq!(reported_count, 64_048_009);
+    }
+
+    #[test]
+    fn export_pixel_guard_rejects_radius_10000_square_full_png_allocation() {
+        let width = export_dimension(20_000.0, 1.0);
+        let height = export_dimension(20_000.0, 1.0);
+        let error = checked_pixel_count(width, height).unwrap_err();
+        let message = js_value_text(&error);
+
+        assert_eq!((width, height), (20_001, 20_001));
+        assert!(message.contains("export image would require"));
     }
 
     #[test]

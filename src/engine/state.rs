@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::engine::spatial::{ContinuousSpatialHash, LatticeSpatialIndex};
+use crate::engine::spatial::{ContinuousSpatialHash, LatticePieceIdentity, LatticeSpatialIndex};
 use crate::math::{
     ArchimedeanSpiral, ArchimedeanSpots, AxialCoord, GEOM_EPS, HexSpiral, Point2, SquareCoord,
     SquareSpiral, TriangleCoord, TriangleSpiral, attack_circle_hits_body_distance_squared,
@@ -24,6 +24,10 @@ const ATTACK_RELEVANCE_RADIUS_MULTIPLIER: f64 = 4.0;
 const CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_FRACTION: f64 = 0.0045;
 const CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_ABSOLUTE: f64 = 1.0e-10;
 const MAX_PREALLOCATED_SPIRAL_PATH_SPOTS: u64 = 12_000_000;
+#[cfg(not(test))]
+const PLACED_PAGE_SIZE: usize = 65_536;
+#[cfg(test)]
+const PLACED_PAGE_SIZE: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SimulationMode {
@@ -61,6 +65,81 @@ struct PlacedPiece {
     color_key: ColorKey,
     enemy_color_group: u64,
     attack_radius: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlacementStore {
+    pages: Vec<Vec<PlacedPiece>>,
+    len: usize,
+}
+
+impl PlacementStore {
+    #[must_use]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    fn with_capacity(capacity: usize) -> Self {
+        let page_count = capacity.div_ceil(PLACED_PAGE_SIZE);
+        let mut pages = Vec::new();
+        let _ = pages.try_reserve_exact(page_count);
+        Self { pages, len: 0 }
+    }
+
+    #[must_use]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, placement: PlacedPiece) {
+        let needs_page = self
+            .pages
+            .last()
+            .is_none_or(|page| page.len() >= PLACED_PAGE_SIZE);
+        if needs_page {
+            self.pages.push(Vec::with_capacity(PLACED_PAGE_SIZE));
+        }
+        if let Some(page) = self.pages.last_mut() {
+            page.push(placement);
+            self.len += 1;
+        }
+    }
+
+    #[must_use]
+    fn get(&self, index: usize) -> Option<&PlacedPiece> {
+        let page_index = index / PLACED_PAGE_SIZE;
+        let local_index = index % PLACED_PAGE_SIZE;
+        self.pages
+            .get(page_index)
+            .and_then(|page| page.get(local_index))
+    }
+
+    fn extend_protocol_range(
+        &self,
+        out: &mut Vec<Placement>,
+        start: usize,
+        end: usize,
+        board: BoardKind,
+        shape: ShapeKind,
+    ) {
+        let mut index = start;
+        while index < end {
+            let page_index = index / PLACED_PAGE_SIZE;
+            let local_start = index % PLACED_PAGE_SIZE;
+            let Some(page) = self.pages.get(page_index) else {
+                break;
+            };
+            let local_end = (end - page_index * PLACED_PAGE_SIZE).min(page.len());
+            if local_start >= local_end {
+                break;
+            }
+            out.extend(page[local_start..local_end].iter().enumerate().map(
+                |(offset, placement)| placement.to_protocol((index + offset) as u64, board, shape),
+            ));
+            index += local_end - local_start;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -336,7 +415,7 @@ pub struct SimulationEngine {
     lattice_index: LatticeSpatialIndex,
     continuous_index: ContinuousSpatialHash,
     max_continuous_attack_radius: f64,
-    placed: Vec<PlacedPiece>,
+    placed: PlacementStore,
     prime_cache: Vec<u32>,
     min_gap_seen: Option<f64>,
     max_gap_seen: Option<f64>,
@@ -352,12 +431,12 @@ impl SimulationEngine {
         let continuous_center_streams_exhausted = vec![false; continuous_center_spirals.len()];
         let preallocated_spiral_path_spots = preallocated_spiral_path_spots(&settings);
         let mut spots = Vec::new();
-        let mut placed = Vec::new();
+        let mut placed = PlacementStore::new();
         if let Some(capacity) = preallocated_spiral_path_spots {
             if settings.board == BoardKind::ContinuousArchimedean {
                 let _ = spots.try_reserve_exact(capacity);
             }
-            let _ = placed.try_reserve_exact(capacity);
+            placed = PlacementStore::with_capacity(capacity);
         }
         let custom_enemy_color_groups = custom_army_effective_color_groups(&settings);
         Self {
@@ -417,14 +496,8 @@ impl SimulationEngine {
 
         let mut placements = Vec::with_capacity(end - start);
         let shape = forced_shape_for_board(self.settings.board, self.settings.shape);
-        placements.extend(
-            self.placed[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, placement)| {
-                    placement.to_protocol((start + offset) as u64, self.settings.board, shape)
-                }),
-        );
+        self.placed
+            .extend_protocol_range(&mut placements, start, end, self.settings.board, shape);
         placements
     }
 
@@ -594,10 +667,15 @@ impl SimulationEngine {
         };
 
         if let Some(coord) = lattice_coord {
-            self.lattice_index.insert_occupied(coord, id);
+            let identity = LatticePieceIdentity {
+                placement_id: id,
+                color_group: piece.enemy_color_group,
+                move_group: piece.move_group,
+            };
+            self.lattice_index.insert_occupied(coord, identity);
             if attack_radius_relevant_to_generation(&self.settings, piece.attack_radius) {
                 for attack in lattice_attack_targets(self.settings.board, coord, piece.signature) {
-                    self.lattice_index.add_attack(attack, id);
+                    self.lattice_index.add_attack(attack, identity);
                 }
             }
         } else {
@@ -644,15 +722,13 @@ impl SimulationEngine {
             return false;
         }
 
-        for attacker_id in self.lattice_index.attackers_at(coord) {
-            let Some(attacker) = self.placed.get(*attacker_id as usize) else {
-                continue;
-            };
-
-            if self.are_enemies(attacker, candidate) {
-                self.stats.passive_rejections += 1;
-                return false;
-            }
+        if self.lattice_index.is_attacked_by_enemy(
+            coord,
+            lattice_identity_for_candidate(candidate),
+            self.settings.enemy_mode,
+        ) {
+            self.stats.passive_rejections += 1;
+            return false;
         }
 
         if self.settings.proactive_attacking
@@ -661,15 +737,15 @@ impl SimulationEngine {
             for target_coord in
                 lattice_attack_targets(self.settings.board, coord, candidate.signature)
             {
-                if let Some(target_id) = self.lattice_index.get(target_coord) {
-                    let Some(target) = self.placed.get(target_id as usize) else {
-                        continue;
-                    };
-
-                    if self.are_enemies(target, candidate) {
-                        self.stats.proactive_rejections += 1;
-                        return false;
-                    }
+                if let Some(target) = self.lattice_index.occupant_at(target_coord)
+                    && lattice_identities_are_enemies(
+                        target.identity,
+                        lattice_identity_for_candidate(candidate),
+                        self.settings.enemy_mode,
+                    )
+                {
+                    self.stats.proactive_rejections += 1;
+                    return false;
                 }
             }
         }
@@ -686,7 +762,7 @@ impl SimulationEngine {
         let body_radius = self.settings.piece_radius;
         let body_probe_radius = 2.0 * body_radius;
         for id in self.continuous_index.nearby_ids(center, body_probe_radius) {
-            let Some(existing) = self.placed.get(id as usize) else {
+            let Some(existing) = self.placed_piece(id) else {
                 continue;
             };
             let Some(existing_center) = existing.continuous_center() else {
@@ -703,7 +779,7 @@ impl SimulationEngine {
         }
 
         for id in self.continuous_passive_probe_ids(center, body_radius) {
-            let Some(existing) = self.placed.get(id as usize) else {
+            let Some(existing) = self.placed_piece(id) else {
                 continue;
             };
             let Some(existing_center) = existing.continuous_center() else {
@@ -724,7 +800,7 @@ impl SimulationEngine {
 
         if self.settings.proactive_attacking {
             for id in self.continuous_proactive_probe_ids(center, candidate, body_radius) {
-                let Some(existing) = self.placed.get(id as usize) else {
+                let Some(existing) = self.placed_piece(id) else {
                     continue;
                 };
                 let Some(existing_center) = existing.continuous_center() else {
@@ -797,6 +873,12 @@ impl SimulationEngine {
 
         self.enemy_mode_uses_attack_set()
             && move_group(self.settings.board, existing.piece) != candidate.move_group
+    }
+
+    fn placed_piece(&self, id: u64) -> Option<&PlacedPiece> {
+        usize::try_from(id)
+            .ok()
+            .and_then(|index| self.placed.get(index))
     }
 
     fn enemy_mode_uses_color(&self) -> bool {
@@ -1003,7 +1085,14 @@ impl SimulationEngine {
 
     fn spot_at_search_order(&mut self, order_index: u64) -> Option<BoardSpot> {
         match self.settings.placement_search {
-            PlacementSearchMode::SpiralPath => self.spot_at(index_from_u64(order_index)?),
+            PlacementSearchMode::SpiralPath => match self.settings.board {
+                BoardKind::ContinuousArchimedean => {
+                    self.continuous_spiral_path_spot_at(index_from_u64(order_index)?)
+                }
+                BoardKind::LatticeSquare | BoardKind::LatticeHex | BoardKind::LatticeTriangle => {
+                    self.lattice_spiral_path_spot_at(order_index)
+                }
+            },
             PlacementSearchMode::CenterDistance => self.center_ordered_spot(order_index),
         }
     }
@@ -1181,11 +1270,7 @@ impl SimulationEngine {
         true
     }
 
-    fn spot_at(&mut self, index: usize) -> Option<BoardSpot> {
-        if self.settings.board != BoardKind::ContinuousArchimedean {
-            return self.lattice_spiral_path_spot_at(index);
-        }
-
+    fn continuous_spiral_path_spot_at(&mut self, index: usize) -> Option<BoardSpot> {
         if self.spots_exhausted && self.spots.len() <= index {
             return None;
         }
@@ -1218,8 +1303,7 @@ impl SimulationEngine {
         self.spots.get(index).cloned()
     }
 
-    fn lattice_spiral_path_spot_at(&mut self, index: usize) -> Option<BoardSpot> {
-        let index = index as u64;
+    fn lattice_spiral_path_spot_at(&mut self, index: u64) -> Option<BoardSpot> {
         if self
             .first_out_of_radius_spot
             .as_ref()
@@ -1602,6 +1686,30 @@ fn continuous_bodies_overlap_for_placement_rejection(
     let tolerance = (minimum_distance * CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_FRACTION)
         .max(CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_ABSOLUTE);
     a.distance(b) < minimum_distance - tolerance - GEOM_EPS
+}
+
+fn lattice_identity_for_candidate(candidate: &CandidatePiece) -> LatticePieceIdentity {
+    LatticePieceIdentity {
+        placement_id: u64::MAX,
+        color_group: candidate.enemy_color_group,
+        move_group: candidate.move_group,
+    }
+}
+
+fn lattice_identities_are_enemies(
+    existing: LatticePieceIdentity,
+    candidate: LatticePieceIdentity,
+    enemy_mode: EnemyMode,
+) -> bool {
+    match enemy_mode {
+        EnemyMode::FreeForAll => true,
+        EnemyMode::Color => existing.color_group != candidate.color_group,
+        EnemyMode::AttackSet => existing.move_group != candidate.move_group,
+        EnemyMode::ColorAttackSet => {
+            existing.color_group != candidate.color_group
+                || existing.move_group != candidate.move_group
+        }
+    }
 }
 
 fn prime_knight_color_bucket(value: u32, divisor: u32) -> (u32, f64) {
@@ -2591,6 +2699,106 @@ mod tests {
                 "lattice SpiralPath should compute spots by index instead of caching every spot"
             );
         }
+    }
+
+    #[test]
+    fn radius_10000_lattice_spiral_bounds_use_direct_last_index_math() {
+        let radius = 10_000_u64;
+        for (board, last_index) in [
+            (
+                BoardKind::LatticeSquare,
+                radius
+                    .saturating_mul(2)
+                    .saturating_add(1)
+                    .saturating_pow(2)
+                    .saturating_sub(1),
+            ),
+            (
+                BoardKind::LatticeHex,
+                3_u64
+                    .saturating_mul(radius)
+                    .saturating_mul(radius.saturating_add(1)),
+            ),
+            (
+                BoardKind::LatticeTriangle,
+                triangular_number(3_u64.saturating_mul(radius)),
+            ),
+        ] {
+            let mut engine = SimulationEngine::new(EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else {
+                    ShapeKind::Square
+                },
+                radius: radius as f64,
+                placement_search: PlacementSearchMode::SpiralPath,
+                custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+                ..EngineSettings::default()
+            });
+
+            let last = engine
+                .lattice_spiral_path_spot_at(last_index)
+                .unwrap_or_else(|| panic!("board={board:?} last index should be in bounds"));
+            assert!(
+                engine.spot_within_generation_radius(&last),
+                "board={board:?} last index should stay in radius"
+            );
+            assert!(
+                engine
+                    .lattice_spiral_path_spot_at(last_index.saturating_add(1))
+                    .is_none(),
+                "board={board:?} first spot after last index should exhaust"
+            );
+            assert!(engine.spots.is_empty(), "board={board:?}");
+        }
+    }
+
+    #[test]
+    fn lattice_spiral_path_direct_lookup_accepts_indices_above_u32_max() {
+        let index = u64::from(u32::MAX) + 1;
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            radius: 50_000.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+
+        let spot = engine
+            .spot_at_search_order(index)
+            .expect("large direct lattice index should be addressable");
+
+        assert_eq!(spot.index(), index);
+        assert!(engine.spot_within_generation_radius(&spot));
+        assert!(engine.spots.is_empty());
+    }
+
+    #[test]
+    fn placement_history_is_paged_and_keeps_protocol_ranges_ordered() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            radius: 20.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            custom_army: vec![CustomPiece::with_auto_color(0, 0)],
+            ..EngineSettings::default()
+        });
+        let batch = engine.step_budget(20, 20);
+        assert_eq!(batch.len(), 20);
+        assert!(
+            engine.placed.pages.len() > 1,
+            "test page size should force multi-page placement storage"
+        );
+
+        let range = engine.placements_in_range(6, 18);
+        let ids = range
+            .iter()
+            .map(|placement| placement.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, (6_u64..18).collect::<Vec<_>>());
+        assert_eq!(
+            engine.placement_at(17).map(|placement| placement.id),
+            Some(17)
+        );
     }
 
     #[test]

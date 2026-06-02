@@ -1,28 +1,32 @@
-# Spiral Pattern Generator (in alpha)
+# <a href="https://mnbnkr.github.io/Spiral-Pattern-Generator/">Spiral Pattern Generator</a>
 <br>
 Inspired by <i>- Numberphile's 'Red & Black Knights' <a href="https://youtu.be/UiX4CFIiegM">video</a>, - Jonas Karlsson's <a href="https://jonka364.github.io/stendhal/stendhal.html">work</a>, - and Pitouli's 'Knights' <a href="https://github.com/Pitouli/knights">web application</a>.</i>
 
 <br><br>
 
-Rust/WASM application for deterministic spiral pattern simulations. The simulation engine runs in a Web Worker, the main thread owns UI and WebGL rendering with WebGL 2 preferred and WebGL 1 fallback, and builds are static assets suitable for GitHub Pages.
+Rust/WASM application for deterministic spiral pattern simulations. The engine runs in a Web Worker, the main thread owns UI and one WebGL canvas, and the build output is static GitHub Pages-compatible assets.
 
 ## Manual
 
 The detailed source of truth is [MANUAL.md](MANUAL.md). It documents the board math, rule engine, placement modes, radius semantics, rendering/export behavior, UI state rules, and verification checklist.
 
-## Stack
+## Requirements
 
 - Rust `1.96` stable
-- Target `wasm32-unknown-unknown`
-- Trunk
+- `wasm32-unknown-unknown` target
+- Trunk `0.21.x`
+- Corepack-managed `pnpm` for Playwright tests only
 - `wasm-bindgen`, `web-sys`, `js-sys`
-- WebGL point sprites on one HTML5 canvas, with WebGL 2 preferred and WebGL 1 fallback
 - Binary worker transport with `bincode` over transferable `Uint8Array`
 
-## Run
+## Run And Build
 
 ```powershell
+# Development server
 trunk serve --port 8080
+
+# Release build for static hosting
+trunk build --release
 ```
 
 ## Verify
@@ -34,6 +38,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
 cargo build --target wasm32-unknown-unknown
 trunk build --release
+
+# Browser regression suite
 pnpm exec playwright test --project=chromium
 ```
 

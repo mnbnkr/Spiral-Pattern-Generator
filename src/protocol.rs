@@ -3,8 +3,50 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_ANCHOR_A: &str = "#ff7800";
 pub const DEFAULT_ANCHOR_B: &str = "#ff0006";
 pub const DEFAULT_RADIUS: f64 = 200.0;
+pub const MAX_RADIUS: f64 = 10_000.0;
 pub const MIN_FREE_CAMERA_ZOOM: f64 = 1.0;
 pub const MAX_FREE_CAMERA_ZOOM: f64 = 256.0;
+pub const MAX_EXPORT_CANVAS_DIMENSION: u32 = 32_767;
+pub const MAX_EXPORT_PIXEL_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportPixelLimitError {
+    DimensionsTooLarge,
+    CanvasLimit { width: u32, height: u32 },
+    PixelBytes { bytes: usize },
+}
+
+#[must_use]
+pub fn export_pixel_limit_error_message(error: ExportPixelLimitError) -> String {
+    match error {
+        ExportPixelLimitError::DimensionsTooLarge => "export dimensions are too large".to_string(),
+        ExportPixelLimitError::CanvasLimit { width, height } => {
+            format!("export dimensions {width}x{height} exceed the browser canvas limit")
+        }
+        ExportPixelLimitError::PixelBytes { bytes } => format!(
+            "export image would require {:.1} MiB of pixels; reduce Radius or use regular PNG",
+            bytes as f64 / (1024.0 * 1024.0)
+        ),
+    }
+}
+
+pub fn checked_export_pixel_count(width: u32, height: u32) -> Result<usize, ExportPixelLimitError> {
+    if width > MAX_EXPORT_CANVAS_DIMENSION || height > MAX_EXPORT_CANVAS_DIMENSION {
+        return Err(ExportPixelLimitError::CanvasLimit { width, height });
+    }
+
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(ExportPixelLimitError::DimensionsTooLarge)?;
+    let byte_count = pixel_count
+        .checked_mul(4)
+        .ok_or(ExportPixelLimitError::DimensionsTooLarge)?;
+    if byte_count > MAX_EXPORT_PIXEL_BYTES {
+        return Err(ExportPixelLimitError::PixelBytes { bytes: byte_count });
+    }
+
+    Ok(pixel_count)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BoardKind {
@@ -615,6 +657,8 @@ pub enum VertexBufferUpdate {
     None,
     Append(Vec<f32>),
     Replace(Vec<f32>),
+    ReplaceStart,
+    ReplaceAppend(Vec<f32>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -743,6 +787,19 @@ mod tests {
     #[test]
     fn visual_progress_defaults_to_enabled() {
         assert!(EngineSettings::default().visual_progress);
+    }
+
+    #[test]
+    fn export_pixel_limits_allow_reported_8003_case() {
+        assert_eq!(checked_export_pixel_count(8003, 8003).unwrap(), 64_048_009);
+    }
+
+    #[test]
+    fn export_pixel_limits_reject_radius_10000_square_full_png() {
+        let error = checked_export_pixel_count(20_001, 20_001).unwrap_err();
+
+        assert!(matches!(error, ExportPixelLimitError::PixelBytes { .. }));
+        assert!(export_pixel_limit_error_message(error).contains("export image would require"));
     }
 
     #[test]

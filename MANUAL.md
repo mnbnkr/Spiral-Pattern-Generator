@@ -29,7 +29,7 @@ Do not introduce React, Yew, npm build tooling, or a heavy UI framework. Playwri
 
 The mathematical engine must run in the worker. The main thread owns UI, worker control, rendering, and downloads.
 
-Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices; the worker does not keep a second protocol-placement history beside the engine's compact placement state. The main thread appends vertex ranges and uploads them with `bufferSubData` into fixed-size WebGL pages; full vertex replacements are reserved for recoloring or reset events.
+Worker messages use `bincode` over transferable `Uint8Array`, not JSON strings. Control and result messages carry a worker epoch so queued batches, stats, errors, starts, and ticks from an older reset cannot mutate a newer board/radius run. Placement batches include only sampled log placements plus packed render vertices; the worker does not keep a second protocol-placement history beside the engine's compact placement state. The engine stores placement history in fixed-size pages, so high-radius runs do not require one contiguous placement allocation. The main thread appends vertex ranges and uploads them with `bufferSubData` into fixed-size WebGL pages; recolor and silent-completion replacements are sent as a clear/start message followed by exact append chunks instead of one monolithic vertex buffer.
 
 The visual run loop is a bounded pull loop: the main thread asks for one worker batch, handles the reply, coalesces drawing onto `requestAnimationFrame`, and only then requests more work. Do not reintroduce an unbounded worker-push loop.
 
@@ -128,7 +128,7 @@ Enemy mode:
 
 For custom finite armies, two pieces with the same attack-set but different row colors are enemies in `Color` mode and allies in `Attack-set` mode. In `Color` mode, a spot attacked only by same-color pieces is legal; a spot attacked by any different-color piece is illegal.
 
-Lattice boards use occupied-cell and attacked-cell maps keyed by board coordinates. Continuous mode uses a spatial hash for nearby body checks and algebraic attack-ring predicates for thin attack circles.
+Lattice boards use occupied-cell and attacked-cell maps keyed by board coordinates. Attacked cells store constant-size color, move, and color-move summaries needed by the active enemy rule rather than every attacker placement id, so high-cardinality attacks do not create unbounded per-cell attacker lists. Continuous mode uses a spatial hash for nearby body checks and algebraic attack-ring predicates for thin attack circles.
 
 Continuous body overlap:
 
@@ -155,7 +155,7 @@ Custom mode is current-piece spot search. The army is an ordered cyclic list of 
 
 Each custom row has its own search cursor. On that row's turn, the row's current piece scans forward in the selected search order until it finds a valid unoccupied spot under passive and optional proactive rules. After placement, that row's cursor advances past the placed spot and priority moves to the next row. The row does not revisit earlier empty spots on later turns.
 
-In `SpiralPath`, each row cursor scans the chronological spiral. Lattice SpiralPath spots are computed directly from their spiral index instead of caching the full spot list, so high-radius finite-board runs do not hit a spot-cache capacity cliff. In `CenterDistance`, each row cursor scans spots by Euclidean distance from the spiral origin. This is intentionally a different simulation policy.
+In `SpiralPath`, each row cursor scans the chronological spiral. Lattice SpiralPath spots are computed directly from their `u64` spiral index instead of caching the full spot list or passing direct lattice lookups through a platform-sized index, so high-radius finite-board runs do not hit a spot-cache capacity cliff. In `CenterDistance`, each row cursor scans spots by Euclidean distance from the spiral origin. This is intentionally a different simulation policy.
 
 For lattice boards, `CenterDistance` streams spots from the requested board bound in Euclidean center-distance order with spiral index as the tie-breaker. It must not prebuild and sort the entire radius before emitting the first placement; high-radius runs still progress through bounded worker batches. Square, hex, and triangle corners are valid outer-bound spots, but they appear late in live generation because they are farther from the origin than most interior spots.
 
@@ -206,7 +206,7 @@ Prime modes search spots for the current prime piece and only move to the next p
 
 `Radius` is both a view bound and a generation bound.
 
-Typing in the Radius field updates Fit Screen immediately. Worker radius commits are debounced for 2 seconds; Start, Pause, and Step force a pending commit.
+Typing in the Radius field updates Fit Screen immediately. User-facing Radius input and settings import normalize to the inclusive range `1..10000` so malformed or accidental huge values cannot lock the browser while building view bounds, tracks, or exports. Worker radius commits are debounced for 2 seconds; Start, Pause, and Step force a pending commit.
 
 Compatible higher `SpiralPath` radius changes update the worker in place. The engine remembers the first spot that was just outside the previous radius so an increased bound can resume from that spot without clearing or duplicating the visible generation. The existing snapshot stays at full saturation because it remains valid under the larger radius.
 
@@ -218,7 +218,7 @@ Fit Screen maps the requested radius and board-specific bounds to the viewport. 
 
 Pieces render on one responsive HTML5 canvas through WebGL point sprites. The renderer requests WebGL 2 first and uses it whenever available; if WebGL 2 is unavailable, it falls back to WebGL 1 with GLSL 100 shader variants and the derivative extension used for antialiasing. The canvas CSS size stays viewport-driven, including dynamic mobile viewport units where supported, while the backing store is resized from the measured CSS bounds and current device pixel ratio. Do not replace pieces with DOM nodes or per-piece Canvas 2D calls for large runs without a benchmark proving that is faster.
 
-Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`, with derivative-based edge coverage to reduce zoomed-out and high-DPI/mobile aliasing. Placement vertices are stored in fixed-size CPU/WebGL pages so large radius runs do not hit a single-buffer reallocation cliff; image export flattens those pages only when an export is requested.
+Each placement contributes one packed vertex: world position and RGB. The shader clips point sprites into Square, Circle, Hex, or Triangle shapes through `gl_PointCoord`, with derivative-based edge coverage to reduce zoomed-out and high-DPI/mobile aliasing. Placement vertices are stored in fixed-size CPU/WebGL pages so large radius runs do not hit a single-buffer reallocation cliff; image export snapshots those pages directly instead of first flattening or duplicating all placement vertices.
 
 Render shapes:
 
@@ -246,16 +246,16 @@ In `Free Camera`, internal zoom `x1` is anchored to the same requested Radius bo
 
 ## Image And Settings Export
 
-Image export never copies the visible viewport canvas. It renders deterministic offscreen pixels from placement/vertex data. Export buttons re-read the visible controls for render bounds and filenames, but they do not force a pending Radius commit into the worker.
+Image export never copies the visible viewport canvas. It renders deterministic offscreen pixels from placement/vertex data. Export buttons re-read the visible controls for render bounds and filenames, but they do not force a pending Radius commit into the worker. Export drawing walks placement vertex pages in chunks, avoiding a single contiguous all-placement allocation.
 
 - Full PNG preserves strict deterministic scale.
 - PNG keeps square/cell exports at one cell per pixel and caps non-square piece diameter to practical size.
 - LatticeSquare Square exports use nearest-neighbor one-cell pixels.
 - Non-square, Hex, Triangle, and Continuous exports use smoothed supersampled rasterization.
-- Image exports run in browser-scheduled chunks. Square Lattice Square exports write one cell directly to one output pixel instead of rasterizing every square shape, so large one-cell PNG exports avoid unnecessary per-piece shape loops. While an export is preparing, the clicked image button changes to `Cancel`; clicking it requests cancellation and restores the button when the worker-visible export job stops. Allocation, canvas, encoder failures, and encoder timeouts surface as visible status errors and restore the clicked button so later exports can run.
+- Image exports run in browser-scheduled chunks. Square Lattice Square exports write one cell directly to one output pixel instead of rasterizing every square shape, so large one-cell PNG exports avoid unnecessary per-piece shape loops. While an export is preparing, the clicked image button changes to `Cancel`; clicking it requests cancellation and restores the button when the worker-visible export job stops. Allocation, pixel-budget, canvas, encoder failures, and encoder timeouts surface as visible status errors and restore the clicked button so later exports can run.
 - Filenames include render settings and placement count.
 
-Settings Export writes a JSON file for the current user-facing configuration: engine settings, custom pieces, First/Turn Move fields, Random count, editable random pool, random-pool editor state, and per-board session shape preferences. Settings Import reads that file through a file picker, restores the controls, stages a fresh worker generation, and keeps the current visible snapshot until Start, Step, or Refresh begins the imported run.
+Settings Export writes a JSON file for the current user-facing configuration: engine settings, custom pieces, First/Turn Move fields, Random count, editable random pool, random-pool editor state, and per-board session shape preferences. Settings Import reads that file through a file picker, restores the controls, stages a fresh worker generation, and keeps the current visible snapshot until Start, Step, or Refresh begins the imported run. Imported numeric ranges, colors, board-shape combinations, random counts, random-pool names, and per-board shape preferences are normalized before controls or workers are updated.
 
 The placement log must stay wired and visible. It records settings, first placements, latest placements, exact coordinates, piece signatures, color groups, and color rules.
 
@@ -307,7 +307,7 @@ Refresh terminates active worker work, recreates worker/render state, clears sta
 
 Per-second Speed mode schedules worker ticks from the selected rate. `1/s` means one placement batch per second, and changing Speed cancels stale queued run ticks so returning to `1/s` does not keep a faster cadence.
 
-`Visual Progress` off makes the worker suppress live vertices/logs and send final render/log data only on completion or after a long silent work slice yields. Re-enabling Visual Progress during a silent run cancels and pauses that run cleanly so future visual runs are not corrupted.
+`Visual Progress` off makes the worker suppress live vertices/logs and send final render/log data only on completion or after a long silent work slice yields. Re-enabling Visual Progress during a silent run cancels and pauses that run cleanly so future visual runs are not corrupted. The Visual Progress label has an info capsule describing this silent-mode behavior.
 
 Continuous Offset accepts `0..=1` with up to 12 decimals. Invalid input is highlighted while editing without clearing or dimming the current snapshot. On blur, invalid text is restored to the last valid value; an empty invalid field becomes `0`. Valid offset edits stage a new Continuous generation while preserving the current canvas/log snapshot at reduced saturation until Start, Step, or Refresh begins the staged run.
 
@@ -345,7 +345,7 @@ trunk serve --port 8080
 pnpm exec playwright test --project=chromium
 ```
 
-GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install the official Trunk `0.21.14` Linux release binary with a pinned SHA-256 checksum instead of compiling Trunk through Cargo. As of May 25, 2026, `0.21.14` is the latest stable Trunk release on crates.io; `0.22.0-beta.1` is newer but is a prerelease, so CI intentionally stays on stable. Playwright CI uses Corepack-managed `pnpm@11.3.0`, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and release-mode browser tests, then uploads the HTML report from `target/playwright/report/`. Dependabot checks the pnpm-backed Playwright harness and GitHub Actions weekly so stable dependency and action updates do not sit stale. Playwright serves its browser-test build from `target/playwright/dist/` so its GitHub Pages public URL does not overwrite the main local `dist/` used by `trunk serve --port 8080`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed. Cleanup can remove generated files inside `dist/`, but keep the ignored `dist/` directory itself present because Trunk canonicalizes watch-ignore paths before serving.
+GitHub Pages builds use `.github/workflows/pages.yml`. The app and worker assets must load correctly under the repository public URL subpath; worker URLs resolve against the document base URI. Workflows install the official Trunk `0.21.14` Linux release binary with a pinned SHA-256 checksum instead of compiling Trunk through Cargo. As of May 25, 2026, `0.21.14` is the latest stable Trunk release on crates.io; `0.22.0-beta.1` is newer but is a prerelease, so CI intentionally stays on stable. Playwright CI installs stable Rust `1.96` with `rustfmt`, `clippy`, and `wasm32-unknown-unknown` on that same toolchain, uses Corepack-managed `pnpm@11.3.0`, runs Rust formatting, tests, host clippy, WASM clippy, Trunk build, and release-mode browser tests, then uploads the HTML report from `target/playwright/report/`. Dependabot checks the pnpm-backed Playwright harness and GitHub Actions weekly so stable dependency and action updates do not sit stale. Playwright serves its browser-test build from `target/playwright/dist/` so its GitHub Pages public URL does not overwrite the main local `dist/` used by `trunk serve --port 8080`. Playwright writes browser artifacts under `target/playwright/`, which Trunk already ignores, so local browser tests do not trigger rebuilds while workers are being refreshed. Cleanup can remove generated files inside `dist/`, but keep the ignored `dist/` directory itself present because Trunk canonicalizes watch-ignore paths before serving.
 
 WASM-only files are guarded with `#[cfg(target_arch = "wasm32")]`. `.vscode/settings.json` sets `rust-analyzer.cargo.target = "wasm32-unknown-unknown"` so app, worker, UI, and renderer modules are analyzed as active.
 

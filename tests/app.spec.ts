@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 const appBasePath = process.env.APP_BASE_PATH ?? "/Spiral-Pattern-Generator/";
 const placementPageVertices = 1_048_576;
@@ -474,6 +475,12 @@ test("custom finite panel layout and color swatch overrides work", async ({
   await page.mouse.move(10, 10);
   await expect(tooltip).toBeHidden();
 
+  const visualProgressInfo = page.locator(".visual-progress .info-icon");
+  await visualProgressInfo.scrollIntoViewIfNeeded();
+  await expect(visualProgressInfo).toBeVisible();
+  await expect(visualProgressInfo).toHaveAttribute("data-tip", /runs silently/);
+  await expect(visualProgressInfo).toHaveAttribute("data-tip", /pauses/);
+
   await page.locator("#random-pool-toggle-button").click();
   await expect(page.locator(".random-pool-row").first()).toContainText(
     "(2, 1) Knight",
@@ -856,6 +863,48 @@ test("settings export and import restore controls, army, and random pool", async
   await expect(page.locator("#status-line")).toContainText("Import failed");
   await expect(page.locator("#board-select")).toHaveValue("LatticeHex");
   await expect(page.locator("#enemy-mode-select")).toHaveValue("FreeForAll");
+
+  const normalizedImport = JSON.parse(await readFile(exportedPath, "utf8"));
+  normalizedImport.settings.board = "LatticeTriangle";
+  normalizedImport.settings.shape = "Hex";
+  normalizedImport.settings.radius = -5;
+  normalizedImport.settings.piece_radius = 99;
+  normalizedImport.settings.track_opacity = 2;
+  normalizedImport.settings.attack_overlay_opacity = -1;
+  normalizedImport.settings.anchor_color_a = "invalid";
+  normalizedImport.random_count = 20_000;
+  normalizedImport.random_pool = [
+    { name: "   ", a: 1, b: 1 },
+    { name: "x".repeat(120), a: 4, b: 4 },
+  ];
+  await page.setInputFiles("#settings-import-input", {
+    name: "normalized-spg-settings.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(normalizedImport)),
+  });
+  await expect(page.locator("#status-line")).toContainText("Settings imported");
+  await expect(page.locator("#board-select")).toHaveValue("LatticeTriangle");
+  await expect(page.locator("#shape-select")).toHaveValue("Triangle");
+  await expect(page.locator("#radius-input")).toHaveValue("1");
+  await expect(page.locator("#piece-radius-slider")).toHaveValue("0.5");
+  await expect(page.locator("#track-opacity-slider")).toHaveValue("100");
+  await expect(page.locator("#attack-overlay-opacity-slider")).toHaveValue("0");
+  await expect(page.locator("#anchor-a-input")).toHaveValue("#ff7800");
+  await expect(page.locator("#random-count-input")).toHaveValue("10000");
+  await page.click("#random-pool-toggle-button");
+  await expect(page.locator(".random-pool-row")).toHaveCount(2);
+  await expect(page.locator(".random-pool-row").first()).toContainText("(1, 1) Fers");
+
+  normalizedImport.settings.board = "LatticeSquare";
+  normalizedImport.settings.shape = "Square";
+  normalizedImport.settings.radius = 1e20;
+  normalizedImport.settings.track_opacity = 0;
+  await page.setInputFiles("#settings-import-input", {
+    name: "huge-radius-spg-settings.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(normalizedImport)),
+  });
+  await expect(page.locator("#radius-input")).toHaveValue("10000");
 });
 
 test("random custom army safely restarts an active run", async ({ page }) => {
@@ -1315,6 +1364,28 @@ test("failed image export restores the button and later reduced-radius exports w
   const download = page.waitForEvent("download");
   await page.click("#download-png-button");
   expect((await download).suggestedFilename()).toContain("image");
+});
+
+test("oversized full png export surfaces a visible status error", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.click("#refresh-button");
+  await expect(page.locator("#status-line")).toContainText("Paused");
+  await page.click("#step-button");
+  await expect(page.locator("#status-line")).toContainText("1 placements", {
+    timeout: 15_000,
+  });
+
+  await page.fill("#radius-input", "1e20");
+  await page.click("#download-full-png-button");
+  await expect(page.locator("#radius-input")).toHaveValue("10000");
+  await expect(page.locator("#status-line")).toContainText(
+    "Export failed: export image would require",
+    { timeout: 10_000 },
+  );
+  await expect(page.locator("#download-full-png-button")).toHaveText("Full PNG");
+  await expect(page.locator("#download-full-png-button")).toBeEnabled();
 });
 
 test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async ({

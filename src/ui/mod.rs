@@ -12,7 +12,7 @@ use web_sys::{
 
 use crate::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DEFAULT_RADIUS,
-    DisplayMode, EnemyMode, EngineSettings, EngineStats, MAX_FREE_CAMERA_ZOOM,
+    DisplayMode, EnemyMode, EngineSettings, EngineStats, MAX_FREE_CAMERA_ZOOM, MAX_RADIUS,
     MIN_FREE_CAMERA_ZOOM, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
     VertexBufferUpdate, WorkerToApp, custom_army_moves_match_for_board,
     custom_color_group_change_affects_generation, custom_piece_order_color,
@@ -299,7 +299,7 @@ fn install_worker_handler_on(
                         if let Err(error) = update_run_buttons(&document, false) {
                             log_error(&error);
                         }
-                        if let Err(error) = set_status("Worker ready") {
+                        if let Err(error) = set_status_from_worker("Worker ready") {
                             log_error(&error);
                         }
                     }
@@ -364,7 +364,7 @@ fn install_worker_handler_on(
                     }
                 };
                 if let Some(status) = status
-                    && let Err(error) = set_status(&status)
+                    && let Err(error) = set_status_from_worker(&status)
                 {
                     log_error(&error);
                 }
@@ -434,7 +434,7 @@ fn install_worker_handler_on(
                             log_error(&error);
                         }
                     }
-                    if let Err(error) = set_status(&status) {
+                    if let Err(error) = set_status_from_worker(&status) {
                         log_error(&error);
                     }
                     if let Some((worker, epoch, start_after_ready, step_after_ready)) =
@@ -488,7 +488,7 @@ fn install_worker_handler_on(
                     }
                     status_text(&state, stats)
                 };
-                if let Err(error) = set_status(&status) {
+                if let Err(error) = set_status_from_worker(&status) {
                     log_error(&error);
                 }
                 if let Some((worker, epoch, start_after_ready, step_after_ready)) = deferred_actions
@@ -1585,16 +1585,21 @@ fn install_select_quick_close_handlers(
         let select = select(document, select_id)?;
         let id = select.id();
         let state = Rc::clone(&state);
+        let pointer_document = document.clone();
         let pointer_recent_select = Rc::clone(&recent_select);
         let closure_select = select.clone();
         let pointer_closure = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
             let now = js_sys::Date::now();
+            let focused_same_select = pointer_document
+                .active_element()
+                .and_then(|element| element.get_attribute("id"))
+                .is_some_and(|active_id| active_id == id);
             let recent_same_select = pointer_recent_select
                 .borrow()
                 .as_ref()
                 .is_some_and(|(recent_id, time)| recent_id == &id && now - *time <= 1_000.0);
 
-            if recent_same_select {
+            if focused_same_select || recent_same_select {
                 event.prevent_default();
                 event.stop_propagation();
                 if id == "board-select" {
@@ -1895,6 +1900,9 @@ fn install_image_export_button(
                 Err(message) if message == "Export canceled" => message,
                 Err(message) => format!("Export failed: {message}"),
             };
+            if status.starts_with("Export failed") || status == "Export canceled" {
+                hold_status_for_ms(5_000.0);
+            }
             if let Err(error) = set_status(&status) {
                 log_error(&error);
             }
@@ -1924,9 +1932,9 @@ fn install_image_export_button(
                 {
                     log_error(&class_error);
                 }
-                if let Err(status_error) =
-                    set_status(&format!("Export failed: {}", js_value_text(&error)))
-                {
+                hold_status_for_ms(5_000.0);
+                let status = format!("Export failed: {}", js_value_text(&error));
+                if let Err(status_error) = set_status(&status) {
                     log_error(&status_error);
                 }
             }
@@ -3607,11 +3615,23 @@ fn read_settings(
     };
 
     let continuous_offset = read_continuous_offset(document, fallback.continuous_offset)?;
+    let radius_raw = input_value(document, "radius-input")?;
+    let radius_parsed = radius_raw
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite());
+    let radius = normalize_radius(radius_parsed.unwrap_or(DEFAULT_RADIUS));
+    if let Some(parsed) = radius_parsed
+        && (parsed - radius).abs() > f64::EPSILON
+    {
+        input(document, "radius-input")?.set_value(&finite_number_text(radius));
+    }
 
     Ok(EngineSettings {
         board,
         shape,
-        radius: parse_finite_f64(&input_value(document, "radius-input")?, DEFAULT_RADIUS).max(1.0),
+        radius,
         piece_radius: parse_finite_f64(&input_value(document, "piece-radius-slider")?, 0.5)
             .clamp(0.05, 0.5),
         visual_progress: input_checked(document, "visual-progress-toggle")?,
@@ -3642,7 +3662,7 @@ fn read_settings(
 }
 
 fn normalize_imported_settings(mut settings: EngineSettings) -> EngineSettings {
-    settings.radius = finite_or_default(settings.radius, DEFAULT_RADIUS).max(1.0);
+    settings.radius = normalize_radius(finite_or_default(settings.radius, DEFAULT_RADIUS));
     settings.piece_radius = finite_or_default(settings.piece_radius, 0.5).clamp(0.05, 0.5);
     settings.zoom =
         finite_or_default(settings.zoom, 1.0).clamp(MIN_FREE_CAMERA_ZOOM, MAX_FREE_CAMERA_ZOOM);
@@ -3670,6 +3690,10 @@ fn finite_or_default(value: f64, fallback: f64) -> f64 {
 
 fn finite_f32_or_default(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
+}
+
+fn normalize_radius(value: f64) -> f64 {
+    finite_or_default(value, DEFAULT_RADIUS).clamp(1.0, MAX_RADIUS)
 }
 
 fn normalize_shape_for_board(board: BoardKind, shape: ShapeKind) -> ShapeKind {
@@ -4166,6 +4190,7 @@ fn stats_text(settings: &EngineSettings, stats: EngineStats) -> String {
 
 fn normalize_custom_army(army: Vec<CustomPiece>) -> Vec<CustomPiece> {
     army.into_iter()
+        .take(10_000)
         .map(|piece| {
             let mut normalized = CustomPiece::with_auto_color(piece.a, piece.b);
             normalized.color_override = piece
@@ -4318,7 +4343,49 @@ fn worker_script_url(document: &Document) -> Result<String, JsValue> {
 
 fn set_status(text: &str) -> Result<(), JsValue> {
     let document = current_document()?;
+    if !status_text_holds_worker_updates(text)
+        && let Some(status) = document.get_element_by_id("status-line")
+    {
+        status.remove_attribute("data-status-hold-until")?;
+    }
     set_text(&document, "status-line", text)
+}
+
+fn set_status_from_worker(text: &str) -> Result<(), JsValue> {
+    if status_hold_active() {
+        return Ok(());
+    }
+    set_status(text)
+}
+
+fn hold_status_for_ms(ms: f64) {
+    let Ok(document) = current_document() else {
+        return;
+    };
+    let Some(status) = document.get_element_by_id("status-line") else {
+        return;
+    };
+    let hold_until = js_sys::Date::now() + ms.max(0.0);
+    if let Err(error) = status.set_attribute("data-status-hold-until", &hold_until.to_string()) {
+        log_error(&error);
+    }
+}
+
+fn status_hold_active() -> bool {
+    let Ok(document) = current_document() else {
+        return false;
+    };
+    let Some(status) = document.get_element_by_id("status-line") else {
+        return false;
+    };
+    status
+        .get_attribute("data-status-hold-until")
+        .and_then(|value| value.parse::<f64>().ok())
+        .is_some_and(|hold_until| hold_until > js_sys::Date::now())
+}
+
+fn status_text_holds_worker_updates(text: &str) -> bool {
+    text.starts_with("Export failed") || text == "Export canceled"
 }
 
 fn set_text(document: &Document, id: &str, text: &str) -> Result<(), JsValue> {
