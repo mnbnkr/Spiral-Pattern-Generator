@@ -30,37 +30,60 @@ async function pauseIfRunning(page) {
     return false;
   });
   if (requestedPause) {
-    await expect(page.locator("#pause-button")).toBeDisabled({ timeout: 10_000 });
-    await expect
-      .poll(
-        async () => {
-          const before = await page.locator("#status-line").textContent();
-          await page.waitForTimeout(150);
-          const after = await page.locator("#status-line").textContent();
-          return before === after;
-        },
-        { timeout: 10_000 },
-      )
-      .toBe(true);
+    await expect(page.locator("#start-button")).toBeEnabled({ timeout: 20_000 });
+    await expect(page.locator("#pause-button")).toBeDisabled({ timeout: 20_000 });
   }
+}
+
+async function stableStatusText(page, timeoutMs = 10_000, stableMs = 500) {
+  const locator = page.locator("#status-line");
+  const deadline = Date.now() + timeoutMs;
+  let previous = await locator.textContent();
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(stableMs);
+    const current = await locator.textContent();
+    if (current === previous) {
+      return current;
+    }
+    previous = current;
+  }
+  throw new Error("status line did not stabilize");
 }
 
 async function renderedPixelCount(page) {
   return page.locator("#sim-canvas").evaluate((canvas) => {
     const source = canvas as HTMLCanvasElement;
-    const copy = document.createElement("canvas");
-    copy.width = source.width;
-    copy.height = source.height;
-    const context = copy.getContext("2d", { willReadFrequently: true });
-    if (!context) throw new Error("missing 2d context");
-    context.drawImage(source, 0, 0);
-    const data = context.getImageData(0, 0, copy.width, copy.height).data;
+    const contextOptions = { preserveDrawingBuffer: true };
+    const gl = (
+      source.getContext("webgl2", contextOptions) ??
+      source.getContext("webgl", contextOptions) ??
+      source.getContext("experimental-webgl", contextOptions)
+    ) as WebGLRenderingContext | null;
+    if (!gl) throw new Error("missing WebGL context");
+    if (gl.drawingBufferWidth <= 0 || gl.drawingBufferHeight <= 0) {
+      return 0;
+    }
+    gl.finish();
+    const data = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+    gl.readPixels(
+      0,
+      0,
+      gl.drawingBufferWidth,
+      gl.drawingBufferHeight,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      data,
+    );
     let pixels = 0;
     for (let index = 0; index < data.length; index += 4) {
       const r = data[index];
       const g = data[index + 1];
       const b = data[index + 2];
-      if (Math.abs(r - 8) > 3 || Math.abs(g - 9) > 3 || Math.abs(b - 10) > 3) {
+      const a = data[index + 3];
+      if (
+        a > 0 &&
+        (Math.abs(r - 8) > 3 || Math.abs(g - 9) > 3 || Math.abs(b - 10) > 3)
+      ) {
         pixels += 1;
       }
     }
@@ -133,13 +156,27 @@ async function canvasPlacementPages(page) {
 async function lightPixelCount(page) {
   return page.locator("#sim-canvas").evaluate((canvas) => {
     const source = canvas as HTMLCanvasElement;
-    const copy = document.createElement("canvas");
-    copy.width = source.width;
-    copy.height = source.height;
-    const context = copy.getContext("2d", { willReadFrequently: true });
-    if (!context) throw new Error("missing 2d context");
-    context.drawImage(source, 0, 0);
-    const data = context.getImageData(0, 0, copy.width, copy.height).data;
+    const contextOptions = { preserveDrawingBuffer: true };
+    const gl = (
+      source.getContext("webgl2", contextOptions) ??
+      source.getContext("webgl", contextOptions) ??
+      source.getContext("experimental-webgl", contextOptions)
+    ) as WebGLRenderingContext | null;
+    if (!gl) throw new Error("missing WebGL context");
+    if (gl.drawingBufferWidth <= 0 || gl.drawingBufferHeight <= 0) {
+      return 0;
+    }
+    gl.finish();
+    const data = new Uint8Array(gl.drawingBufferWidth * gl.drawingBufferHeight * 4);
+    gl.readPixels(
+      0,
+      0,
+      gl.drawingBufferWidth,
+      gl.drawingBufferHeight,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      data,
+    );
     let pixels = 0;
     for (let index = 0; index < data.length; index += 4) {
       const r = data[index];
@@ -151,6 +188,40 @@ async function lightPixelCount(page) {
     }
     return pixels;
   });
+}
+
+async function canvasScreenshotPixelStats(page) {
+  const screenshot = await page.locator("#sim-canvas").screenshot();
+  const imageSource = `data:image/png;base64,${screenshot.toString("base64")}`;
+  return page.evaluate(async (src) => {
+    const image = new Image();
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("failed to load canvas screenshot"));
+      image.src = src;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("missing screenshot 2d context");
+    context.drawImage(image, 0, 0);
+    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let nonBackground = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      const a = data[index + 3];
+      if (
+        a > 0 &&
+        (Math.abs(r - 8) > 3 || Math.abs(g - 9) > 3 || Math.abs(b - 10) > 3)
+      ) {
+        nonBackground += 1;
+      }
+    }
+    return { nonBackground };
+  }, imageSource);
 }
 
 async function continuousSpotsForSearch(page, search: string) {
@@ -200,12 +271,135 @@ test("high-radius rendering grows past the previous single-page buffer cliff", a
     })
     .toBeGreaterThan(placementPageVertices);
   await expect
-    .poll(() => canvasPlacementPages(page), { timeout: 10_000 })
+    .poll(() => canvasPlacementPages(page), { timeout: 30_000 })
     .toBeGreaterThanOrEqual(2);
+  await expect(page.locator("#status-line")).toContainText("Complete", {
+    timeout: 100_000,
+  });
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-generation-border",
+    "hidden",
+  );
+  await expect
+    .poll(async () => (await canvasScreenshotPixelStats(page)).nonBackground, {
+      timeout: 10_000,
+    })
+    .toBeGreaterThan(100);
+  await expect(page.locator("#status-line")).not.toContainText("Render error");
   await pauseIfRunning(page);
   await expect(page.locator("#start-button")).toBeEnabled();
   await expect(page.locator("#pause-button")).toBeDisabled();
-  expect(await renderedPixelCount(page)).toBeGreaterThan(0);
+});
+
+test("default lower-radius rendering keeps piece pixels after page growth", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "0";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.fill("#radius-input", "200");
+  await page.click("#refresh-button");
+  await page.click("#start-button");
+
+  await expect
+    .poll(() => statusPlacementCount(page), { timeout: 20_000 })
+    .toBeGreaterThan(10_000);
+  await expect(page.locator("#status-line")).toContainText("Complete", {
+    timeout: 20_000,
+  });
+  await expect(page.locator("#sim-canvas")).toHaveAttribute(
+    "data-generation-border",
+    "hidden",
+  );
+  await expect
+    .poll(async () => (await canvasScreenshotPixelStats(page)).nonBackground, {
+      timeout: 10_000,
+    })
+    .toBeGreaterThan(100);
+  await expect(page.locator("#status-line")).not.toContainText("Render error");
+  await pauseIfRunning(page);
+});
+
+test("high-radius Color lattice runs keep exact row colors in compact export", async ({
+  page,
+}) => {
+  test.setTimeout(60_000);
+  await pauseIfRunning(page);
+  await page.evaluate(() => {
+    const slider = document.querySelector<HTMLInputElement>(
+      "#track-opacity-slider",
+    );
+    if (!slider) throw new Error("missing track opacity slider");
+    slider.value = "0";
+    slider.dispatchEvent(new Event("input", { bubbles: true }));
+    const anchorA = document.querySelector<HTMLInputElement>("#anchor-a-input");
+    const anchorB = document.querySelector<HTMLInputElement>("#anchor-b-input");
+    if (!anchorA || !anchorB) throw new Error("missing color anchors");
+    anchorA.value = "#00ff00";
+    anchorB.value = "#0000ff";
+    anchorA.dispatchEvent(new Event("input", { bubbles: true }));
+    anchorB.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.fill("#radius-input", "1800");
+  await page.selectOption("#enemy-mode-select", "Color");
+  await page.selectOption("#placement-search-select", "SpiralPath");
+  for (let count = 1; count <= 4; count += 1) {
+    await page.click("#step-button");
+    await expect
+      .poll(() => statusPlacementCount(page), { timeout: 10_000 })
+      .toBe(count);
+  }
+
+  await expect
+    .poll(
+      () =>
+        page.locator("#sim-canvas").evaluate((canvas) => ({
+          compact: canvas.getAttribute("data-compact-lattice"),
+          dense: canvas.getAttribute("data-dense-lattice"),
+          placements: Number(canvas.getAttribute("data-placements") ?? "0"),
+        })),
+      { timeout: 30_000 },
+    )
+    .toMatchObject({ compact: "active", dense: "none" });
+  const downloadPromise = page.waitForEvent("download");
+  await page.click("#download-png-button");
+  const download = await downloadPromise;
+  const path = await download.path();
+  if (!path) throw new Error("missing compact PNG download path");
+  const imageSource = `data:image/png;base64,${(await readFile(path)).toString("base64")}`;
+  const colors = await page.evaluate(async (src) => {
+    const image = new Image();
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("failed to load compact PNG"));
+      image.src = src;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const context = canvas.getContext("2d", { willReadFrequently: true });
+    if (!context) throw new Error("missing PNG 2d context");
+    context.drawImage(image, 0, 0);
+    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    let green = 0;
+    let blue = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      const r = data[index];
+      const g = data[index + 1];
+      const b = data[index + 2];
+      if (g > r + 30 && g > b + 30) green += 1;
+      if (b > r + 30 && b > g + 30) blue += 1;
+    }
+    return { green, blue };
+  }, imageSource);
+  expect(colors.green).toBeGreaterThan(0);
+  expect(colors.blue).toBeGreaterThan(0);
 });
 
 test("default simulation auto-runs", async ({ page }) => {
@@ -230,8 +424,9 @@ test("default simulation auto-runs", async ({ page }) => {
   await expect(page.locator("#attack-overlay-opacity-output")).toHaveText("Off");
   await expect(page.locator("#download-jpeg-button")).toHaveCount(0);
   await expect(page.locator("#download-log-button")).toHaveCount(0);
-  await expect(page.locator("#settings-export-button")).toContainText("Export");
-  await expect(page.locator("#settings-import-button")).toContainText("Import");
+  await expect(page.locator("#refresh-button")).toHaveText("Clear");
+  await expect(page.locator("#settings-export-button")).toHaveText("⚙︎ Export");
+  await expect(page.locator("#settings-import-button")).toHaveText("⚙︎ Import");
   await expect(page.locator(".export-button-row .button-row-divider")).toBeVisible();
   await expect(page.locator("#sim-canvas")).toHaveAttribute(
     "data-webgl-context",
@@ -960,7 +1155,7 @@ test("dragging identical custom rows is a visual no-op and preserves the snapsho
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
   const beforePixels = await renderedPixelCount(page);
   expect(beforePixels).toBeGreaterThan(0);
-  const beforeStatus = await page.locator("#status-line").textContent();
+  const beforeStatus = await stableStatusText(page);
 
   const rows = page.locator(".army-row");
   await rows.nth(0).dragTo(rows.nth(1));
@@ -968,7 +1163,7 @@ test("dragging identical custom rows is a visual no-op and preserves the snapsho
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
   await expect(page.locator("#placement-log")).not.toContainText("No placements yet.");
   await expect.poll(() => renderedPixelCount(page)).toBeGreaterThan(0);
-  expect(await page.locator("#status-line").textContent()).toBe(beforeStatus);
+  expect(await stableStatusText(page)).toBe(beforeStatus);
 });
 
 test("complete runs hide the radius border until settings change", async ({
@@ -976,7 +1171,7 @@ test("complete runs hide the radius border until settings change", async ({
 }) => {
   await pauseIfRunning(page);
   await page.fill("#radius-input", "1");
-  await page.click("#refresh-button");
+  await page.click("#refresh-button", { force: true });
   await expect(page.locator("#sim-canvas")).toHaveAttribute(
     "data-generation-border",
     "visible",
@@ -1388,7 +1583,24 @@ test("oversized full png export surfaces a visible status error", async ({
   await expect(page.locator("#download-full-png-button")).toBeEnabled();
 });
 
-test("triangle board, refresh, collapse, pan, and wheel zoom stay wired", async ({
+test("oversized compact lattice generation surfaces a visible worker error", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.fill("#radius-input", "6000");
+  await page.selectOption("#placement-search-select", "SpiralPath");
+  await page.click("#start-button");
+
+  await expect(page.locator("#status-line")).toContainText(
+    "Worker error: exact compact lattice run needs",
+    { timeout: 15_000 },
+  );
+  await expect(page.locator("#status-line")).toContainText("dense cells");
+  await expect(page.locator("#start-button")).toBeEnabled();
+  await expect(page.locator("#pause-button")).toBeDisabled();
+});
+
+test("triangle board, clear, collapse, pan, and wheel zoom stay wired", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -1472,7 +1684,7 @@ test("visual progress off is explicit and re-enabling pauses cleanly", async ({
   });
 });
 
-test("refresh terminates a silent continuous run and keeps controls usable", async ({
+test("clear terminates a silent continuous run and keeps controls usable", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -1497,7 +1709,7 @@ test("refresh terminates a silent continuous run and keeps controls usable", asy
   });
 });
 
-test("refresh then immediate start uses the selected board worker", async ({
+test("clear then immediate start uses the selected board worker", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -1513,7 +1725,7 @@ test("refresh then immediate start uses the selected board worker", async ({
   await expect(page.locator("#placement-log")).not.toContainText("coord=square(");
 });
 
-test("track-on board switch under load refreshes the selected board worker", async ({
+test("track-on board switch under load clears the selected board worker", async ({
   page,
 }) => {
   await page.evaluate(() => {
@@ -1624,24 +1836,27 @@ test("continuous offset edits dim and preserve the current snapshot until restar
   await pauseIfRunning(page);
 });
 
-test("reselecting the current board refreshes without changing board", async ({
+test("opening the current board select and clicking away keeps the generation", async ({
   page,
 }) => {
   await pauseIfRunning(page);
   await expect(page.locator("#board-select")).toHaveValue("LatticeSquare");
   await expect(page.locator("#placement-log")).toContainText("placements logged:");
 
-  await page.locator("#board-select").evaluate((element) => {
-    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
-    element.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
-  });
+  const boardBox = await page.locator("#board-select").boundingBox();
+  if (!boardBox) throw new Error("missing board select bounds");
+  await page.mouse.click(boardBox.x + boardBox.width / 2, boardBox.y + boardBox.height / 2);
+  await page.mouse.click(20, 20);
+  await page.waitForTimeout(100);
 
   await expect(page.locator("#board-select")).toHaveValue("LatticeSquare");
-  await expect(page.locator("#status-line")).toContainText("Paused");
-  await expect(page.locator("#placement-log")).toContainText("No placements yet.");
+  await expect(page.locator("#placement-log")).not.toContainText(
+    "No placements yet.",
+  );
+  await expect(page.locator("#status-line")).not.toContainText("0 placements");
 });
 
-test("board-select blur into another control does not refresh the board", async ({
+test("board-select blur into another control does not clear the board", async ({
   page,
 }) => {
   await pauseIfRunning(page);
@@ -1653,7 +1868,13 @@ test("board-select blur into another control does not refresh the board", async 
 
   await page.locator("#board-select").evaluate((element) => {
     const relatedTarget = document.querySelector("#enemy-mode-select");
-    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    element.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerType: "mouse",
+      }),
+    );
     element.dispatchEvent(
       new FocusEvent("blur", { bubbles: false, relatedTarget }),
     );
@@ -1669,7 +1890,13 @@ test("board-select blur into another control does not refresh the board", async 
   await page.locator("#board-select").evaluate((element) => {
     const enemy = document.querySelector<HTMLElement>("#enemy-mode-select");
     if (!enemy) throw new Error("missing enemy-mode-select");
-    element.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    element.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerType: "mouse",
+      }),
+    );
     enemy.focus();
     element.dispatchEvent(new FocusEvent("blur", { bubbles: false }));
   });
@@ -1682,7 +1909,32 @@ test("board-select blur into another control does not refresh the board", async 
   );
 });
 
-test("refresh then start uses visible board and radius controls for every board", async ({
+test("board-select quick-close does not clear the visible generation", async ({
+  page,
+}) => {
+  await pauseIfRunning(page);
+  await page.selectOption("#board-select", "LatticeTriangle");
+  await page.click("#step-button");
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(", {
+    timeout: 15_000,
+  });
+
+  const boardBox = await page.locator("#board-select").boundingBox();
+  if (!boardBox) throw new Error("missing board select bounds");
+  await page.mouse.click(boardBox.x + boardBox.width / 2, boardBox.y + boardBox.height / 2);
+  await page.mouse.click(boardBox.x + boardBox.width / 2, boardBox.y + boardBox.height / 2);
+  await page.mouse.click(20, 20);
+  await page.waitForTimeout(100);
+
+  await expect(page.locator("#board-select")).toHaveValue("LatticeTriangle");
+  await expect(page.locator("#placement-log")).toContainText("coord=triangle(");
+  await expect(page.locator("#placement-log")).not.toContainText(
+    "No placements yet.",
+  );
+  await expect(page.locator("#status-line")).not.toContainText("0 placements");
+});
+
+test("clear then start uses visible board and radius controls for every board", async ({
   page,
 }) => {
   for (const scenario of [

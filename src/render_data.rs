@@ -1,10 +1,13 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::engine::state::{attack_radius_relevant_to_generation, lattice_attack_targets};
-use crate::math::{AxialCoord, Point2, SquareCoord, TriangleCoord, attack_radius_from_move};
+use crate::math::{
+    AxialCoord, HexSpiral, Point2, SquareCoord, SquareSpiral, TriangleCoord, TriangleSpiral,
+    attack_radius_from_move,
+};
 use crate::protocol::{
     ArmyPreset, AttackOverlayUpdate, BoardKind, ColorRule, ColorState, CustomPiece, EnemyMode,
-    EngineSettings, PieceSignature, Placement, RgbColor, SpotCoord, VertexBufferUpdate,
+    EngineSettings, PieceSignature, Placement, RgbColor, ShapeKind, SpotCoord, VertexBufferUpdate,
     custom_army_effective_color_groups, move_key_for_board, normalize_prime_modulo_divisor,
     parse_hex_rgb, rainbow_rgb,
 };
@@ -130,6 +133,118 @@ pub fn append_vertices(
         let center = placement_center(placement);
         let color = color_for_placement_rgb(placement, context, color_state);
         vertices.extend_from_slice(&[center.x as f32, center.y as f32, color.r, color.g, color.b]);
+    }
+}
+
+#[must_use]
+pub fn compact_lattice_placement(
+    settings: &EngineSettings,
+    placement_id: u64,
+    spot_index: u32,
+) -> Option<Placement> {
+    if settings.army_preset != ArmyPreset::CustomFinite
+        || settings.board == BoardKind::ContinuousArchimedean
+        || settings.custom_army.is_empty()
+    {
+        return None;
+    }
+
+    let army_index = (placement_id as usize) % settings.custom_army.len();
+    let piece = settings.custom_army.get(army_index)?;
+    let army_len = settings.custom_army.len();
+    let color_t = if army_len <= 1 {
+        0.0
+    } else {
+        army_index as f64 / (army_len - 1) as f64
+    };
+
+    Some(Placement {
+        id: placement_id,
+        spot_index: u64::from(spot_index),
+        coord: compact_lattice_spot_coord(settings.board, spot_index)?,
+        piece: PieceSignature::new(piece.a, piece.b),
+        color: crate::protocol::PieceColor {
+            rule: ColorRule::OrderRainbow,
+            fixed_css: String::new(),
+            key: crate::protocol::ColorKey {
+                group: army_index as u64,
+                gradient_value: color_t,
+            },
+        },
+        shape: forced_shape_for_board(settings.board, settings.shape),
+    })
+}
+
+#[must_use]
+pub fn compact_lattice_vertex(
+    settings: &EngineSettings,
+    placement_id: u64,
+    spot_index: u32,
+    context: &ColorContext,
+    color_state: ColorState,
+) -> Option<[f32; 5]> {
+    let placement = compact_lattice_placement(settings, placement_id, spot_index)?;
+    let center = placement_center(&placement);
+    let color = color_for_placement_rgb(&placement, context, color_state);
+    Some([center.x as f32, center.y as f32, color.r, color.g, color.b])
+}
+
+pub fn append_compact_lattice_vertices(
+    vertices: &mut Vec<f32>,
+    settings: &EngineSettings,
+    start_placement: u64,
+    spot_indices: &[u32],
+    context: &ColorContext,
+    color_state: ColorState,
+) {
+    vertices.reserve(spot_indices.len().saturating_mul(5));
+    for (offset, spot_index) in spot_indices.iter().copied().enumerate() {
+        let placement_id = start_placement.saturating_add(offset as u64);
+        if let Some(vertex) =
+            compact_lattice_vertex(settings, placement_id, spot_index, context, color_state)
+        {
+            vertices.extend_from_slice(&vertex);
+        }
+    }
+}
+
+#[must_use]
+fn compact_lattice_spot_coord(board: BoardKind, spot_index: u32) -> Option<SpotCoord> {
+    match board {
+        BoardKind::LatticeSquare => {
+            let coord = SquareSpiral::coord_at_index(u64::from(spot_index));
+            Some(SpotCoord::Square {
+                x: coord.x,
+                y: coord.y,
+            })
+        }
+        BoardKind::LatticeHex => {
+            let coord = HexSpiral::coord_at_index(u64::from(spot_index));
+            Some(SpotCoord::Hex {
+                q: coord.q,
+                r: coord.r,
+            })
+        }
+        BoardKind::LatticeTriangle => {
+            let coord = TriangleSpiral::coord_at_index(u64::from(spot_index));
+            Some(SpotCoord::Triangle {
+                u: coord.u,
+                v: coord.v,
+            })
+        }
+        BoardKind::ContinuousArchimedean => None,
+    }
+}
+
+#[must_use]
+fn forced_shape_for_board(board: BoardKind, requested: ShapeKind) -> ShapeKind {
+    match board {
+        BoardKind::ContinuousArchimedean => ShapeKind::Circle,
+        BoardKind::LatticeTriangle => match requested {
+            ShapeKind::Circle => ShapeKind::Circle,
+            _ => ShapeKind::Triangle,
+        },
+        BoardKind::LatticeSquare | BoardKind::LatticeHex => requested,
     }
 }
 
@@ -912,6 +1027,42 @@ mod tests {
 
         assert_eq!(&vertices[2..5], &[85.0 / 255.0, 167.0 / 255.0, 1.0]);
         assert_eq!(placements[0].color.key.group, 0);
+    }
+
+    #[test]
+    fn compact_lattice_vertices_preserve_distinct_custom_row_colors() {
+        let settings = EngineSettings {
+            board: crate::protocol::BoardKind::LatticeSquare,
+            radius: 1_800.0,
+            anchor_color_a: "#00ff00".to_string(),
+            anchor_color_b: "#0000ff".to_string(),
+            custom_army: vec![
+                CustomPiece::with_auto_color(2, 1),
+                CustomPiece::with_auto_color(2, 1),
+            ],
+            ..EngineSettings::default()
+        };
+        let context = ColorContext::from_settings(&settings);
+        let mut vertices = Vec::new();
+
+        append_compact_lattice_vertices(
+            &mut vertices,
+            &settings,
+            0,
+            &[0, 1, 2, 3],
+            &context,
+            ColorState::default(),
+        );
+
+        assert_eq!(vertices.len(), 20);
+        let colors = vertices
+            .chunks_exact(5)
+            .map(|vertex| [vertex[2], vertex[3], vertex[4]])
+            .collect::<Vec<_>>();
+        assert_eq!(colors[0], [0.0, 1.0, 0.0]);
+        assert_eq!(colors[1], [0.0, 0.0, 1.0]);
+        assert_eq!(colors[2], [0.0, 1.0, 0.0]);
+        assert_eq!(colors[3], [0.0, 0.0, 1.0]);
     }
 
     #[test]

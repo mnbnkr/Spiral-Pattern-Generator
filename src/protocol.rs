@@ -6,6 +6,7 @@ pub const DEFAULT_RADIUS: f64 = 200.0;
 pub const MAX_RADIUS: f64 = 10_000.0;
 pub const MIN_FREE_CAMERA_ZOOM: f64 = 1.0;
 pub const MAX_FREE_CAMERA_ZOOM: f64 = 256.0;
+pub const MAX_EXPLICIT_LATTICE_SPIRAL_SPOTS: u64 = 12_000_000;
 pub const MAX_EXPORT_CANVAS_DIMENSION: u32 = 32_767;
 pub const MAX_EXPORT_PIXEL_BYTES: usize = 512 * 1024 * 1024;
 
@@ -279,6 +280,49 @@ pub fn custom_color_group_change_affects_generation(
 ) -> bool {
     (custom_color_groups_affect_generation(left) || custom_color_groups_affect_generation(right))
         && !custom_army_effective_color_groups_match(left, right)
+}
+
+#[must_use]
+pub fn lattice_spiral_path_spot_count_for_settings(settings: &EngineSettings) -> Option<u64> {
+    if settings.placement_search != PlacementSearchMode::SpiralPath {
+        return None;
+    }
+
+    let radius = settings.radius.max(0.0).floor() as u64;
+    match settings.board {
+        BoardKind::LatticeSquare => {
+            let side = radius.saturating_mul(2).saturating_add(1);
+            Some(side.saturating_mul(side))
+        }
+        BoardKind::LatticeHex => Some(
+            1_u64.saturating_add(
+                3_u64
+                    .saturating_mul(radius)
+                    .saturating_mul(radius.saturating_add(1)),
+            ),
+        ),
+        BoardKind::LatticeTriangle => {
+            let last_segment = radius.saturating_mul(3);
+            Some(
+                last_segment
+                    .saturating_mul(last_segment.saturating_add(1))
+                    .saturating_div(2)
+                    .saturating_add(1),
+            )
+        }
+        BoardKind::ContinuousArchimedean => None,
+    }
+}
+
+#[must_use]
+pub fn compact_lattice_storage_required(settings: &EngineSettings) -> bool {
+    settings.army_preset == ArmyPreset::CustomFinite
+        && settings.placement_search == PlacementSearchMode::SpiralPath
+        && !settings.proactive_attacking
+        && !settings.custom_army.is_empty()
+        && lattice_spiral_path_spot_count_for_settings(settings).is_some_and(|count| {
+            count > MAX_EXPLICIT_LATTICE_SPIRAL_SPOTS && count <= u64::from(u32::MAX)
+        })
 }
 
 #[must_use]
@@ -595,6 +639,12 @@ impl Default for ColorState {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CompactLatticeRenderChunk {
+    pub start: u64,
+    pub spot_indices: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AppToWorker {
     Initialize {
         epoch: u64,
@@ -659,6 +709,8 @@ pub enum VertexBufferUpdate {
     Replace(Vec<f32>),
     ReplaceStart,
     ReplaceAppend(Vec<f32>),
+    CompactLatticeStart,
+    CompactLatticeAppend(CompactLatticeRenderChunk),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

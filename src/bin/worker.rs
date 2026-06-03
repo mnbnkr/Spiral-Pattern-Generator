@@ -7,9 +7,10 @@ use std::rc::Rc;
 use spiral_pattern_generator::engine::SimulationEngine;
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::protocol::{
-    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, ColorState, EngineSettings, Placement,
-    SpeedMode, VertexBufferUpdate, WorkerToApp, custom_army_color_overrides_match,
-    custom_army_moves_match_for_board, custom_color_group_change_affects_generation,
+    AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, ColorState, CompactLatticeRenderChunk,
+    EngineSettings, Placement, SpeedMode, VertexBufferUpdate, WorkerToApp,
+    custom_army_color_overrides_match, custom_army_moves_match_for_board,
+    custom_color_group_change_affects_generation,
 };
 #[cfg(target_arch = "wasm32")]
 use spiral_pattern_generator::render_data::{
@@ -85,6 +86,9 @@ fn handle_message(
             runtime.engine.reset(settings);
             runtime.attack_overlay_cache = None;
             runtime.attack_overlay_job = None;
+            if post_resource_error_if_any(&mut runtime) {
+                return Ok(());
+            }
             post_stats_with_updates(
                 &runtime,
                 VertexBufferUpdate::Replace(Vec::new()),
@@ -110,6 +114,9 @@ fn handle_message(
             if reset {
                 runtime.attack_overlay_cache = None;
                 runtime.attack_overlay_job = None;
+                if post_resource_error_if_any(&mut runtime) {
+                    return Ok(());
+                }
                 post_stats_with_updates(
                     &runtime,
                     VertexBufferUpdate::Replace(Vec::new()),
@@ -158,6 +165,9 @@ fn handle_message(
         AppToWorker::Start { epoch } => {
             let mut runtime = runtime.borrow_mut();
             if epoch == runtime.epoch {
+                if post_resource_error_if_any(&mut runtime) {
+                    return Ok(());
+                }
                 runtime.running = true;
             }
         }
@@ -174,6 +184,9 @@ fn handle_message(
             if epoch != runtime.epoch {
                 return Ok(());
             }
+            if post_resource_error_if_any(&mut runtime) {
+                return Ok(());
+            }
             if runtime.running {
                 if runtime.engine.settings().visual_progress {
                     let (batch_size, work_budget) = batch_parameters(runtime.engine.settings());
@@ -188,6 +201,9 @@ fn handle_message(
         AppToWorker::StepBatch { epoch, max_steps } => {
             let mut runtime = runtime.borrow_mut();
             if epoch != runtime.epoch {
+                return Ok(());
+            }
+            if post_resource_error_if_any(&mut runtime) {
                 return Ok(());
             }
             post_step_result(&mut runtime, max_steps, 2_000_000);
@@ -247,19 +263,28 @@ fn post_finish_only_result(runtime: &mut WorkerRuntime) {
         runtime.running = false;
         let log_placements = log_sample_for_full_run(runtime);
         let attack_overlay_update = attack_overlay_update_for_runtime(runtime, false);
+        let vertex_update = if runtime.engine.uses_compact_lattice_storage() {
+            VertexBufferUpdate::CompactLatticeStart
+        } else {
+            VertexBufferUpdate::ReplaceStart
+        };
         post_worker_message(
             &runtime.scope,
             &WorkerToApp::Batch {
                 epoch: runtime.epoch,
                 log_placements,
-                vertex_update: VertexBufferUpdate::ReplaceStart,
+                vertex_update,
                 attack_overlay_update,
                 attack_overlay_pending: attack_overlay_pending(runtime),
                 stats,
                 color_state,
             },
         );
-        post_vertex_replace_append_chunks(runtime, color_state);
+        if !runtime.engine.uses_compact_lattice_storage() {
+            post_vertex_replace_append_chunks(runtime, color_state);
+        } else {
+            post_compact_lattice_replace_append_chunks(runtime, color_state);
+        }
     } else {
         post_worker_message(
             &runtime.scope,
@@ -297,7 +322,9 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
         );
     } else {
         let color_replacement_needed = had_existing_placements && color_state != old_color_state;
-        let vertex_update = if color_replacement_needed {
+        let vertex_update = if runtime.engine.uses_compact_lattice_storage() {
+            compact_lattice_append_update(previous_placement_count, &placements)
+        } else if color_replacement_needed {
             VertexBufferUpdate::ReplaceStart
         } else {
             VertexBufferUpdate::Append(pack_vertices(
@@ -320,7 +347,7 @@ fn post_step_result(runtime: &mut WorkerRuntime, max_steps: u32, work_budget: u6
                 color_state,
             },
         );
-        if color_replacement_needed {
+        if color_replacement_needed && !runtime.engine.uses_compact_lattice_storage() {
             post_vertex_replace_append_chunks(runtime, color_state);
         }
     }
@@ -560,6 +587,17 @@ fn merge_vertex_updates(
             a.extend_from_slice(&b);
             VertexBufferUpdate::Append(a)
         }
+        (_, compact @ VertexBufferUpdate::CompactLatticeStart)
+        | (compact @ VertexBufferUpdate::CompactLatticeStart, _) => compact,
+        (
+            VertexBufferUpdate::CompactLatticeAppend(mut a),
+            VertexBufferUpdate::CompactLatticeAppend(b),
+        ) if a.start.saturating_add(a.spot_indices.len() as u64) == b.start => {
+            a.spot_indices.extend_from_slice(&b.spot_indices);
+            VertexBufferUpdate::CompactLatticeAppend(a)
+        }
+        (_, compact @ VertexBufferUpdate::CompactLatticeAppend(_))
+        | (compact @ VertexBufferUpdate::CompactLatticeAppend(_), _) => compact,
         (VertexBufferUpdate::ReplaceAppend(mut a), VertexBufferUpdate::ReplaceAppend(b)) => {
             a.extend_from_slice(&b);
             VertexBufferUpdate::ReplaceAppend(a)
@@ -598,6 +636,11 @@ fn batch_parameters(settings: &EngineSettings) -> (u32, u64) {
 
 #[cfg(target_arch = "wasm32")]
 fn post_vertex_replace_append_chunks(runtime: &WorkerRuntime, color_state: ColorState) {
+    if runtime.engine.uses_compact_lattice_storage() {
+        post_compact_lattice_replace_append_chunks(runtime, color_state);
+        return;
+    }
+
     const PACK_CHUNK: usize = 65_536;
     let placement_count = runtime.engine.placement_count();
     let context = ColorContext::from_settings(runtime.engine.settings());
@@ -619,6 +662,52 @@ fn post_vertex_replace_append_chunks(runtime: &WorkerRuntime, color_state: Color
             },
         );
         start = end;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn post_compact_lattice_replace_append_chunks(runtime: &WorkerRuntime, color_state: ColorState) {
+    const PACK_CHUNK: usize = 65_536;
+    let placement_count = runtime.engine.placement_count();
+    let mut start = 0;
+    while start < placement_count {
+        let end = start.saturating_add(PACK_CHUNK).min(placement_count);
+        let placements = runtime.engine.placements_in_range(start, end);
+        post_worker_message(
+            &runtime.scope,
+            &WorkerToApp::Stats {
+                epoch: runtime.epoch,
+                stats: runtime.engine.stats(),
+                color_state,
+                vertex_update: compact_lattice_append_update(start as u64, &placements),
+                attack_overlay_update: AttackOverlayUpdate::none(),
+                attack_overlay_pending: attack_overlay_pending(runtime),
+            },
+        );
+        start = end;
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn compact_lattice_append_update(start: u64, placements: &[Placement]) -> VertexBufferUpdate {
+    if placements.is_empty() {
+        return VertexBufferUpdate::None;
+    }
+
+    let mut spot_indices = Vec::with_capacity(placements.len());
+    for placement in placements {
+        if let Ok(spot_index) = u32::try_from(placement.spot_index) {
+            spot_indices.push(spot_index);
+        }
+    }
+
+    if spot_indices.is_empty() {
+        VertexBufferUpdate::None
+    } else {
+        VertexBufferUpdate::CompactLatticeAppend(CompactLatticeRenderChunk {
+            start,
+            spot_indices,
+        })
     }
 }
 
@@ -687,6 +776,23 @@ fn post_worker_message(scope: &DedicatedWorkerGlobalScope, msg: &WorkerToApp) {
             )));
         }
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn post_resource_error_if_any(runtime: &mut WorkerRuntime) -> bool {
+    let Some(message) = runtime.engine.resource_error() else {
+        return false;
+    };
+
+    runtime.running = false;
+    post_worker_message(
+        &runtime.scope,
+        &WorkerToApp::Error {
+            epoch: runtime.epoch,
+            message: message.to_string(),
+        },
+    );
+    true
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -10,10 +10,12 @@ use web_sys::{
 
 use crate::math::{ArchimedeanSpiral, AxialCoord, SquareCoord, TriangleCoord, TriangleSpiral};
 use crate::protocol::{
-    AttackOverlayUpdate, BoardKind, ColorState, DisplayMode, EngineSettings, MAX_FREE_CAMERA_ZOOM,
-    MIN_FREE_CAMERA_ZOOM, ShapeKind, VertexBufferUpdate, checked_export_pixel_count,
-    custom_color_group_change_affects_generation, export_pixel_limit_error_message,
+    AttackOverlayUpdate, BoardKind, ColorState, CompactLatticeRenderChunk, DisplayMode,
+    EngineSettings, MAX_FREE_CAMERA_ZOOM, MIN_FREE_CAMERA_ZOOM, ShapeKind, VertexBufferUpdate,
+    checked_export_pixel_count, custom_color_group_change_affects_generation,
+    export_pixel_limit_error_message,
 };
+use crate::render_data::{ColorContext, append_compact_lattice_vertices, compact_lattice_vertex};
 
 const FLOATS_PER_VERTEX: usize = 5;
 const FLOATS_PER_CIRCLE_VERTEX: usize = 8;
@@ -330,16 +332,19 @@ pub struct CanvasRenderer {
     attack_spot_vertices: Vec<f32>,
     attack_hit_vertices: Vec<f32>,
     attack_circle_vertices: Vec<f32>,
+    compact_lattice_temp_vertices: Vec<f32>,
     track_vertices: Vec<f32>,
     border_vertices: Vec<f32>,
     pending_upload: PendingUpload,
     placement_float_count: usize,
+    compact_lattice_count: usize,
     attack_spot_upload_pending: bool,
     attack_hit_upload_pending: bool,
     attack_circle_upload_pending: bool,
     track_upload_pending: bool,
     border_upload_pending: bool,
     placement_pages: Vec<VertexPage>,
+    compact_lattice_pages: Vec<CompactLatticePage>,
     attack_spot_buffer: WebGlBuffer,
     attack_hit_buffer: WebGlBuffer,
     attack_circle_buffer: WebGlBuffer,
@@ -447,16 +452,19 @@ impl CanvasRenderer {
             attack_spot_vertices: Vec::new(),
             attack_hit_vertices: Vec::new(),
             attack_circle_vertices: Vec::new(),
+            compact_lattice_temp_vertices: Vec::new(),
             track_vertices: Vec::new(),
             border_vertices: Vec::new(),
             pending_upload: PendingUpload::Full,
             placement_float_count: 0,
+            compact_lattice_count: 0,
             attack_spot_upload_pending: true,
             attack_hit_upload_pending: true,
             attack_circle_upload_pending: true,
             track_upload_pending: true,
             border_upload_pending: true,
             placement_pages: Vec::new(),
+            compact_lattice_pages: Vec::new(),
             attack_spot_buffer,
             attack_hit_buffer,
             attack_circle_buffer,
@@ -553,6 +561,7 @@ impl CanvasRenderer {
 
     pub fn clear_placements(&mut self) -> Result<(), JsValue> {
         self.clear_placement_vertices();
+        self.clear_compact_lattice();
         self.clear_attack_overlay_vertices()?;
         self.pan_x = 0.0;
         self.pan_y = 0.0;
@@ -689,6 +698,7 @@ impl CanvasRenderer {
         match vertex_update {
             VertexBufferUpdate::None => {}
             VertexBufferUpdate::Append(vertices) => {
+                self.clear_compact_lattice();
                 let start = self.placement_float_count;
                 self.append_placement_vertices(vertices)?;
                 self.pending_upload = match self.pending_upload {
@@ -700,10 +710,12 @@ impl CanvasRenderer {
                 };
             }
             VertexBufferUpdate::ReplaceStart => {
+                self.clear_compact_lattice();
                 self.clear_placement_vertices();
                 self.pending_upload = PendingUpload::Full;
             }
             VertexBufferUpdate::ReplaceAppend(vertices) => {
+                self.clear_compact_lattice();
                 let start = self.placement_float_count;
                 self.append_placement_vertices(vertices)?;
                 self.pending_upload = match self.pending_upload {
@@ -715,9 +727,18 @@ impl CanvasRenderer {
                 };
             }
             VertexBufferUpdate::Replace(vertices) => {
+                self.clear_compact_lattice();
                 self.clear_placement_vertices();
                 self.append_placement_vertices(vertices)?;
                 self.pending_upload = PendingUpload::Full;
+            }
+            VertexBufferUpdate::CompactLatticeStart => {
+                self.clear_placement_vertices();
+                self.clear_compact_lattice();
+            }
+            VertexBufferUpdate::CompactLatticeAppend(update) => {
+                self.clear_placement_vertices();
+                self.append_compact_lattice_indices(update)?;
             }
         }
         Ok(())
@@ -763,17 +784,31 @@ impl CanvasRenderer {
     }
 
     fn sync_placement_attributes(&self) -> Result<(), JsValue> {
-        self.canvas.set_attribute(
-            "data-placements",
-            &(self.placement_float_count / FLOATS_PER_VERTEX).to_string(),
-        )?;
+        let compact_placements = self.compact_lattice_count as u64;
+        let visible_placements = if compact_placements > 0 {
+            compact_placements
+        } else {
+            (self.placement_float_count / FLOATS_PER_VERTEX) as u64
+        };
+        self.canvas
+            .set_attribute("data-placements", &visible_placements.to_string())?;
         self.canvas.set_attribute(
             "data-placement-pages",
             &self
                 .placement_float_count
                 .div_ceil(PLACEMENT_VERTEX_PAGE_FLOATS)
+                .max(self.compact_lattice_pages.len())
                 .to_string(),
         )?;
+        self.canvas.set_attribute(
+            "data-compact-lattice",
+            if compact_placements > 0 {
+                "active"
+            } else {
+                "none"
+            },
+        )?;
+        self.canvas.set_attribute("data-dense-lattice", "none")?;
         Ok(())
     }
 
@@ -863,26 +898,39 @@ impl CanvasRenderer {
             self.draw_attack_spots(&render_state)?;
         }
 
-        if self.placement_float_count == 0 {
+        if self.compact_lattice_count > 0 {
+            self.sync_compact_lattice_buffers()?;
+            self.gl
+                .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
+            self.gl
+                .uniform1i(Some(&self.shape_uniform), render_state.shape);
+            self.gl
+                .uniform1f(Some(&self.sprite_scale_uniform), render_state.sprite_scale);
+            self.gl.uniform1f(Some(&self.alpha_uniform), 1.0);
+            self.gl.uniform1f(
+                Some(&self.saturation_uniform),
+                self.color_saturation.clamp(0.0, 1.0),
+            );
+            self.draw_compact_lattice_pages()?;
+        } else if self.placement_float_count > 0 {
+            self.sync_gpu_buffer()?;
+            self.gl
+                .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
+            self.gl
+                .uniform1i(Some(&self.shape_uniform), render_state.shape);
+            self.gl
+                .uniform1f(Some(&self.sprite_scale_uniform), render_state.sprite_scale);
+            self.gl.uniform1f(Some(&self.alpha_uniform), 1.0);
+            self.gl.uniform1f(
+                Some(&self.saturation_uniform),
+                self.color_saturation.clamp(0.0, 1.0),
+            );
+            self.draw_placement_pages()?;
+        } else {
             self.pending_upload = PendingUpload::None;
-            self.sync_placement_attributes()?;
-            return Ok(());
         }
 
-        self.sync_gpu_buffer()?;
         self.sync_placement_attributes()?;
-        self.gl
-            .uniform1f(Some(&self.point_size_uniform), render_state.point_size);
-        self.gl
-            .uniform1i(Some(&self.shape_uniform), render_state.shape);
-        self.gl
-            .uniform1f(Some(&self.sprite_scale_uniform), render_state.sprite_scale);
-        self.gl.uniform1f(Some(&self.alpha_uniform), 1.0);
-        self.gl.uniform1f(
-            Some(&self.saturation_uniform),
-            self.color_saturation.clamp(0.0, 1.0),
-        );
-        self.draw_placement_pages()?;
 
         if self.settings.attack_overlay_opacity > f32::EPSILON {
             if !self.attack_hit_vertices.is_empty() {
@@ -893,6 +941,7 @@ impl CanvasRenderer {
             }
         }
 
+        self.gl.flush();
         Ok(())
     }
 
@@ -1163,7 +1212,7 @@ impl CanvasRenderer {
                     .create_buffer()
                     .ok_or_else(|| JsValue::from_str("failed to create WebGL placement buffer"))?,
                 vertices: Rc::new(Vec::new()),
-                allocated: false,
+                allocated_floats: 0,
                 uploaded_floats: 0,
             });
         }
@@ -1177,9 +1226,88 @@ impl CanvasRenderer {
     }
 
     fn clear_placement_vertices(&mut self) {
+        self.gl.bind_buffer(Gl::ARRAY_BUFFER, None);
         self.placement_pages.clear();
         self.placement_float_count = 0;
         self.pending_upload = PendingUpload::None;
+    }
+
+    fn clear_compact_lattice(&mut self) {
+        self.gl.bind_buffer(Gl::ARRAY_BUFFER, None);
+        self.compact_lattice_pages.clear();
+        self.compact_lattice_count = 0;
+        self.compact_lattice_temp_vertices.clear();
+    }
+
+    fn append_compact_lattice_indices(
+        &mut self,
+        update: &CompactLatticeRenderChunk,
+    ) -> Result<(), JsValue> {
+        let start = usize::try_from(update.start)
+            .map_err(|_| JsValue::from_str("compact lattice start is too large"))?;
+        if start == 0 && self.compact_lattice_count != 0 {
+            self.clear_compact_lattice();
+        } else if start < self.compact_lattice_count {
+            self.truncate_compact_lattice(start);
+        } else if start > self.compact_lattice_count {
+            return Err(JsValue::from_str(
+                "compact lattice render chunk arrived out of order",
+            ));
+        }
+
+        let mut spot_indices = update.spot_indices.as_slice();
+        while !spot_indices.is_empty() {
+            let page_index = self.compact_lattice_count / PLACEMENT_VERTEX_PAGE_VERTICES;
+            let local_start = self.compact_lattice_count % PLACEMENT_VERTEX_PAGE_VERTICES;
+            if self.compact_lattice_pages.len() <= page_index {
+                self.compact_lattice_pages.push(CompactLatticePage {
+                    buffer: self.gl.create_buffer().ok_or_else(|| {
+                        JsValue::from_str("failed to create compact lattice WebGL buffer")
+                    })?,
+                    indices: Rc::new(Vec::with_capacity(PLACEMENT_VERTEX_PAGE_VERTICES)),
+                    allocated_vertices: 0,
+                    uploaded_indices: 0,
+                });
+            }
+
+            let page_room = PLACEMENT_VERTEX_PAGE_VERTICES.saturating_sub(local_start);
+            let take = spot_indices.len().min(page_room);
+            if take == 0 {
+                return Err(JsValue::from_str("compact lattice page is full"));
+            }
+
+            let page = &mut self.compact_lattice_pages[page_index];
+            {
+                let indices = Rc::make_mut(&mut page.indices);
+                if indices.len() != local_start {
+                    indices.truncate(local_start);
+                    page.uploaded_indices = page.uploaded_indices.min(local_start);
+                }
+                indices
+                    .try_reserve_exact(take)
+                    .map_err(|_| JsValue::from_str("compact lattice page allocation failed"))?;
+                indices.extend_from_slice(&spot_indices[..take]);
+            }
+            self.compact_lattice_count += take;
+            spot_indices = &spot_indices[take..];
+        }
+
+        Ok(())
+    }
+
+    fn truncate_compact_lattice(&mut self, len: usize) {
+        let required_pages = len.div_ceil(PLACEMENT_VERTEX_PAGE_VERTICES);
+        self.compact_lattice_pages.truncate(required_pages);
+        if len > 0 {
+            let local_len = len % PLACEMENT_VERTEX_PAGE_VERTICES;
+            if local_len != 0
+                && let Some(page) = self.compact_lattice_pages.last_mut()
+            {
+                Rc::make_mut(&mut page.indices).truncate(local_len);
+                page.uploaded_indices = page.uploaded_indices.min(local_len);
+            }
+        }
+        self.compact_lattice_count = len;
     }
 
     fn append_placement_vertices(&mut self, mut vertices: &[f32]) -> Result<(), JsValue> {
@@ -1246,16 +1374,43 @@ impl CanvasRenderer {
         })
     }
 
+    fn collect_export_placements(&self) -> Result<ExportPlacements, JsValue> {
+        if self.compact_lattice_count > 0 {
+            let mut pages = Vec::new();
+            pages
+                .try_reserve_exact(self.compact_lattice_pages.len())
+                .map_err(|_| JsValue::from_str("export compact page list allocation failed"))?;
+            let mut remaining = self.compact_lattice_count;
+            for page in &self.compact_lattice_pages {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(page.indices.len());
+                pages.push(CompactLatticePageSnapshot {
+                    indices: Rc::clone(&page.indices),
+                    len: take,
+                });
+                remaining -= take;
+            }
+            Ok(ExportPlacements::CompactLattice(CompactLatticePages {
+                settings: self.placement_settings.clone(),
+                color_state: self.color_state,
+                pages,
+                placement_count: self.compact_lattice_count,
+            }))
+        } else {
+            self.collect_placement_vertex_pages()
+                .map(ExportPlacements::Vertices)
+        }
+    }
+
     fn upload_vertex_range(&mut self, start_float: usize, end_float: usize) -> Result<(), JsValue> {
         if start_float >= end_float {
             return Ok(());
         }
 
         self.ensure_placement_pages(end_float)?;
-        let page_bytes = PLACEMENT_VERTEX_PAGE_FLOATS
-            .checked_mul(BYTES_PER_FLOAT)
-            .and_then(|bytes| i32::try_from(bytes).ok())
-            .ok_or_else(|| JsValue::from_str("WebGL placement page is too large"))?;
+        let gl = self.gl.clone();
         let first_page = start_float / PLACEMENT_VERTEX_PAGE_FLOATS;
         let last_page = (end_float - 1) / PLACEMENT_VERTEX_PAGE_FLOATS;
 
@@ -1268,31 +1423,37 @@ impl CanvasRenderer {
             }
 
             let page = &mut self.placement_pages[page_index];
-            self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page.buffer));
-            if !page.allocated {
-                self.gl
-                    .buffer_data_with_i32(Gl::ARRAY_BUFFER, page_bytes, Gl::DYNAMIC_DRAW);
-                page.allocated = true;
+            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page.buffer));
+            if local_end > page.allocated_floats {
+                let allocated_floats =
+                    webgl_page_allocation_floats(local_end, PLACEMENT_VERTEX_PAGE_FLOATS);
+                let page_bytes = webgl_buffer_size_bytes(allocated_floats)?;
+                clear_gl_errors(&gl);
+                gl.buffer_data_with_i32(Gl::ARRAY_BUFFER, page_bytes, Gl::DYNAMIC_DRAW);
+                check_gl_error(&gl, "allocating placement vertex page")?;
+                page.allocated_floats = allocated_floats;
+                page.uploaded_floats = 0;
             }
 
-            let offset_bytes = local_start
-                .checked_mul(BYTES_PER_FLOAT)
-                .and_then(|bytes| i32::try_from(bytes).ok())
-                .ok_or_else(|| JsValue::from_str("WebGL vertex upload offset is too large"))?;
-            let upload_start = local_start.min(page.vertices.len());
-            let upload_end = local_end.min(page.vertices.len());
-            if upload_start >= upload_end {
+            let Some((upload_start, upload_end, offset_bytes)) = planned_vertex_upload(
+                local_start,
+                local_end,
+                page.uploaded_floats,
+                page.vertices.len(),
+            )?
+            else {
                 continue;
-            }
-
+            };
+            clear_gl_errors(&gl);
             unsafe {
                 let view = js_sys::Float32Array::view(&page.vertices[upload_start..upload_end]);
-                self.gl.buffer_sub_data_with_i32_and_array_buffer_view(
+                gl.buffer_sub_data_with_i32_and_array_buffer_view(
                     Gl::ARRAY_BUFFER,
                     offset_bytes,
                     &view,
                 );
             }
+            check_gl_error(&gl, "uploading placement vertex page")?;
             page.uploaded_floats = page.uploaded_floats.max(upload_end);
         }
 
@@ -1321,6 +1482,110 @@ impl CanvasRenderer {
             self.gl
                 .draw_arrays(Gl::POINTS, 0, (draw_floats / FLOATS_PER_VERTEX) as i32);
         }
+        Ok(())
+    }
+
+    fn sync_compact_lattice_buffers(&mut self) -> Result<(), JsValue> {
+        if self.compact_lattice_count == 0 {
+            return Ok(());
+        }
+
+        let settings = self.placement_settings.clone();
+        let context = ColorContext::from_settings(&settings);
+        let gl = self.gl.clone();
+        let mut page_start = 0_u64;
+        for page_index in 0..self.compact_lattice_pages.len() {
+            let page = Rc::clone(&self.compact_lattice_pages[page_index].indices);
+            let remaining = self
+                .compact_lattice_count
+                .saturating_sub(page_start as usize);
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(page.len());
+            if take == 0 {
+                break;
+            }
+
+            let mut uploaded = self.compact_lattice_pages[page_index]
+                .uploaded_indices
+                .min(take);
+            {
+                let page_state = &mut self.compact_lattice_pages[page_index];
+                gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page_state.buffer));
+                if take > page_state.allocated_vertices {
+                    let allocated_vertices =
+                        webgl_page_allocation_vertices(take, PLACEMENT_VERTEX_PAGE_VERTICES);
+                    let page_bytes =
+                        webgl_buffer_size_bytes(allocated_vertices * FLOATS_PER_VERTEX)?;
+                    clear_gl_errors(&gl);
+                    gl.buffer_data_with_i32(Gl::ARRAY_BUFFER, page_bytes, Gl::DYNAMIC_DRAW);
+                    check_gl_error(&gl, "allocating compact lattice vertex page")?;
+                    page_state.allocated_vertices = allocated_vertices;
+                    page_state.uploaded_indices = 0;
+                    uploaded = 0;
+                }
+            }
+            if uploaded >= take {
+                page_start = page_start.saturating_add(take as u64);
+                continue;
+            }
+
+            self.compact_lattice_temp_vertices.clear();
+            append_compact_lattice_vertices(
+                &mut self.compact_lattice_temp_vertices,
+                &settings,
+                page_start.saturating_add(uploaded as u64),
+                &page[uploaded..take],
+                &context,
+                self.color_state,
+            );
+            if self.compact_lattice_temp_vertices.len() < FLOATS_PER_VERTEX {
+                page_start = page_start.saturating_add(take as u64);
+                continue;
+            }
+
+            let page_state = &mut self.compact_lattice_pages[page_index];
+            gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page_state.buffer));
+            let offset_bytes = uploaded
+                .checked_mul(FLOATS_PER_VERTEX)
+                .and_then(|floats| floats.checked_mul(BYTES_PER_FLOAT))
+                .and_then(|bytes| i32::try_from(bytes).ok())
+                .ok_or_else(|| JsValue::from_str("WebGL compact upload offset is too large"))?;
+            clear_gl_errors(&gl);
+            unsafe {
+                let view = js_sys::Float32Array::view(&self.compact_lattice_temp_vertices);
+                gl.buffer_sub_data_with_i32_and_array_buffer_view(
+                    Gl::ARRAY_BUFFER,
+                    offset_bytes,
+                    &view,
+                );
+            }
+            check_gl_error(&gl, "uploading compact lattice vertex page")?;
+            page_state.uploaded_indices = take;
+            page_start = page_start.saturating_add(take as u64);
+        }
+
+        Ok(())
+    }
+
+    fn draw_compact_lattice_pages(&self) -> Result<(), JsValue> {
+        let mut remaining = self.compact_lattice_count;
+        for page in &self.compact_lattice_pages {
+            if remaining == 0 {
+                break;
+            }
+            let draw_vertices = remaining.min(page.indices.len()).min(page.uploaded_indices);
+            if draw_vertices == 0 {
+                break;
+            }
+
+            self.gl.bind_buffer(Gl::ARRAY_BUFFER, Some(&page.buffer));
+            self.configure_vertex_attribs();
+            self.gl.draw_arrays(Gl::POINTS, 0, draw_vertices as i32);
+            remaining -= draw_vertices;
+        }
+
         Ok(())
     }
 
@@ -1428,8 +1693,15 @@ enum PendingUpload {
 struct VertexPage {
     buffer: WebGlBuffer,
     vertices: Rc<Vec<f32>>,
-    allocated: bool,
+    allocated_floats: usize,
     uploaded_floats: usize,
+}
+
+struct CompactLatticePage {
+    buffer: WebGlBuffer,
+    indices: Rc<Vec<u32>>,
+    allocated_vertices: usize,
+    uploaded_indices: usize,
 }
 
 struct PlacementVertexPageSnapshot {
@@ -1448,6 +1720,32 @@ impl PlacementVertexPages {
     }
 }
 
+struct CompactLatticePageSnapshot {
+    indices: Rc<Vec<u32>>,
+    len: usize,
+}
+
+struct CompactLatticePages {
+    settings: EngineSettings,
+    color_state: ColorState,
+    pages: Vec<CompactLatticePageSnapshot>,
+    placement_count: usize,
+}
+
+enum ExportPlacements {
+    Vertices(PlacementVertexPages),
+    CompactLattice(CompactLatticePages),
+}
+
+impl ExportPlacements {
+    fn vertex_count(&self) -> usize {
+        match self {
+            Self::Vertices(vertices) => vertices.vertex_count(),
+            Self::CompactLattice(compact) => compact.placement_count,
+        }
+    }
+}
+
 fn reserve_page_vertices(page: &mut VertexPage, additional: usize) -> Result<(), JsValue> {
     let vertices = Rc::make_mut(&mut page.vertices);
     let needed = vertices
@@ -1462,6 +1760,71 @@ fn reserve_page_vertices(page: &mut VertexPage, additional: usize) -> Result<(),
     vertices
         .try_reserve_exact(target_capacity.saturating_sub(vertices.capacity()))
         .map_err(|_| JsValue::from_str("placement vertex page allocation failed"))
+}
+
+fn planned_vertex_upload(
+    local_start: usize,
+    local_end: usize,
+    uploaded_floats: usize,
+    vertex_len: usize,
+) -> Result<Option<(usize, usize, i32)>, JsValue> {
+    let upload_start = uploaded_floats.min(local_start).min(vertex_len);
+    let upload_end = local_end.min(vertex_len);
+    if upload_start >= upload_end {
+        return Ok(None);
+    }
+
+    let offset_bytes = upload_start
+        .checked_mul(BYTES_PER_FLOAT)
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .ok_or_else(|| JsValue::from_str("WebGL vertex upload offset is too large"))?;
+    Ok(Some((upload_start, upload_end, offset_bytes)))
+}
+
+fn clear_gl_errors(gl: &Gl) {
+    if browser_is_automation() {
+        return;
+    }
+    for _ in 0..16 {
+        if gl.get_error() == Gl::NO_ERROR {
+            break;
+        }
+    }
+}
+
+fn check_gl_error(gl: &Gl, operation: &str) -> Result<(), JsValue> {
+    if browser_is_automation() {
+        return Ok(());
+    }
+    let error = gl.get_error();
+    if error == Gl::NO_ERROR {
+        Ok(())
+    } else {
+        Err(JsValue::from_str(&format!(
+            "{operation} failed with WebGL error 0x{error:04x}"
+        )))
+    }
+}
+
+fn webgl_page_allocation_floats(required_floats: usize, max_floats: usize) -> usize {
+    required_floats
+        .max(FLOATS_PER_VERTEX)
+        .next_power_of_two()
+        .min(max_floats)
+}
+
+fn webgl_page_allocation_vertices(required_vertices: usize, max_vertices: usize) -> usize {
+    required_vertices
+        .max(1)
+        .next_power_of_two()
+        .min(max_vertices)
+}
+
+fn webgl_buffer_size_bytes(floats: usize) -> Result<i32, JsValue> {
+    floats
+        .checked_mul(BYTES_PER_FLOAT)
+        .and_then(|bytes| i32::try_from(bytes).ok())
+        .ok_or_else(|| JsValue::from_str("WebGL vertex page is too large"))
 }
 
 fn apply_static_vertex_update(
@@ -1488,6 +1851,7 @@ fn apply_static_vertex_update(
             target.extend_from_slice(vertices);
             *upload_pending = true;
         }
+        VertexBufferUpdate::CompactLatticeStart | VertexBufferUpdate::CompactLatticeAppend(_) => {}
     }
 }
 
@@ -1534,14 +1898,14 @@ struct ExportSpec {
 enum ExportJob {
     Direct {
         spec: ExportSpec,
-        vertices: PlacementVertexPages,
+        placements: ExportPlacements,
         pixels: Vec<u8>,
         stage: ExportStage,
     },
     Supersampled {
         spec: ExportSpec,
         supersampled: ExportSpec,
-        vertices: PlacementVertexPages,
+        placements: ExportPlacements,
         high_pixels: Vec<u8>,
         pixels: Vec<u8>,
         stage: ExportStage,
@@ -1566,12 +1930,12 @@ impl ExportJob {
         let spec = renderer.export_spec(kind, 1.0);
         let pixel_count = checked_pixel_count(spec.width, spec.height)?;
         let pixels = allocate_pixel_buffer(pixel_count)?;
-        let vertices = renderer.collect_placement_vertex_pages()?;
+        let placements = renderer.collect_export_placements()?;
 
         if spec.square_pixel_cells {
             return Ok(Self::Direct {
                 spec,
-                vertices,
+                placements,
                 pixels,
                 stage: ExportStage::Fill { next_pixel: 0 },
             });
@@ -1585,7 +1949,7 @@ impl ExportJob {
         Ok(Self::Supersampled {
             spec,
             supersampled,
-            vertices,
+            placements,
             high_pixels,
             pixels,
             stage: ExportStage::Fill { next_pixel: 0 },
@@ -1602,7 +1966,7 @@ impl ExportJob {
         match self {
             Self::Direct {
                 spec,
-                vertices,
+                placements,
                 pixels,
                 stage,
             } => match stage {
@@ -1620,7 +1984,7 @@ impl ExportJob {
                     Ok(ExportStep::Pending)
                 }
                 ExportStage::DrawPieces { next_vertex } => {
-                    let total_vertices = vertices.vertex_count();
+                    let total_vertices = placements.vertex_count();
                     let vertices_per_chunk = if spec.square_pixel_cells {
                         SQUARE_PIXEL_VERTICES_PER_CHUNK
                     } else {
@@ -1629,7 +1993,7 @@ impl ExportJob {
                     let end = next_vertex
                         .saturating_add(vertices_per_chunk)
                         .min(total_vertices);
-                    draw_export_vertex_pages(pixels, spec, vertices, *next_vertex, end);
+                    draw_export_placements(pixels, spec, placements, *next_vertex, end);
                     if end >= total_vertices {
                         *stage = ExportStage::Finish;
                     } else {
@@ -1648,7 +2012,7 @@ impl ExportJob {
             Self::Supersampled {
                 spec,
                 supersampled,
-                vertices,
+                placements,
                 high_pixels,
                 pixels,
                 stage,
@@ -1667,14 +2031,14 @@ impl ExportJob {
                     Ok(ExportStep::Pending)
                 }
                 ExportStage::DrawPieces { next_vertex } => {
-                    let total_vertices = vertices.vertex_count();
+                    let total_vertices = placements.vertex_count();
                     let end = next_vertex
                         .saturating_add(SUPERSAMPLED_VERTICES_PER_CHUNK)
                         .min(total_vertices);
-                    draw_export_vertex_pages(
+                    draw_export_placements(
                         high_pixels,
                         supersampled,
-                        vertices,
+                        placements,
                         *next_vertex,
                         end,
                     );
@@ -2356,6 +2720,23 @@ fn fill_background_range(pixels: &mut [u8], start_pixel: usize, end_pixel: usize
     }
 }
 
+fn draw_export_placements(
+    pixels: &mut [u8],
+    spec: &ExportSpec,
+    placements: &ExportPlacements,
+    start_vertex: usize,
+    end_vertex: usize,
+) {
+    match placements {
+        ExportPlacements::Vertices(vertices) => {
+            draw_export_vertex_pages(pixels, spec, vertices, start_vertex, end_vertex);
+        }
+        ExportPlacements::CompactLattice(compact) => {
+            draw_export_compact_lattice_pages(pixels, spec, compact, start_vertex, end_vertex);
+        }
+    }
+}
+
 fn draw_export_vertex_pages(
     pixels: &mut [u8],
     spec: &ExportSpec,
@@ -2384,6 +2765,78 @@ fn draw_export_vertex_pages(
             );
         }
         page_start_vertex = page_end_vertex;
+    }
+}
+
+fn draw_export_compact_lattice_pages(
+    pixels: &mut [u8],
+    spec: &ExportSpec,
+    compact: &CompactLatticePages,
+    start_vertex: usize,
+    end_vertex: usize,
+) {
+    let context = ColorContext::from_settings(&compact.settings);
+    let mut page_start_vertex = 0_usize;
+    for page in &compact.pages {
+        let page_vertex_count = page.len;
+        let page_end_vertex = page_start_vertex.saturating_add(page_vertex_count);
+        if end_vertex <= page_start_vertex {
+            break;
+        }
+        if start_vertex < page_end_vertex {
+            let local_start = start_vertex.saturating_sub(page_start_vertex);
+            let local_end = end_vertex
+                .min(page_end_vertex)
+                .saturating_sub(page_start_vertex);
+            draw_export_compact_lattice_slice(
+                pixels,
+                spec,
+                compact,
+                &context,
+                &page.indices[..page.len.min(page.indices.len())],
+                page_start_vertex as u64,
+                local_start..local_end,
+            );
+        }
+        page_start_vertex = page_end_vertex;
+    }
+}
+
+fn draw_export_compact_lattice_slice(
+    pixels: &mut [u8],
+    spec: &ExportSpec,
+    compact: &CompactLatticePages,
+    context: &ColorContext,
+    spot_indices: &[u32],
+    page_start_vertex: u64,
+    vertex_range: std::ops::Range<usize>,
+) {
+    let start = vertex_range.start.min(spot_indices.len());
+    let end = vertex_range.end.min(spot_indices.len());
+    for (offset, spot_index) in spot_indices[start..end].iter().copied().enumerate() {
+        let placement_id = page_start_vertex.saturating_add((start + offset) as u64);
+        let Some(vertex) = compact_lattice_vertex(
+            &compact.settings,
+            placement_id,
+            spot_index,
+            context,
+            compact.color_state,
+        ) else {
+            continue;
+        };
+        let center_x = vertex[0] as f64;
+        let center_y = vertex[1] as f64;
+        let color = [
+            channel_to_u8(vertex[2]),
+            channel_to_u8(vertex[3]),
+            channel_to_u8(vertex[4]),
+            255,
+        ];
+        if spec.square_pixel_cells {
+            draw_square_cell_export_pixel(pixels, spec, center_x, center_y, color);
+        } else {
+            draw_export_piece(pixels, spec, center_x, center_y, color);
+        }
     }
 }
 
@@ -2578,7 +3031,8 @@ fn js_value_text(value: &JsValue) -> String {
 fn webgl_context_with_fallback(
     canvas: &HtmlCanvasElement,
 ) -> Result<(Gl, &'static str, ShaderSources), JsValue> {
-    if let Some(context) = canvas.get_context("webgl2")? {
+    let options = webgl_context_options()?;
+    if let Some(context) = canvas.get_context_with_context_options("webgl2", &options)? {
         return Ok((
             context.unchecked_into::<Gl>(),
             "webgl2",
@@ -2592,8 +3046,13 @@ fn webgl_context_with_fallback(
     }
 
     let context = canvas
-        .get_context("webgl")?
-        .or_else(|| canvas.get_context("experimental-webgl").ok().flatten())
+        .get_context_with_context_options("webgl", &options)?
+        .or_else(|| {
+            canvas
+                .get_context_with_context_options("experimental-webgl", &options)
+                .ok()
+                .flatten()
+        })
         .ok_or_else(|| JsValue::from_str("webgl context unavailable"))?
         .dyn_into::<Gl>()?;
     if context.get_extension("OES_standard_derivatives")?.is_none() {
@@ -2612,6 +3071,30 @@ fn webgl_context_with_fallback(
             circle_fragment: CIRCLE_FRAGMENT_SHADER_WEBGL1,
         },
     ))
+}
+
+fn webgl_context_options() -> Result<js_sys::Object, JsValue> {
+    let options = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &options,
+        &JsValue::from_str("preserveDrawingBuffer"),
+        &JsValue::from_bool(browser_is_automation()),
+    )?;
+    Ok(options)
+}
+
+fn browser_is_automation() -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let window_value: JsValue = window.into();
+    let Ok(navigator) = js_sys::Reflect::get(&window_value, &JsValue::from_str("navigator")) else {
+        return false;
+    };
+    js_sys::Reflect::get(&navigator, &JsValue::from_str("webdriver"))
+        .ok()
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 fn compile_shader(gl: &Gl, shader_type: u32, source: &str) -> Result<WebGlShader, JsValue> {
@@ -2681,7 +3164,6 @@ fn uniform_location(
         .ok_or_else(|| JsValue::from_str(&format!("missing WebGL uniform {name}")))
 }
 
-#[allow(dead_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2745,6 +3227,18 @@ mod tests {
 
         assert_eq!((width, height), (20_001, 20_001));
         assert!(message.contains("export image would require"));
+    }
+
+    #[test]
+    fn vertex_upload_plan_replays_from_zero_after_page_growth() {
+        let plan = planned_vertex_upload(100, 200, 0, 200).unwrap();
+        assert_eq!(plan, Some((0, 200, 0)));
+
+        let append_plan = planned_vertex_upload(100, 200, 100, 200).unwrap();
+        assert_eq!(
+            append_plan,
+            Some((100, 200, (100 * BYTES_PER_FLOAT) as i32))
+        );
     }
 
     #[test]

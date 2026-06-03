@@ -3,7 +3,10 @@ use std::collections::BinaryHeap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::engine::spatial::{ContinuousSpatialHash, LatticePieceIdentity, LatticeSpatialIndex};
+use crate::engine::spatial::{
+    ContinuousSpatialHash, LatticePieceIdentity, LatticeSpatialIndex, MAX_DENSE_GROUP_BITS,
+    MAX_DENSE_LATTICE_CELLS, dense_lattice_cell_count,
+};
 use crate::math::{
     ArchimedeanSpiral, ArchimedeanSpots, AxialCoord, GEOM_EPS, HexSpiral, Point2, SquareCoord,
     SquareSpiral, TriangleCoord, TriangleSpiral, attack_circle_hits_body_distance_squared,
@@ -11,10 +14,11 @@ use crate::math::{
 };
 use crate::protocol::{
     ArmyPreset, BoardKind, ColorKey, ColorRule, ColorState, CustomPiece, EnemyMode, EngineSettings,
-    EngineStats, PieceColor, PieceSignature, Placement, PlacementSearchMode, ShapeKind, SpotCoord,
+    EngineStats, MAX_EXPLICIT_LATTICE_SPIRAL_SPOTS, PieceColor, PieceSignature, Placement,
+    PlacementSearchMode, ShapeKind, SpotCoord, compact_lattice_storage_required,
     custom_army_effective_color_groups, custom_army_moves_match_for_board,
-    custom_color_group_change_affects_generation, move_key_for_board,
-    normalize_prime_modulo_divisor,
+    custom_color_group_change_affects_generation, lattice_spiral_path_spot_count_for_settings,
+    move_key_for_board, normalize_prime_modulo_divisor,
 };
 
 const CONTINUOUS_CENTER_STREAMS: usize = 1;
@@ -23,7 +27,6 @@ const SPECIAL_PRIME_COLOR: &str = "#808080";
 const ATTACK_RELEVANCE_RADIUS_MULTIPLIER: f64 = 4.0;
 const CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_FRACTION: f64 = 0.0045;
 const CONTINUOUS_PLACEMENT_OVERLAP_TOLERANCE_ABSOLUTE: f64 = 1.0e-10;
-const MAX_PREALLOCATED_SPIRAL_PATH_SPOTS: u64 = 12_000_000;
 #[cfg(not(test))]
 const PLACED_PAGE_SIZE: usize = 65_536;
 #[cfg(test)]
@@ -142,6 +145,52 @@ impl PlacementStore {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct CompactLatticePlacementStore {
+    pages: Vec<Vec<u32>>,
+    len: usize,
+}
+
+impl CompactLatticePlacementStore {
+    #[must_use]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn push(&mut self, spot_index: u64) {
+        let Ok(spot_index) = u32::try_from(spot_index) else {
+            return;
+        };
+
+        let needs_page = self
+            .pages
+            .last()
+            .is_none_or(|page| page.len() >= PLACED_PAGE_SIZE);
+        if needs_page {
+            self.pages.push(Vec::with_capacity(PLACED_PAGE_SIZE));
+        }
+        if let Some(page) = self.pages.last_mut() {
+            page.push(spot_index);
+            self.len += 1;
+        }
+    }
+
+    #[must_use]
+    fn get(&self, index: usize) -> Option<u64> {
+        let page_index = index / PLACED_PAGE_SIZE;
+        let local_index = index % PLACED_PAGE_SIZE;
+        self.pages
+            .get(page_index)
+            .and_then(|page| page.get(local_index))
+            .map(|spot_index| u64::from(*spot_index))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PlacedLocation {
     Lattice { a: i64, b: i64 },
@@ -234,32 +283,99 @@ fn preallocated_spiral_path_spots(settings: &EngineSettings) -> Option<usize> {
         return None;
     }
 
-    let radius = settings.radius.max(0.0).floor() as u64;
-    let count = match settings.board {
-        BoardKind::LatticeSquare => {
-            let side = radius.saturating_mul(2).saturating_add(1);
-            side.saturating_mul(side)
-        }
-        BoardKind::LatticeHex => 1_u64.saturating_add(
-            3_u64
-                .saturating_mul(radius)
-                .saturating_mul(radius.saturating_add(1)),
-        ),
-        BoardKind::LatticeTriangle => {
-            let last_segment = radius.saturating_mul(3);
-            last_segment
-                .saturating_mul(last_segment.saturating_add(1))
-                .saturating_div(2)
-                .saturating_add(1)
-        }
-        BoardKind::ContinuousArchimedean => return None,
-    };
+    let count = lattice_spiral_path_spot_count_for_settings(settings)?;
 
-    if count <= MAX_PREALLOCATED_SPIRAL_PATH_SPOTS {
+    if count <= MAX_EXPLICIT_LATTICE_SPIRAL_SPOTS {
         usize::try_from(count).ok()
     } else {
         None
     }
+}
+
+fn dense_lattice_index_for_settings(
+    settings: &EngineSettings,
+    color_groups: &[u64],
+) -> Option<LatticeSpatialIndex> {
+    if !compact_lattice_storage_required(settings) {
+        return None;
+    }
+
+    LatticeSpatialIndex::with_dense(
+        settings.board,
+        settings.radius,
+        color_groups,
+        &custom_move_groups(settings),
+        settings.enemy_mode,
+    )
+}
+
+fn compact_dense_cell_limit_error(settings: &EngineSettings) -> Option<String> {
+    if !compact_lattice_storage_required(settings) {
+        return None;
+    }
+
+    let cells = dense_lattice_cell_count(settings.board, settings.radius)?;
+    if cells <= MAX_DENSE_LATTICE_CELLS {
+        return None;
+    }
+
+    Some(format!(
+        "exact compact lattice run needs {cells} dense cells, above the current safe limit of {MAX_DENSE_LATTICE_CELLS}; lower Radius or use a smaller exact run"
+    ))
+}
+
+fn compact_dense_allocation_error(
+    settings: &EngineSettings,
+    color_groups: &[u64],
+    dense_lattice_index: &Option<LatticeSpatialIndex>,
+) -> Option<String> {
+    if !compact_lattice_storage_required(settings)
+        || dense_lattice_index.is_some()
+        || !compact_dense_group_masks_supported(settings, color_groups)
+    {
+        return None;
+    }
+
+    Some(
+        "exact compact lattice run could not allocate dense occupied/attack masks; lower Radius or use a smaller exact run"
+            .to_string(),
+    )
+}
+
+fn compact_dense_group_masks_supported(settings: &EngineSettings, color_groups: &[u64]) -> bool {
+    let needs_color_masks = matches!(
+        settings.enemy_mode,
+        EnemyMode::Color | EnemyMode::ColorAttackSet
+    );
+    let needs_move_masks = matches!(
+        settings.enemy_mode,
+        EnemyMode::AttackSet | EnemyMode::ColorAttackSet
+    );
+
+    if needs_color_masks && unique_count(color_groups) > MAX_DENSE_GROUP_BITS {
+        return false;
+    }
+
+    if needs_move_masks && unique_count(&custom_move_groups(settings)) > MAX_DENSE_GROUP_BITS {
+        return false;
+    }
+
+    true
+}
+
+fn unique_count<T>(items: &[T]) -> usize
+where
+    T: Copy + Eq + std::hash::Hash,
+{
+    items.iter().copied().collect::<FxHashSet<_>>().len()
+}
+
+fn custom_move_groups(settings: &EngineSettings) -> Vec<(u32, u32)> {
+    settings
+        .custom_army
+        .iter()
+        .map(|piece| move_key_for_board(settings.board, PieceSignature::new(piece.a, piece.b)))
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -416,6 +532,8 @@ pub struct SimulationEngine {
     continuous_index: ContinuousSpatialHash,
     max_continuous_attack_radius: f64,
     placed: PlacementStore,
+    compact_lattice_placed: Option<CompactLatticePlacementStore>,
+    resource_error: Option<String>,
     prime_cache: Vec<u32>,
     min_gap_seen: Option<f64>,
     max_gap_seen: Option<f64>,
@@ -432,13 +550,36 @@ impl SimulationEngine {
         let preallocated_spiral_path_spots = preallocated_spiral_path_spots(&settings);
         let mut spots = Vec::new();
         let mut placed = PlacementStore::new();
+        let custom_enemy_color_groups = custom_army_effective_color_groups(&settings);
+        let dense_limit_error = compact_dense_cell_limit_error(&settings);
+        let dense_lattice_index = if dense_limit_error.is_none() {
+            dense_lattice_index_for_settings(&settings, &custom_enemy_color_groups)
+        } else {
+            None
+        };
+        let dense_allocation_error = compact_dense_allocation_error(
+            &settings,
+            &custom_enemy_color_groups,
+            &dense_lattice_index,
+        );
+        let resource_error = dense_limit_error.or(dense_allocation_error);
+        let lattice_index = if resource_error.is_none() {
+            dense_lattice_index.unwrap_or_default()
+        } else {
+            LatticeSpatialIndex::new()
+        };
+        let compact_lattice_placed =
+            if lattice_index.is_dense() && compact_lattice_storage_required(&settings) {
+                Some(CompactLatticePlacementStore::new())
+            } else {
+                None
+            };
         if let Some(capacity) = preallocated_spiral_path_spots {
             if settings.board == BoardKind::ContinuousArchimedean {
                 let _ = spots.try_reserve_exact(capacity);
             }
             placed = PlacementStore::with_capacity(capacity);
         }
-        let custom_enemy_color_groups = custom_army_effective_color_groups(&settings);
         Self {
             settings,
             mode,
@@ -460,10 +601,12 @@ impl SimulationEngine {
             continuous_spiral,
             continuous_center_spirals,
             continuous_center_streams_exhausted,
-            lattice_index: LatticeSpatialIndex::new(),
+            lattice_index,
             continuous_index: ContinuousSpatialHash::new(2.0),
             max_continuous_attack_radius: 0.0,
             placed,
+            compact_lattice_placed,
+            resource_error,
             prime_cache: Vec::new(),
             min_gap_seen: None,
             max_gap_seen: None,
@@ -476,11 +619,22 @@ impl SimulationEngine {
 
     #[must_use]
     pub fn placement_count(&self) -> usize {
-        self.placed.len()
+        self.compact_lattice_placed
+            .as_ref()
+            .map_or_else(|| self.placed.len(), CompactLatticePlacementStore::len)
+    }
+
+    #[must_use]
+    pub fn uses_compact_lattice_storage(&self) -> bool {
+        self.compact_lattice_placed.is_some()
     }
 
     #[must_use]
     pub fn placement_at(&self, index: usize) -> Option<Placement> {
+        if self.compact_lattice_placed.is_some() {
+            return self.compact_lattice_protocol_placement(index);
+        }
+
         let shape = forced_shape_for_board(self.settings.board, self.settings.shape);
         self.placed
             .get(index)
@@ -489,9 +643,19 @@ impl SimulationEngine {
 
     #[must_use]
     pub fn placements_in_range(&self, start: usize, end: usize) -> Vec<Placement> {
-        let end = end.min(self.placed.len());
+        let end = end.min(self.placement_count());
         if start >= end {
             return Vec::new();
+        }
+
+        if self.compact_lattice_placed.is_some() {
+            let mut placements = Vec::with_capacity(end - start);
+            for index in start..end {
+                if let Some(placement) = self.compact_lattice_protocol_placement(index) {
+                    placements.push(placement);
+                }
+            }
+            return placements;
         }
 
         let mut placements = Vec::with_capacity(end - start);
@@ -527,6 +691,11 @@ impl SimulationEngine {
     }
 
     #[must_use]
+    pub fn resource_error(&self) -> Option<&str> {
+        self.resource_error.as_deref()
+    }
+
+    #[must_use]
     pub fn color_state(&self) -> ColorState {
         match (self.min_gap_seen, self.max_gap_seen) {
             (Some(min_gap), Some(max_gap)) if max_gap > min_gap => ColorState { min_gap, max_gap },
@@ -543,6 +712,11 @@ impl SimulationEngine {
     }
 
     pub fn step_budget(&mut self, max_steps: u32, max_work: u64) -> Vec<Placement> {
+        if self.resource_error.is_some() {
+            self.stats.exhausted = true;
+            return Vec::new();
+        }
+
         let count = max_steps.max(1);
         let mut placements = Vec::with_capacity(count as usize);
         let mut remaining_work = max_work.max(1);
@@ -690,7 +864,11 @@ impl SimulationEngine {
             self.max_gap_seen = Some(self.max_gap_seen.map_or(gap, |current| current.max(gap)));
         }
 
-        self.placed.push(placed_piece);
+        if let Some(compact) = &mut self.compact_lattice_placed {
+            compact.push(spot_index);
+        } else {
+            self.placed.push(placed_piece);
+        }
         self.next_id += 1;
         self.stats.placements += 1;
 
@@ -881,6 +1059,25 @@ impl SimulationEngine {
             .and_then(|index| self.placed.get(index))
     }
 
+    fn compact_lattice_protocol_placement(&self, index: usize) -> Option<Placement> {
+        let store = self.compact_lattice_placed.as_ref()?;
+        let spot_index = store.get(index)?;
+        let spot = lattice_spiral_path_board_spot(self.settings.board, spot_index)?;
+        let army_len = self.custom_army_len();
+        if army_len == 0 {
+            return None;
+        }
+        let piece = self.custom_candidate(index % army_len);
+        Some(Placement {
+            id: index as u64,
+            spot_index,
+            coord: spot.spot_coord(),
+            piece: piece.signature,
+            color: piece.color,
+            shape: forced_shape_for_board(self.settings.board, self.settings.shape),
+        })
+    }
+
     fn enemy_mode_uses_color(&self) -> bool {
         matches!(
             self.settings.enemy_mode,
@@ -936,6 +1133,7 @@ impl SimulationEngine {
 
         current.board != next.board
             || self.radius_change_requires_reset(next)
+            || compact_lattice_storage_required(current) != compact_lattice_storage_required(next)
             || continuous_piece_radius_changes_simulation(current, next)
             || current.proactive_attacking != next.proactive_attacking
             || current.enemy_mode != next.enemy_mode
@@ -957,7 +1155,9 @@ impl SimulationEngine {
             return false;
         }
 
-        current.placement_search != PlacementSearchMode::SpiralPath || next.radius < current.radius
+        current.placement_search != PlacementSearchMode::SpiralPath
+            || next.radius < current.radius
+            || compact_lattice_storage_required(current)
     }
 
     fn custom_candidate(&self, index: usize) -> CandidatePiece {
@@ -1420,6 +1620,25 @@ fn center_shell_spots(board: BoardKind, shell: u64) -> Vec<BoardSpot> {
         BoardKind::LatticeHex => center_hex_shell_spots(shell),
         BoardKind::LatticeTriangle => center_triangle_shell_spots(shell),
         BoardKind::ContinuousArchimedean => Vec::new(),
+    }
+}
+
+fn lattice_spiral_path_board_spot(board: BoardKind, index: u64) -> Option<BoardSpot> {
+    match board {
+        BoardKind::LatticeSquare => Some(BoardSpot::Square {
+            index,
+            coord: SquareSpiral::coord_at_index(index),
+        }),
+        BoardKind::LatticeHex => Some(BoardSpot::Hex {
+            index,
+            coord: HexSpiral::coord_at_index(index),
+        }),
+        BoardKind::LatticeTriangle => Some(BoardSpot::Triangle {
+            index,
+            coord: TriangleSpiral::coord_at_index(index),
+            spiral_radius: TriangleSpiral::radius_for_index(index),
+        }),
+        BoardKind::ContinuousArchimedean => None,
     }
 }
 
@@ -2699,6 +2918,244 @@ mod tests {
                 "lattice SpiralPath should compute spots by index instead of caching every spot"
             );
         }
+    }
+
+    #[test]
+    fn radius_5000_lattice_spiral_path_uses_compact_history_before_memory_cliff() {
+        let radius = 5_000.0;
+        for (board, expected_spots) in [
+            (BoardKind::LatticeSquare, 100_020_001_u64),
+            (BoardKind::LatticeHex, 75_015_001_u64),
+            (BoardKind::LatticeTriangle, 112_507_501_u64),
+        ] {
+            let settings = EngineSettings {
+                board,
+                shape: if board == BoardKind::LatticeHex {
+                    ShapeKind::Hex
+                } else if board == BoardKind::LatticeTriangle {
+                    ShapeKind::Triangle
+                } else {
+                    ShapeKind::Square
+                },
+                radius,
+                placement_search: PlacementSearchMode::SpiralPath,
+                ..EngineSettings::default()
+            };
+
+            assert_eq!(
+                lattice_spiral_path_spot_count_for_settings(&settings),
+                Some(expected_spots),
+                "board={board:?}"
+            );
+            assert_eq!(preallocated_spiral_path_spots(&settings), None);
+
+            let mut engine = SimulationEngine::new(settings);
+            assert!(
+                engine.uses_compact_lattice_storage(),
+                "board={board:?} should avoid full PlacedPiece history"
+            );
+            assert!(engine.lattice_index.is_dense(), "board={board:?}");
+
+            let batch = engine.step_budget(16, 1_000);
+            assert_eq!(batch.len(), 16, "board={board:?}");
+            assert_eq!(engine.placement_count(), 16, "board={board:?}");
+            assert_eq!(
+                engine.placement_at(15).map(|placement| placement.id),
+                Some(15),
+                "board={board:?}"
+            );
+            assert!(
+                engine.placed.pages.is_empty(),
+                "board={board:?} should not retain full placement records"
+            );
+        }
+    }
+
+    #[test]
+    fn lattice_spiral_path_uses_compact_strategy_for_2000_through_5000() {
+        for radius in 2_000..=5_000 {
+            for board in [
+                BoardKind::LatticeSquare,
+                BoardKind::LatticeHex,
+                BoardKind::LatticeTriangle,
+            ] {
+                let settings = EngineSettings {
+                    board,
+                    radius: radius as f64,
+                    placement_search: PlacementSearchMode::SpiralPath,
+                    ..EngineSettings::default()
+                };
+
+                assert!(
+                    compact_lattice_storage_required(&settings),
+                    "board={board:?} radius={radius}"
+                );
+                assert_eq!(
+                    preallocated_spiral_path_spots(&settings),
+                    None,
+                    "board={board:?} radius={radius}"
+                );
+            }
+        }
+
+        for radius in [2_000.0, 3_000.0, 4_000.0, 5_000.0] {
+            for board in [
+                BoardKind::LatticeSquare,
+                BoardKind::LatticeHex,
+                BoardKind::LatticeTriangle,
+            ] {
+                let settings = EngineSettings {
+                    board,
+                    radius,
+                    placement_search: PlacementSearchMode::SpiralPath,
+                    ..EngineSettings::default()
+                };
+
+                let spot_count = lattice_spiral_path_spot_count_for_settings(&settings)
+                    .expect("lattice SpiralPath should report a bounded spot count");
+                assert!(
+                    spot_count > MAX_EXPLICIT_LATTICE_SPIRAL_SPOTS,
+                    "board={board:?} radius={radius}"
+                );
+                assert!(compact_lattice_storage_required(&settings));
+
+                let mut engine = SimulationEngine::new(settings);
+                assert!(
+                    engine.uses_compact_lattice_storage(),
+                    "board={board:?} radius={radius}"
+                );
+                assert!(
+                    engine.lattice_index.is_dense(),
+                    "board={board:?} radius={radius}"
+                );
+
+                let batch = engine.step_budget(4, 1_000);
+                assert_eq!(batch.len(), 4, "board={board:?} radius={radius}");
+                assert!(
+                    engine.placed.pages.is_empty(),
+                    "board={board:?} radius={radius}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_lattice_range_replay_preserves_color_mode_rows() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            board: BoardKind::LatticeSquare,
+            radius: 1_800.0,
+            enemy_mode: EnemyMode::Color,
+            placement_search: PlacementSearchMode::SpiralPath,
+            ..EngineSettings::default()
+        });
+        assert!(engine.uses_compact_lattice_storage());
+
+        let batch = engine.step_budget(32, 2_000);
+        assert_eq!(batch.len(), 32);
+        assert!(engine.placed.pages.is_empty());
+
+        let replay = engine.placements_in_range(0, 32);
+        assert_eq!(replay.len(), 32);
+        assert_eq!(
+            replay
+                .iter()
+                .map(|placement| placement.spot_index)
+                .collect::<Vec<_>>(),
+            batch
+                .iter()
+                .map(|placement| placement.spot_index)
+                .collect::<Vec<_>>()
+        );
+        let color_groups = replay
+            .iter()
+            .map(|placement| placement.color.key.group)
+            .collect::<FxHashSet<_>>();
+        assert_eq!(color_groups.len(), 2);
+        assert!(color_groups.contains(&0));
+        assert!(color_groups.contains(&1));
+    }
+
+    #[test]
+    fn increasing_radius_into_compact_lattice_range_resets_storage_strategy() {
+        let mut engine = SimulationEngine::new(EngineSettings::default());
+        let batch = engine.step_budget(8, 8);
+        assert!(!batch.is_empty());
+        assert!(!engine.uses_compact_lattice_storage());
+
+        let reset = engine.update_settings(EngineSettings {
+            radius: 5_000.0,
+            ..EngineSettings::default()
+        });
+
+        assert!(reset);
+        assert!(engine.uses_compact_lattice_storage());
+        assert_eq!(engine.stats().placements, 0);
+        let batch = engine.step_budget(8, 10_000);
+        assert!(!batch.is_empty());
+        assert_eq!(engine.placement_count(), batch.len());
+        assert!(engine.placed.pages.is_empty());
+    }
+
+    #[test]
+    fn compact_lattice_radius_increase_resets_dense_bounds() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            radius: 1_733.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            ..EngineSettings::default()
+        });
+        assert!(engine.uses_compact_lattice_storage());
+
+        let batch = engine.step_budget(8, 10_000);
+        assert!(!batch.is_empty());
+        assert!(engine.placement_count() > 0);
+
+        let reset = engine.update_settings(EngineSettings {
+            radius: 1_734.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            ..EngineSettings::default()
+        });
+
+        assert!(reset);
+        assert!(engine.uses_compact_lattice_storage());
+        assert_eq!(engine.stats().placements, 0);
+    }
+
+    #[test]
+    fn oversized_compact_lattice_run_reports_resource_error_without_sparse_fallback() {
+        let mut engine = SimulationEngine::new(EngineSettings {
+            radius: 6_000.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            ..EngineSettings::default()
+        });
+
+        let message = engine
+            .resource_error()
+            .expect("oversized compact run should report a resource error");
+        assert!(message.contains("dense cells"));
+        assert!(!engine.uses_compact_lattice_storage());
+        assert!(engine.placed.pages.is_empty());
+
+        let batch = engine.step_budget(1, 1_000);
+        assert!(batch.is_empty());
+        assert!(engine.stats().exhausted);
+    }
+
+    #[test]
+    fn high_cardinality_compact_candidate_keeps_sparse_fallback() {
+        let custom_army = (0..=MAX_DENSE_GROUP_BITS)
+            .map(|index| CustomPiece::with_auto_color(2 + index as i32, 1))
+            .collect();
+        let engine = SimulationEngine::new(EngineSettings {
+            radius: 1_733.0,
+            placement_search: PlacementSearchMode::SpiralPath,
+            enemy_mode: EnemyMode::Color,
+            custom_army,
+            ..EngineSettings::default()
+        });
+
+        assert!(compact_lattice_storage_required(engine.settings()));
+        assert!(engine.resource_error().is_none());
+        assert!(!engine.uses_compact_lattice_storage());
     }
 
     #[test]

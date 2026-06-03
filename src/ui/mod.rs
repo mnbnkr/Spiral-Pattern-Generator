@@ -14,9 +14,9 @@ use crate::protocol::{
     AppToWorker, ArmyPreset, AttackOverlayUpdate, BoardKind, CustomPiece, DEFAULT_RADIUS,
     DisplayMode, EnemyMode, EngineSettings, EngineStats, MAX_FREE_CAMERA_ZOOM, MAX_RADIUS,
     MIN_FREE_CAMERA_ZOOM, Placement, PlacementSearchMode, ShapeKind, SpeedMode, SpotCoord,
-    VertexBufferUpdate, WorkerToApp, custom_army_moves_match_for_board,
-    custom_color_group_change_affects_generation, custom_piece_order_color,
-    normalize_prime_modulo_divisor, parse_hex_rgb,
+    VertexBufferUpdate, WorkerToApp, compact_lattice_storage_required,
+    custom_army_moves_match_for_board, custom_color_group_change_affects_generation,
+    custom_piece_order_color, normalize_prime_modulo_divisor, parse_hex_rgb,
 };
 use crate::render::{CanvasRenderer, ExportKind};
 
@@ -67,7 +67,6 @@ struct AppState {
     canvas_pinch_last_distance: f64,
     canvas_pinch_last_x: f64,
     canvas_pinch_last_y: f64,
-    board_select_pointer_value: Option<String>,
     preferred_square_shape: ShapeKind,
     preferred_hex_shape: ShapeKind,
     preferred_triangle_shape: ShapeKind,
@@ -182,7 +181,6 @@ pub fn boot_app() -> Result<(), JsValue> {
         canvas_pinch_last_distance: 0.0,
         canvas_pinch_last_x: 0.0,
         canvas_pinch_last_y: 0.0,
-        board_select_pointer_value: None,
         preferred_square_shape: ShapeKind::Square,
         preferred_hex_shape: ShapeKind::Hex,
         preferred_triangle_shape: ShapeKind::Triangle,
@@ -898,10 +896,35 @@ fn schedule_render(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
     }
 
     let closure = Closure::<dyn FnMut(f64)>::new(move |_timestamp: f64| {
-        let mut state = state.borrow_mut();
-        state.render_scheduled = false;
-        if let Err(error) = state.renderer.redraw() {
+        let render_error = {
+            let mut state = state.borrow_mut();
+            state.render_scheduled = false;
+            match state.renderer.redraw() {
+                Ok(()) => None,
+                Err(error) => {
+                    state.running = false;
+                    state.run_tick_generation = state.run_tick_generation.wrapping_add(1);
+                    Some((error, state.worker.clone(), state.worker_epoch))
+                }
+            }
+        };
+        if let Some((error, worker, epoch)) = render_error {
             log_error(&error);
+            if let Ok(document) = current_document()
+                && let Err(button_error) = update_run_buttons(&document, false)
+            {
+                log_error(&button_error);
+            }
+            if let Err(pause_error) = send_to_worker(&worker, &AppToWorker::Pause { epoch }) {
+                log_error(&pause_error);
+            }
+            if let Err(status_error) =
+                set_status(&format!("Render error: {}", js_value_text(&error)))
+            {
+                log_error(&status_error);
+            } else {
+                hold_status_for_ms(5_000.0);
+            }
         }
     });
 
@@ -1229,8 +1252,7 @@ fn install_control_handlers(
     for id in ["anchor-a-input", "anchor-b-input"] {
         install_settings_handler(document, id, Rc::clone(&state), SyncAction::UpdateWorker)?;
     }
-    install_same_board_refresh_handler(document, Rc::clone(&state))?;
-    install_select_quick_close_handlers(document, Rc::clone(&state))?;
+    install_select_quick_close_handlers(document)?;
     install_continuous_offset_blur_handler(document, Rc::clone(&state))?;
     install_prime_divisor_commit_handlers(document, Rc::clone(&state))?;
     install_blank_number_default_handler(document, "piece-a-input", "0")?;
@@ -1479,100 +1501,7 @@ fn commit_prime_modulo_divisor(
     sync_settings(document, state, SyncAction::ResetWorker, true)
 }
 
-fn install_same_board_refresh_handler(
-    document: &Document,
-    state: Rc<RefCell<AppState>>,
-) -> Result<(), JsValue> {
-    let board_select = select(document, "board-select")?;
-
-    let down_state = Rc::clone(&state);
-    let down_select = board_select.clone();
-    let mouse_down = Closure::<dyn FnMut(MouseEvent)>::new(move |_event: MouseEvent| {
-        down_state.borrow_mut().board_select_pointer_value = Some(down_select.value());
-    });
-    board_select
-        .add_event_listener_with_callback("mousedown", mouse_down.as_ref().unchecked_ref())?;
-    mouse_down.forget();
-
-    let change_state = Rc::clone(&state);
-    let change = Closure::<dyn FnMut(Event)>::new(move |_event: Event| {
-        change_state.borrow_mut().board_select_pointer_value = None;
-    });
-    board_select.add_event_listener_with_callback("change", change.as_ref().unchecked_ref())?;
-    change.forget();
-
-    let blur_document = document.clone();
-    let blur_state = Rc::clone(&state);
-    let blur_select = board_select.clone();
-    let blur = Closure::<dyn FnMut(Event)>::new(move |event: Event| {
-        let related_target =
-            js_sys::Reflect::get(event.as_ref(), &JsValue::from_str("relatedTarget"))
-                .unwrap_or(JsValue::NULL);
-        let moved_to_another_control = is_form_control_blur_target(&related_target);
-        let timeout_document = blur_document.clone();
-        let timeout_state = Rc::clone(&blur_state);
-        let timeout_select = blur_select.clone();
-        let timeout = Closure::<dyn FnMut()>::new(move || {
-            let should_refresh = {
-                let mut state = timeout_state.borrow_mut();
-                let previous = state.board_select_pointer_value.take();
-                let active_control = timeout_document.active_element().is_some_and(|element| {
-                    element.get_attribute("id").as_deref() != Some("board-select")
-                        && is_form_control_element(&element)
-                });
-                !moved_to_another_control
-                    && !active_control
-                    && previous.as_deref() == Some(timeout_select.value().as_str())
-            };
-            if !should_refresh {
-                return;
-            }
-
-            let settings = {
-                let mut state = timeout_state.borrow_mut();
-                if let Err(error) = sync_state_from_controls(&timeout_document, &mut state, true) {
-                    log_error(&error);
-                    return;
-                }
-                state.settings.clone()
-            };
-            if let Err(error) = recreate_worker_with_settings(
-                &timeout_document,
-                Rc::clone(&timeout_state),
-                settings,
-                false,
-                true,
-                "Refreshed | Paused",
-            ) {
-                log_error(&error);
-            }
-        });
-
-        if let Err(error) = web_sys::window()
-            .ok_or_else(|| JsValue::from_str("window unavailable"))
-            .and_then(|window| {
-                window
-                    .set_timeout_with_callback_and_timeout_and_arguments_0(
-                        timeout.as_ref().unchecked_ref(),
-                        0,
-                    )
-                    .map(|_| ())
-            })
-        {
-            log_error(&error);
-        }
-        timeout.forget();
-    });
-    board_select.add_event_listener_with_callback("blur", blur.as_ref().unchecked_ref())?;
-    blur.forget();
-
-    Ok(())
-}
-
-fn install_select_quick_close_handlers(
-    document: &Document,
-    state: Rc<RefCell<AppState>>,
-) -> Result<(), JsValue> {
+fn install_select_quick_close_handlers(document: &Document) -> Result<(), JsValue> {
     let recent_select = Rc::new(RefCell::new(None::<(String, f64)>));
     for select_id in [
         "board-select",
@@ -1584,7 +1513,6 @@ fn install_select_quick_close_handlers(
     ] {
         let select = select(document, select_id)?;
         let id = select.id();
-        let state = Rc::clone(&state);
         let pointer_document = document.clone();
         let pointer_recent_select = Rc::clone(&recent_select);
         let closure_select = select.clone();
@@ -1601,10 +1529,8 @@ fn install_select_quick_close_handlers(
 
             if focused_same_select || recent_same_select {
                 event.prevent_default();
+                event.stop_immediate_propagation();
                 event.stop_propagation();
-                if id == "board-select" {
-                    state.borrow_mut().board_select_pointer_value = None;
-                }
                 if let Err(error) = closure_select.blur() {
                     log_error(&error);
                 }
@@ -1638,21 +1564,6 @@ fn install_select_quick_close_handlers(
     }
 
     Ok(())
-}
-
-fn is_form_control_blur_target(value: &JsValue) -> bool {
-    let Some(element) = value.dyn_ref::<Element>() else {
-        return false;
-    };
-
-    is_form_control_element(element)
-}
-
-fn is_form_control_element(element: &Element) -> bool {
-    matches!(
-        element.tag_name().as_str(),
-        "BUTTON" | "INPUT" | "SELECT" | "TEXTAREA"
-    )
 }
 
 fn install_add_piece_handler(
@@ -2226,7 +2137,7 @@ fn install_refresh_handler(
             settings,
             false,
             true,
-            "Refreshed | Paused",
+            "Cleared | Paused",
         ) {
             log_error(&error);
         }
@@ -3352,10 +3263,15 @@ fn commit_pending_radius_change(
 }
 
 fn radius_increase_can_update_worker(current: &EngineSettings, next: &EngineSettings) -> bool {
+    let current_uses_compact = compact_lattice_storage_required(current);
+    let next_uses_compact = compact_lattice_storage_required(next);
+
     next.radius > current.radius
         && current.board == next.board
         && current.placement_search == PlacementSearchMode::SpiralPath
         && next.placement_search == PlacementSearchMode::SpiralPath
+        && current_uses_compact == next_uses_compact
+        && !current_uses_compact
         && continuous_piece_radius_matches(current, next)
         && current.proactive_attacking == next.proactive_attacking
         && current.enemy_mode == next.enemy_mode
