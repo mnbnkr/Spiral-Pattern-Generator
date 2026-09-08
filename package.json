@@ -6,7 +6,7 @@
   "packageManager": "pnpm@11.3.0",
   "type": "module",
   "devDependencies": {
-    "@playwright/test": "^1.60.0",
+    "@playwright/test": "^1.63.0",
     "@types/node": "^25.8.0"
   }
 }
